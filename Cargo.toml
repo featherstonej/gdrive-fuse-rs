@@ -1,0 +1,33 @@
+[package]
+name = "gdrive-fuse-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "A lightweight, read-only Google Drive FUSE filesystem written in Rust for Linux and GNOME."
+license = "MIT"
+
+[dependencies]
+# Async Runtime & Utilities
+tokio = { version = "1.38", features = ["full"] }
+futures = "0.3"
+
+# Filesystem (FUSE)
+fuser = "0.14"
+libc = "0.2"
+
+# HTTP & API Client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Authentication & Keyring
+oauth2 = "4.4"
+keyring = "2.1"
+
+# Caching & Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Logging & CLI
+env_logger = "0.11"
+log = "0.4"
+clap = { version = "4.5", features = ["derive"] }
