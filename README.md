@@ -21,11 +21,13 @@ Before building or running `gdrive-fuse-rs`, ensure your Linux system has the ne
   ```bash
   sudo apt install libfuse3-dev pkg-config build-essential
   ```
+
 * **Fedora / RHEL / CentOS:**
   
   ```bash
   sudo dnf install fuse3-devel pkg-config gcc
   ```
+
 * **Arch Linux:**
   
   ```bash
@@ -85,4 +87,4 @@ Currently under active development (**Phase 1: Read-Only MVP**). Contributions, 
 
 ## License
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [GNU General Public License v3.0](LICENSE).
