@@ -1,10 +1,10 @@
 # `gdrive-fuse-rs` Project Roadmap
 
-This document tracks the development phases, architectural milestones, and feature specifications for `gdrive-fuse-rs`—a lightweight, memory-safe Google Drive FUSE filesystem written in Rust for Linux and GNOME.
+This document tracks the development phases, architectural milestones, and feature specifications for `gdrive-fuse-rs` -- a lightweight, memory-safe Google Drive FUSE filesystem written in Rust for Linux and GNOME.
 
 ---
 
-## Phase 1: Read-Only MVP ✅ *(Completed)*
+## Phase 1: Read-Only MVP (Completed)
 
 **Goal:** Deliver a rock-solid, memory-safe, read-only FUSE mount that streams files on-demand in RAM without consuming local disk space.
 
@@ -27,15 +27,15 @@ This document tracks the development phases, architectural milestones, and featu
 
 ---
 
-## Phase 2: GNOME Desktop Integration & Smart Sync 🚧 *(Next Milestone)*
+## Phase 2: GNOME Desktop Integration & Smart Sync (Next Milestone)
 
 **Goal:** Elevate the read-only mount into a seamless Linux/GNOME desktop experience with clickable Google Docs, accurate disk quota reporting, real-time change polling, Shared Drive access, and background service management.
 
 ### 2.1 Clickable Google Workspace Native Files (Docs, Sheets, Slides)
-- [ ] **Browser Shortcut Mode (Default — `--google-docs-mode=browser` / `.desktop` or `.html`):**
+- [ ] **Browser Shortcut Mode (Default -- `--google-docs-mode=browser` / `.desktop` or `.html`):**
   - Synthesize lightweight, clickable launcher content (`webViewLink` / `https://docs.google.com/...`) for native `application/vnd.google-apps.*` files so double-clicking a Google Doc, Sheet, or Slide in **GNOME Files (Nautilus)** opens it directly in the user's default web browser (matching the Windows Google Drive app behavior).
   - Automatically report the exact byte length of the synthesized shortcut in `getattr` (`FileAttr::size`) so kernel `read()` calls stream the shortcut cleanly from memory.
-- [ ] **On-the-Fly Export Mode (Optional — `--google-docs-mode=pdf|office`):**
+- [ ] **On-the-Fly Export Mode (Optional -- `--google-docs-mode=pdf|office`):**
   - Support exporting Google Docs/Sheets/Slides via `GET /drive/v3/files/{fileId}/export` as `.pdf` or Office formats (`.docx`, `.xlsx`, `.pptx`), caching exported bytes in the in-memory chunk buffer.
 
 ### 2.2 Real Drive Storage Quota (`statfs`)
@@ -60,7 +60,7 @@ This document tracks the development phases, architectural milestones, and featu
 
 ---
 
-## Phase 3: Read-Write Support (`create`, `write`, `mkdir`, `unlink`, `rename`) 📋 *(Planned)*
+## Phase 3: Read-Write Support (`create`, `write`, `mkdir`, `unlink`, `rename`) (Planned)
 
 **Goal:** Enable full POSIX file creation, editing, folder management, and safe deletion while preserving memory safety and low disk footprint.
 
