@@ -27,33 +27,33 @@ This document tracks the development phases, architectural milestones, and featu
 
 ---
 
-## Phase 2: GNOME Desktop Integration & Smart Sync (Next Milestone)
+## Phase 2: GNOME Desktop Integration & Smart Sync (Completed)
 
 **Goal:** Elevate the read-only mount into a seamless Linux/GNOME desktop experience with clickable Google Docs, accurate disk quota reporting, real-time change polling, Shared Drive access, and background service management.
 
 ### 2.1 Clickable Google Workspace Native Files (Docs, Sheets, Slides)
-- [ ] **Browser Shortcut Mode (Default -- `--google-docs-mode=browser` / `.desktop` or `.html`):**
+- [x] **Browser Shortcut Mode (Default -- `--google-docs-mode=browser` / `.desktop` or `.html`):**
   - Synthesize lightweight, clickable launcher content (`webViewLink` / `https://docs.google.com/...`) for native `application/vnd.google-apps.*` files so double-clicking a Google Doc, Sheet, or Slide in **GNOME Files (Nautilus)** opens it directly in the user's default web browser (matching the Windows Google Drive app behavior).
   - Automatically report the exact byte length of the synthesized shortcut in `getattr` (`FileAttr::size`) so kernel `read()` calls stream the shortcut cleanly from memory.
-- [ ] **On-the-Fly Export Mode (Optional -- `--google-docs-mode=pdf|office`):**
+- [x] **On-the-Fly Export Mode (Optional -- `--google-docs-mode=pdf|office`):**
   - Support exporting Google Docs/Sheets/Slides via `GET /drive/v3/files/{fileId}/export` as `.pdf` or Office formats (`.docx`, `.xlsx`, `.pptx`), caching exported bytes in the in-memory chunk buffer.
 
 ### 2.2 Real Drive Storage Quota (`statfs`)
-- [ ] Query `GET /drive/v3/about?fields=storageQuota` (`limit`, `usage`, `usageInDrive`, `usageInDriveTrash`) in [`src/api.rs`](src/api.rs).
-- [ ] Cache storage quota metrics in memory/SQLite with a configurable TTL (e.g., 5 minutes).
-- [ ] Populate `fuser::ReplyStatfs` in [`src/filesystem.rs`](src/filesystem.rs) with real `blocks`, `bfree`, and `bavail` counts (using `4096`-byte block size) so `df -h ~/GoogleDrive` and GNOME Files display accurate Total, Used, and Available Drive space.
+- [x] Query `GET /drive/v3/about?fields=storageQuota` (`limit`, `usage`, `usageInDrive`, `usageInDriveTrash`) in [`src/api.rs`](src/api.rs).
+- [x] Cache storage quota metrics in memory/SQLite with a configurable TTL (e.g., 5 minutes).
+- [x] Populate `fuser::ReplyStatfs` in [`src/filesystem.rs`](src/filesystem.rs) with real `blocks`, `bfree`, and `bavail` counts (using `4096`-byte block size) so `df -h ~/GoogleDrive` and GNOME Files display accurate Total, Used, and Available Drive space.
 
 ### 2.3 Background Incremental Change Sync (`changes.list` API)
-- [ ] Fetch and store the initial `startPageToken` (`GET /drive/v3/changes/startPageToken`) in SQLite.
-- [ ] Spawn a lightweight background Tokio task that periodically polls `GET /drive/v3/changes` (`pageToken`, `includeItemsFromAllDrives=true`, `supportsAllDrives=true`).
-- [ ] When remote changes are detected (file created, renamed, modified, moved, or trashed), atomically update or invalidate the affected inodes and parent directories in SQLite so local directory listings stay fresh even with longer directory TTLs.
+- [x] Fetch and store the initial `startPageToken` (`GET /drive/v3/changes/startPageToken`) in SQLite.
+- [x] Spawn a lightweight background Tokio task that periodically polls `GET /drive/v3/changes` (`pageToken`, `includeItemsFromAllDrives=true`, `supportsAllDrives=true`).
+- [x] When remote changes are detected (file created, renamed, modified, moved, or trashed), atomically update or invalidate the affected inodes and parent directories in SQLite so local directory listings stay fresh even with longer directory TTLs.
 
 ### 2.4 "Shared with me" & Shared Drives Support
-- [ ] Add `supportsAllDrives=true` and `includeItemsFromAllDrives=true` to Drive API v3 requests.
-- [ ] Expose an optional virtual top-level directory (e.g., `Shared with me` at a reserved virtual inode) populated via `q = "sharedWithMe = true and trashed = false"`.
+- [x] Add `supportsAllDrives=true` and `includeItemsFromAllDrives=true` to Drive API v3 requests.
+- [x] Expose an optional virtual top-level directory (e.g., `Shared with me` at a reserved virtual inode) populated via `q = "sharedWithMe = true and trashed = false"`.
 
 ### 2.5 Systemd User Service & Lifecycle CLI Utilities
-- [ ] Add CLI utility flags/actions:
+- [x] Add CLI utility flags/actions:
   - `--clear-cache`: Wipes `~/.cache/gdrive-fuse-rs/metadata.db` before mounting (or exits).
   - `--logout`: Removes saved OAuth tokens from GNOME Keyring.
   - `--install-systemd` / systemd user service unit (`~/.config/systemd/user/gdrive-fuse-rs.service`) so Google Drive mounts automatically on GNOME login.
