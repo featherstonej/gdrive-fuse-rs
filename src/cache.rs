@@ -406,12 +406,23 @@ impl MetadataCache {
             params![parent_inode as i64],
         )?;
 
+        // Assign deduplicated names in a stable order (name, then id) so that a changed
+        // response order cannot swap the names of duplicate siblings.
+        let mut naming_order: Vec<usize> = (0..children.len()).collect();
+        naming_order.sort_by(|&a, &b| {
+            (children[a].name.as_str(), children[a].id.as_str())
+                .cmp(&(children[b].name.as_str(), children[b].id.as_str()))
+        });
         let mut used_names = HashSet::with_capacity(children.len());
+        let mut names = vec![String::new(); children.len()];
+        for idx in naming_order {
+            names[idx] = disambiguate_filename(&children[idx].name, &mut used_names);
+        }
         let mut entries = Vec::with_capacity(children.len());
 
-        for drive_file in children {
+        for (idx, drive_file) in children.iter().enumerate() {
             let cached_file = Self::upsert_file_with_conn(&tx, drive_file)?;
-            let effective_name = disambiguate_filename(&drive_file.name, &mut used_names);
+            let effective_name = names[idx].clone();
 
             tx.execute(
                 "INSERT INTO parent_child (parent_inode, child_inode, effective_name)
