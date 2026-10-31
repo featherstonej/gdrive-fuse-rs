@@ -18,7 +18,7 @@ use fuser::{MountOption, Session};
 use crate::api::DriveClient;
 use crate::auth::{resolve_credentials, AppConfig, AuthManager};
 use crate::cache::MetadataCache;
-use crate::filesystem::{GDriveFS, DEFAULT_READ_CHUNK_SIZE};
+use crate::filesystem::{GDriveFS, DEFAULT_READ_CHUNK_SIZE, MAX_READ_CHUNK_SIZE};
 
 /// A lightweight, memory-safe, read-only Google Drive FUSE filesystem for Linux and GNOME.
 #[derive(Parser, Debug, Clone)]
@@ -52,8 +52,12 @@ pub struct CliArgs {
     #[arg(long = "cache-ttl", value_name = "SECONDS")]
     pub cache_ttl: Option<u64>,
 
-    /// Read-ahead chunk buffer size in bytes (defaults to 4 MB).
-    #[arg(long = "chunk-size", value_name = "BYTES")]
+    /// Read-ahead chunk buffer size in bytes (defaults to 4 MB; maximum 16 MB).
+    #[arg(
+        long = "chunk-size",
+        value_name = "BYTES",
+        value_parser = parse_chunk_size
+    )]
     pub chunk_size: Option<usize>,
 
     /// Do not automatically launch the web browser during interactive OAuth2 login.
@@ -98,10 +102,7 @@ fn main() -> Result<()> {
         .context("Failed to resolve Google OAuth2 client credentials")?;
 
     let cache_ttl_secs = args.cache_ttl.or(config.cache_ttl_secs).unwrap_or(60);
-    let chunk_size_bytes = args
-        .chunk_size
-        .or(config.chunk_size_bytes)
-        .unwrap_or(DEFAULT_READ_CHUNK_SIZE);
+    let chunk_size_bytes = resolve_chunk_size(args.chunk_size, config.chunk_size_bytes)?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -179,6 +180,30 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn resolve_chunk_size(cli_size: Option<usize>, config_size: Option<usize>) -> Result<usize> {
+    let chunk_size = cli_size.or(config_size).unwrap_or(DEFAULT_READ_CHUNK_SIZE);
+    if chunk_size > MAX_READ_CHUNK_SIZE {
+        bail!(
+            "Read-ahead chunk size exceeds the maximum of {} bytes",
+            MAX_READ_CHUNK_SIZE
+        );
+    }
+    Ok(chunk_size)
+}
+
+fn parse_chunk_size(value: &str) -> Result<usize, String> {
+    let chunk_size = value
+        .parse::<usize>()
+        .map_err(|e| format!("invalid chunk size: {e}"))?;
+    if chunk_size > MAX_READ_CHUNK_SIZE {
+        return Err(format!(
+            "chunk size exceeds the maximum of {} bytes",
+            MAX_READ_CHUNK_SIZE
+        ));
+    }
+    Ok(chunk_size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +247,31 @@ mod tests {
         assert!(!args.no_browser);
         assert!(!args.allow_other);
         assert!(args.cache_ttl.is_none());
+    }
+
+    #[test]
+    fn test_cli_rejects_chunk_size_above_maximum() {
+        let args = CliArgs::try_parse_from([
+            "gdrive-fuse-rs",
+            "--mount-point",
+            "/mnt/drive",
+            "--chunk-size",
+            &(MAX_READ_CHUNK_SIZE + 1).to_string(),
+        ]);
+        assert!(args.is_err());
+    }
+
+    #[test]
+    fn test_config_rejects_chunk_size_above_maximum() {
+        let err = resolve_chunk_size(None, Some(MAX_READ_CHUNK_SIZE + 1)).unwrap_err();
+        assert!(err.to_string().contains("exceeds the maximum"));
+    }
+
+    #[test]
+    fn test_chunk_size_accepts_maximum() {
+        assert_eq!(
+            resolve_chunk_size(Some(MAX_READ_CHUNK_SIZE), None).unwrap(),
+            MAX_READ_CHUNK_SIZE
+        );
     }
 }

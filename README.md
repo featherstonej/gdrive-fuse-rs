@@ -77,7 +77,7 @@ You can supply your Google Cloud Desktop OAuth2 `client_id` (and optional `clien
    client_id = "your-client-id.apps.googleusercontent.com"
    client_secret = "your-client-secret"
    cache_ttl_secs = 60
-   chunk_size_bytes = 4194304
+   chunk_size_bytes = 4194304 # maximum: 16777216 (16 MB)
    ```
 4. **System Keyring Fallback:**
    Once you authenticate once using CLI flags, environment variables, or `config.toml`, `gdrive-fuse-rs` caches both your client configuration and OAuth refresh token in your system keyring (**GNOME Keyring**), so future mounts only require `--mount-point`.
@@ -118,7 +118,7 @@ Options:
       --config <FILE>           Path to user configuration TOML file [env: GDRIVE_CONFIG_PATH=]
       --cache-db <FILE>         Path to the SQLite metadata cache database [env: GDRIVE_CACHE_DB=]
       --cache-ttl <SECONDS>     Directory metadata cache TTL in seconds (default: 60)
-      --chunk-size <BYTES>      Read-ahead chunk buffer size in bytes (default: 4 MB)
+      --chunk-size <BYTES>      Read-ahead chunk buffer size in bytes (default: 4 MB; maximum: 16 MB)
       --no-browser              Do not automatically launch the web browser during interactive OAuth2 login
       --allow-other             Allow other system users to access the FUSE mount
   -h, --help                    Print help

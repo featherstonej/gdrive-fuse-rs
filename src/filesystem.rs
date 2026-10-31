@@ -20,6 +20,9 @@ pub const DEFAULT_ATTR_TTL: Duration = Duration::from_secs(60);
 /// Default read-ahead chunk size in bytes (4 MB).
 pub const DEFAULT_READ_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
+/// Maximum read-ahead chunk size in bytes (16 MB).
+pub const MAX_READ_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
 /// Standard 512-byte POSIX block size used for reporting `FileAttr::blocks`.
 pub const BLOCK_SIZE: u32 = 512;
 
