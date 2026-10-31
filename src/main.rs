@@ -84,8 +84,13 @@ fn main() -> Result<()> {
     }
 
     let config = match &args.config {
-        Some(path) => AppConfig::load_from_path(path)
-            .with_context(|| format!("Failed to load configuration from {}", path.display()))?,
+        Some(path) => {
+            if !path.exists() {
+                bail!("Configuration file does not exist: {}", path.display());
+            }
+            AppConfig::load_from_path(path)
+                .with_context(|| format!("Failed to load configuration from {}", path.display()))?
+        }
         None => AppConfig::load_default().context("Failed to load default configuration")?,
     };
 
