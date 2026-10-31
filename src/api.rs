@@ -324,6 +324,9 @@ impl DriveClient {
 
     fn map_status_error(status: StatusCode, body: String) -> ApiError {
         match status {
+            StatusCode::FORBIDDEN if body.to_ascii_lowercase().contains("ratelimitexceeded") => {
+                ApiError::RateLimited(body)
+            }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ApiError::Unauthorized(body),
             StatusCode::NOT_FOUND => ApiError::NotFound(body),
             StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
