@@ -1,0 +1,23 @@
+# Rust Build Artifacts
+/target/
+Cargo.lock
+
+# Operating System & Editor Files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local SQLite Cache / Database
+*.db
+*.sqlite
+*.db-shm
+*.db-wal
+
+# OAuth Credentials & Local Configs (Never Commit)
+client_secret*.json
+*credentials*.json
+config.toml
+
+
