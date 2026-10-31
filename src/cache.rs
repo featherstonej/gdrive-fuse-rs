@@ -104,7 +104,12 @@ impl MetadataCache {
 
     /// Opens the SQLite metadata cache at the default XDG cache path (`~/.cache/gdrive-fuse-rs/metadata.db`).
     pub fn open_default(ttl_secs: u64) -> Result<Self, CacheError> {
-        let base_dir = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let base_dir = dirs::cache_dir().ok_or_else(|| {
+            CacheError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "could not determine the user cache directory; pass --cache-db explicitly",
+            ))
+        })?;
         let db_path = base_dir.join(APP_CACHE_DIR_NAME).join(DEFAULT_DB_FILENAME);
         Self::open(&db_path, ttl_secs)
     }
