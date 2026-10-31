@@ -109,20 +109,26 @@ You can supply your Google Cloud Desktop OAuth2 `client_id` (and optional `clien
 ### CLI Options
 
 ```text
-Usage: gdrive-fuse-rs [OPTIONS] --mount-point <PATH>
+Usage: gdrive-fuse-rs [OPTIONS]
 
 Options:
-  -m, --mount-point <PATH>      Local directory path where Google Drive will be mounted
-      --client-id <ID>          Google OAuth2 Client ID [env: GDRIVE_CLIENT_ID=]
-      --client-secret <SECRET>  Google OAuth2 Client Secret [env: GDRIVE_CLIENT_SECRET=]
-      --config <FILE>           Path to user configuration TOML file [env: GDRIVE_CONFIG_PATH=]
-      --cache-db <FILE>         Path to the SQLite metadata cache database [env: GDRIVE_CACHE_DB=]
-      --cache-ttl <SECONDS>     Directory metadata cache TTL in seconds (default: 60)
-      --chunk-size <BYTES>      Read-ahead chunk buffer size in bytes (default: 4 MB; maximum: 16 MB)
-      --no-browser              Do not automatically launch the web browser during interactive OAuth2 login
-      --allow-other             Allow other system users to access the FUSE mount
-  -h, --help                    Print help
-  -V, --version                 Print version
+  -m, --mount-point <PATH>         Local directory path where Google Drive will be mounted
+      --client-id <ID>             Google OAuth2 Client ID [env: GDRIVE_CLIENT_ID=]
+      --client-secret <SECRET>     Google OAuth2 Client Secret [env: GDRIVE_CLIENT_SECRET=]
+      --config <FILE>              Path to user configuration TOML file [env: GDRIVE_CONFIG_PATH=]
+      --cache-db <FILE>            Path to the SQLite metadata cache database [env: GDRIVE_CACHE_DB=]
+      --cache-ttl <SECONDS>        Directory metadata cache TTL in seconds (default: 60)
+      --chunk-size <BYTES>         Read-ahead chunk buffer size in bytes (default: 4 MB; maximum: 16 MB)
+      --google-docs-mode <MODE>    How Google Docs/Sheets/Slides are presented: browser, desktop, pdf, office (default: browser)
+      --change-poll-secs <SECONDS> Background changes.list poll interval in seconds (default: 30; 0 to disable)
+      --no-shared-with-me          Disable the top-level "Shared with me" virtual directory
+      --clear-cache                Wipe the local SQLite metadata cache before mounting (or exit if no mount point)
+      --logout                     Remove saved OAuth2 tokens from the system keyring
+      --install-systemd            Install a systemd user service at ~/.config/systemd/user/gdrive-fuse-rs.service
+      --no-browser                 Do not automatically launch the web browser during interactive OAuth2 login
+      --allow-other                Allow other system users to access the FUSE mount
+  -h, --help                       Print help
+  -V, --version                    Print version
 ```
 
 ---
@@ -134,6 +140,13 @@ Options:
 - Google Drive API v3 directory listing (`pageSize = 1000` with full pagination) & HTTP `Range` streaming downloads.
 - Embedded SQLite metadata & persistent inode cache (`inode 1 == root`) with automatic sibling duplicate filename disambiguation (`filename (1).ext`).
 - Read-only FUSE filesystem with a **4 MB in-memory Read-Ahead Chunk Buffer** to minimize HTTP requests during sequential file reads.
+
+**Phase 2: GNOME Desktop Integration & Smart Sync (Complete)**
+- Clickable Google Workspace native files (`--google-docs-mode=browser|desktop|pdf|office`) so double-clicking Google Docs/Sheets/Slides opens them in your browser or exports them as PDF/Office files on the fly.
+- Real Google Drive storage quota reporting in `df -h` and GNOME Files (`statfs` via `/drive/v3/about`).
+- Background incremental change polling (`/drive/v3/changes`) for automatic SQLite cache invalidation and updates.
+- Virtual `"Shared with me"` folder (`inode = 2`) and Shared Drives support (`supportsAllDrives=true`).
+- Lifecycle CLI utilities (`--clear-cache`, `--logout`, `--install-systemd`).
 
 ## License
 
