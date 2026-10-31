@@ -136,7 +136,7 @@ pub fn resolve_credentials(
     if let Some(client_id) = cli_id {
         let creds = ClientCredentials {
             client_id,
-            client_secret: cli_secret.or(cfg_secret),
+            client_secret: cli_secret,
         };
         persist_credentials_to_keyring(&creds);
         return Ok(creds);
@@ -145,7 +145,7 @@ pub fn resolve_credentials(
     if let Some(client_id) = cfg_id {
         let creds = ClientCredentials {
             client_id,
-            client_secret: cfg_secret.or(cli_secret),
+            client_secret: cfg_secret,
         };
         persist_credentials_to_keyring(&creds);
         return Ok(creds);
