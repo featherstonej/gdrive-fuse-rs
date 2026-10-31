@@ -307,12 +307,18 @@ impl DriveClient {
             .await?;
 
         let status = response.status();
-        if status == StatusCode::PARTIAL_CONTENT || status == StatusCode::OK {
-            let bytes = response.bytes().await?;
-            Ok(bytes)
-        } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(Self::map_status_error(status, body))
+        match status {
+            StatusCode::PARTIAL_CONTENT => Ok(response.bytes().await?),
+            // A 200 means the server ignored the Range header and sent the whole file,
+            // so the body does not start at `start` and must not be used.
+            StatusCode::OK => Err(ApiError::UnexpectedStatus {
+                status: status.as_u16(),
+                body: format!("Server ignored Range request bytes={}-{}", start, end),
+            }),
+            _ => {
+                let body = response.text().await.unwrap_or_default();
+                Err(Self::map_status_error(status, body))
+            }
         }
     }
 
