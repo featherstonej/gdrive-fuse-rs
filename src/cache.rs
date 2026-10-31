@@ -248,7 +248,7 @@ impl MetadataCache {
 
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT parent_inode FROM parent_child WHERE child_inode = ?1 LIMIT 1",
+            "SELECT parent_inode FROM parent_child WHERE child_inode = ?1 ORDER BY rowid DESC LIMIT 1",
         )?;
         let parent: Option<i64> = stmt.query_row(params![inode as i64], |r| r.get(0)).optional()?;
         Ok(parent.map(|p| p as u64).unwrap_or(ROOT_INODE))
