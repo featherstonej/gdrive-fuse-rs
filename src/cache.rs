@@ -6,13 +6,25 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::api::{DriveFile, FOLDER_MIME_TYPE, GOOGLE_APPS_MIME_PREFIX};
+use crate::api::{ChangeItem, DriveFile, FOLDER_MIME_TYPE, GOOGLE_APPS_MIME_PREFIX};
 
 /// Root inode is strictly pinned to FUSE root ID (`1`).
 pub const ROOT_INODE: u64 = fuser::FUSE_ROOT_ID;
 
 /// Google Drive identifier for the root folder.
 pub const ROOT_DRIVE_ID: &str = "root";
+
+/// Reserved virtual inode (`2`) for the top-level "Shared with me" folder.
+pub const SHARED_WITH_ME_INODE: u64 = 2;
+
+/// Google Drive virtual identifier for the "Shared with me" folder.
+pub const SHARED_WITH_ME_DRIVE_ID: &str = "shared_with_me";
+
+/// Display name for the virtual "Shared with me" directory.
+pub const SHARED_WITH_ME_NAME: &str = "Shared with me";
+
+/// Key in `sync_state` table for storing the `changes.list` page token.
+const CHANGES_PAGE_TOKEN_KEY: &str = "changes_page_token";
 
 /// Default cache database filename inside the user's cache directory.
 const DEFAULT_DB_FILENAME: &str = "metadata.db";
@@ -31,6 +43,7 @@ pub struct CachedFile {
     pub modified_time: i64,
     pub is_dir: bool,
     pub last_synced_at: Option<i64>,
+    pub web_view_link: Option<String>,
 }
 
 impl CachedFile {
@@ -38,6 +51,37 @@ impl CachedFile {
     /// (e.g., Google Docs, Sheets, Slides) rather than a folder or regular binary file.
     pub fn is_google_native_doc(&self) -> bool {
         self.mime_type.starts_with(GOOGLE_APPS_MIME_PREFIX) && !self.is_dir
+    }
+
+    /// Returns the browser URL to open this file in Google Docs/Drive.
+    /// Uses `web_view_link` from the Drive API if present and non-empty,
+    /// otherwise falls back to standard Google Workspace / Drive URLs.
+    pub fn web_url(&self) -> String {
+        if let Some(ref link) = self.web_view_link {
+            let trimmed = link.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        match self.mime_type.as_str() {
+            "application/vnd.google-apps.document" => {
+                format!("https://docs.google.com/document/d/{}/edit", self.drive_id)
+            }
+            "application/vnd.google-apps.spreadsheet" => {
+                format!(
+                    "https://docs.google.com/spreadsheets/d/{}/edit",
+                    self.drive_id
+                )
+            }
+            "application/vnd.google-apps.presentation" => {
+                format!(
+                    "https://docs.google.com/presentation/d/{}/edit",
+                    self.drive_id
+                )
+            }
+            _ => format!("https://drive.google.com/open?id={}", self.drive_id),
+        }
     }
 }
 
@@ -87,9 +131,36 @@ pub type Cache = MetadataCache;
 pub struct MetadataCache {
     conn: Mutex<Connection>,
     ttl_secs: u64,
+    evicted_inodes: Mutex<HashSet<u64>>,
 }
 
 impl MetadataCache {
+    /// Returns the default XDG cache database path (`~/.cache/gdrive-fuse-rs/metadata.db`).
+    pub fn default_db_path() -> PathBuf {
+        let base_dir = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
+        base_dir.join(APP_CACHE_DIR_NAME).join(DEFAULT_DB_FILENAME)
+    }
+
+    /// Removes the SQLite database file along with its `-wal` and `-shm` companion files if present.
+    pub fn remove_db_files(db_path: &Path) -> Result<(), CacheError> {
+        let mut wal_os = db_path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let wal_path = PathBuf::from(wal_os);
+
+        let mut shm_os = db_path.as_os_str().to_os_string();
+        shm_os.push("-shm");
+        let shm_path = PathBuf::from(shm_os);
+
+        for candidate in [db_path, wal_path.as_path(), shm_path.as_path()] {
+            match fs::remove_file(candidate) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(CacheError::Io(err)),
+            }
+        }
+        Ok(())
+    }
+
     /// Opens or creates the SQLite metadata cache at `db_path` with the specified directory TTL (in seconds).
     pub fn open(db_path: &Path, ttl_secs: u64) -> Result<Self, CacheError> {
         if let Some(parent) = db_path.parent() {
@@ -125,7 +196,7 @@ impl MetadataCache {
         self.ttl_secs
     }
 
-    fn init_connection(conn: Connection, ttl_secs: u64) -> Result<Self, CacheError> {
+    fn init_connection(mut conn: Connection, ttl_secs: u64) -> Result<Self, CacheError> {
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -140,7 +211,8 @@ impl MetadataCache {
                 size INTEGER NOT NULL DEFAULT 0,
                 modified_time INTEGER NOT NULL DEFAULT 0,
                 is_dir INTEGER NOT NULL DEFAULT 0,
-                last_synced_at INTEGER
+                last_synced_at INTEGER,
+                web_view_link TEXT
             );
 
             CREATE TABLE IF NOT EXISTS parent_child (
@@ -153,19 +225,107 @@ impl MetadataCache {
             );
 
             CREATE INDEX IF NOT EXISTS idx_parent_child_child ON parent_child(child_inode);
+
+            CREATE TABLE IF NOT EXISTS sync_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             ",
         )?;
 
+        // Gracefully migrate existing Phase 1 databases that lack web_view_link.
+        let _ = conn.execute("ALTER TABLE files ADD COLUMN web_view_link TEXT", []);
+
         let now = Utc::now().timestamp();
-        conn.execute(
-            "INSERT OR IGNORE INTO files (inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at)
-             VALUES (?1, ?2, '', ?3, 0, ?4, 1, NULL)",
-            params![ROOT_INODE as i64, ROOT_DRIVE_ID, FOLDER_MIME_TYPE, now],
-        )?;
+        {
+            let tx = conn.transaction()?;
+
+            tx.execute(
+                "INSERT OR IGNORE INTO files (inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link)
+                 VALUES (?1, ?2, '', ?3, 0, ?4, 1, NULL, NULL)",
+                params![ROOT_INODE as i64, ROOT_DRIVE_ID, FOLDER_MIME_TYPE, now],
+            )?;
+
+            // If migrating an existing Phase 1 database where inode 2 was already assigned
+            // to a real Drive item, transactionally remap that item and its parent_child edges
+            // to a fresh inode before reserving inode 2 for SHARED_WITH_ME_INODE.
+            if let Some(existing) = Self::get_by_inode_with_conn(&tx, SHARED_WITH_ME_INODE)? {
+                if existing.drive_id != SHARED_WITH_ME_DRIVE_ID {
+                    let new_inode: i64 = tx.query_row(
+                        "SELECT COALESCE(MAX(inode), ?1) + 1 FROM files",
+                        params![SHARED_WITH_ME_INODE as i64],
+                        |r| r.get(0),
+                    )?;
+
+                    let mut saved_edges: Vec<(i64, i64, String)> = Vec::new();
+                    {
+                        let mut edge_stmt = tx.prepare(
+                            "SELECT parent_inode, child_inode, effective_name
+                             FROM parent_child
+                             WHERE parent_inode = ?1 OR child_inode = ?1",
+                        )?;
+                        let rows = edge_stmt.query_map(params![SHARED_WITH_ME_INODE as i64], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                        })?;
+                        for row in rows {
+                            saved_edges.push(row?);
+                        }
+                    }
+
+                    tx.execute(
+                        "DELETE FROM parent_child WHERE parent_inode = ?1 OR child_inode = ?1",
+                        params![SHARED_WITH_ME_INODE as i64],
+                    )?;
+
+                    tx.execute(
+                        "UPDATE files SET inode = ?1 WHERE inode = ?2",
+                        params![new_inode, SHARED_WITH_ME_INODE as i64],
+                    )?;
+
+                    let _ = tx.execute(
+                        "UPDATE sqlite_sequence SET seq = MAX(seq, ?1) WHERE name = 'files'",
+                        params![new_inode],
+                    );
+
+                    for (parent_ino, child_ino, eff_name) in saved_edges {
+                        let new_parent = if parent_ino == SHARED_WITH_ME_INODE as i64 {
+                            new_inode
+                        } else {
+                            parent_ino
+                        };
+                        let new_child = if child_ino == SHARED_WITH_ME_INODE as i64 {
+                            new_inode
+                        } else {
+                            child_ino
+                        };
+                        tx.execute(
+                            "INSERT INTO parent_child (parent_inode, child_inode, effective_name)
+                             VALUES (?1, ?2, ?3)",
+                            params![new_parent, new_child, eff_name],
+                        )?;
+                    }
+                }
+            }
+
+            tx.execute(
+                "INSERT OR IGNORE INTO files (inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, 1, NULL, NULL)",
+                params![
+                    SHARED_WITH_ME_INODE as i64,
+                    SHARED_WITH_ME_DRIVE_ID,
+                    SHARED_WITH_ME_NAME,
+                    FOLDER_MIME_TYPE,
+                    now
+                ],
+            )?;
+
+            tx.commit()?;
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
             ttl_secs,
+            evicted_inodes: Mutex::new(HashSet::new()),
         })
     }
 
@@ -182,6 +342,7 @@ impl MetadataCache {
         let modified_time: i64 = row.get(5)?;
         let is_dir_int: i64 = row.get(6)?;
         let last_synced_at: Option<i64> = row.get(7)?;
+        let web_view_link: Option<String> = row.get(8)?;
 
         Ok(CachedFile {
             inode: inode_i64 as u64,
@@ -192,6 +353,7 @@ impl MetadataCache {
             modified_time,
             is_dir: is_dir_int != 0,
             last_synced_at,
+            web_view_link,
         })
     }
 
@@ -206,7 +368,7 @@ impl MetadataCache {
         inode: u64,
     ) -> Result<Option<CachedFile>, CacheError> {
         let mut stmt = conn.prepare_cached(
-            "SELECT inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at
+            "SELECT inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link
              FROM files
              WHERE inode = ?1",
         )?;
@@ -228,7 +390,7 @@ impl MetadataCache {
         drive_id: &str,
     ) -> Result<Option<CachedFile>, CacheError> {
         let mut stmt = conn.prepare_cached(
-            "SELECT inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at
+            "SELECT inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link
              FROM files
              WHERE drive_id = ?1",
         )?;
@@ -242,7 +404,7 @@ impl MetadataCache {
     /// Returns the parent inode for a given `inode`.
     /// Returns `ROOT_INODE` (`1`) if `inode == ROOT_INODE` or if no parent entry is recorded.
     pub fn get_parent_inode(&self, inode: u64) -> Result<u64, CacheError> {
-        if inode == ROOT_INODE {
+        if inode == ROOT_INODE || inode == SHARED_WITH_ME_INODE {
             return Ok(ROOT_INODE);
         }
 
@@ -295,7 +457,7 @@ impl MetadataCache {
     ) -> Result<Option<CachedFile>, CacheError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT f.inode, f.drive_id, f.name, f.mime_type, f.size, f.modified_time, f.is_dir, f.last_synced_at
+            "SELECT f.inode, f.drive_id, f.name, f.mime_type, f.size, f.modified_time, f.is_dir, f.last_synced_at, f.web_view_link
              FROM parent_child pc
              JOIN files f ON f.inode = pc.child_inode
              WHERE pc.parent_inode = ?1 AND pc.effective_name = ?2",
@@ -321,7 +483,7 @@ impl MetadataCache {
         parent_inode: u64,
     ) -> Result<Vec<DirectoryEntry>, CacheError> {
         let mut stmt = conn.prepare_cached(
-            "SELECT f.inode, f.drive_id, f.name, f.mime_type, f.size, f.modified_time, f.is_dir, f.last_synced_at,
+            "SELECT f.inode, f.drive_id, f.name, f.mime_type, f.size, f.modified_time, f.is_dir, f.last_synced_at, f.web_view_link,
                     pc.parent_inode, pc.effective_name
              FROM parent_child pc
              JOIN files f ON f.inode = pc.child_inode
@@ -331,8 +493,8 @@ impl MetadataCache {
 
         let rows = stmt.query_map(params![parent_inode as i64], |row| {
             let file = Self::map_cached_file_row(row)?;
-            let parent_ino_i64: i64 = row.get(8)?;
-            let effective_name: String = row.get(9)?;
+            let parent_ino_i64: i64 = row.get(9)?;
+            let effective_name: String = row.get(10)?;
             Ok(DirectoryEntry {
                 inode: file.inode,
                 parent_inode: parent_ino_i64 as u64,
@@ -362,14 +524,15 @@ impl MetadataCache {
         let size_i64 = i64::try_from(file.size).unwrap_or(i64::MAX);
 
         conn.execute(
-            "INSERT INTO files (drive_id, name, mime_type, size, modified_time, is_dir)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO files (drive_id, name, mime_type, size, modified_time, is_dir, web_view_link)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(drive_id) DO UPDATE SET
                  name = excluded.name,
                  mime_type = excluded.mime_type,
                  size = excluded.size,
                  modified_time = excluded.modified_time,
-                 is_dir = excluded.is_dir",
+                 is_dir = excluded.is_dir,
+                 web_view_link = COALESCE(excluded.web_view_link, files.web_view_link)",
             params![
                 file.id,
                 file.name,
@@ -377,6 +540,7 @@ impl MetadataCache {
                 size_i64,
                 file.modified_time,
                 is_dir_int,
+                file.web_view_link,
             ],
         )?;
 
@@ -451,11 +615,190 @@ impl MetadataCache {
         tx.commit()?;
         Ok(entries)
     }
+
+    /// Retrieves the saved Google Drive `changes.list` page token from `sync_state`, if any.
+    pub fn get_change_page_token(&self) -> Result<Option<String>, CacheError> {
+        let conn = self.lock_conn()?;
+        let mut stmt =
+            conn.prepare_cached("SELECT value FROM sync_state WHERE key = ?1")?;
+        let token: Option<String> = stmt
+            .query_row(params![CHANGES_PAGE_TOKEN_KEY], |r| r.get(0))
+            .optional()?;
+        Ok(token)
+    }
+
+    /// Saves the Google Drive `changes.list` page token into `sync_state`.
+    pub fn set_change_page_token(&self, token: &str) -> Result<(), CacheError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![CHANGES_PAGE_TOKEN_KEY, token],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically applies a batch of incremental Drive changes (`changes.list`) and optionally updates
+    /// the stored change page token inside a single SQLite transaction.
+    ///
+    /// Returns the number of changes that affected local cached state.
+    pub fn apply_changes(
+        &self,
+        changes: &[ChangeItem],
+        new_page_token: Option<&str>,
+    ) -> Result<usize, CacheError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let mut affected_count = 0usize;
+        let mut newly_evicted = Vec::new();
+
+        for change in changes {
+            let is_removed_or_trashed =
+                change.removed || change.file.as_ref().is_some_and(|f| f.trashed);
+
+            if is_removed_or_trashed {
+                if let Some(existing) = Self::get_by_drive_id_with_conn(&tx, &change.file_id)? {
+                    let child_inode_i64 = existing.inode as i64;
+                    tx.execute(
+                        "UPDATE files SET last_synced_at = NULL
+                         WHERE inode IN (SELECT parent_inode FROM parent_child WHERE child_inode = ?1)",
+                        params![child_inode_i64],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM parent_child WHERE child_inode = ?1",
+                        params![child_inode_i64],
+                    )?;
+                    if existing.inode > SHARED_WITH_ME_INODE {
+                        tx.execute(
+                            "DELETE FROM files WHERE inode = ?1",
+                            params![child_inode_i64],
+                        )?;
+                    }
+                    newly_evicted.push(existing.inode);
+                    affected_count += 1;
+                }
+                // Also invalidate the virtual "Shared with me" directory in case a shared item was removed
+                tx.execute(
+                    "UPDATE files SET last_synced_at = NULL WHERE inode = ?1",
+                    params![SHARED_WITH_ME_INODE as i64],
+                )?;
+            } else if let Some(ref drive_file) = change.file {
+                let upserted = Self::upsert_file_with_conn(&tx, drive_file)?;
+                let child_inode_i64 = upserted.inode as i64;
+                newly_evicted.push(upserted.inode);
+
+                // Invalidate any previously recorded parent directories for this inode
+                tx.execute(
+                    "UPDATE files SET last_synced_at = NULL
+                     WHERE inode IN (SELECT parent_inode FROM parent_child WHERE child_inode = ?1)",
+                    params![child_inode_i64],
+                )?;
+
+                // Invalidate any new/current parent directories reported by Drive
+                let mut has_known_local_parent = false;
+                for parent_drive_id in &drive_file.parents {
+                    let updated = tx.execute(
+                        "UPDATE files SET last_synced_at = NULL WHERE drive_id = ?1",
+                        params![parent_drive_id],
+                    )?;
+                    if updated > 0 {
+                        has_known_local_parent = true;
+                    }
+                    if parent_drive_id == ROOT_DRIVE_ID {
+                        tx.execute(
+                            "UPDATE files SET last_synced_at = NULL WHERE inode = ?1",
+                            params![ROOT_INODE as i64],
+                        )?;
+                        has_known_local_parent = true;
+                    }
+                }
+
+                // If the changed file has no listed parents or its parent is outside our cached
+                // hierarchy (e.g., a "Shared with me" item owned by another user), invalidate
+                // SHARED_WITH_ME_INODE so its directory listing refreshes on next access.
+                if drive_file.parents.is_empty() || !has_known_local_parent {
+                    tx.execute(
+                        "UPDATE files SET last_synced_at = NULL WHERE inode = ?1",
+                        params![SHARED_WITH_ME_INODE as i64],
+                    )?;
+                }
+
+                affected_count += 1;
+            }
+        }
+
+        if let Some(token) = new_page_token {
+            tx.execute(
+                "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![CHANGES_PAGE_TOKEN_KEY, token],
+            )?;
+        }
+
+        tx.commit()?;
+
+        if !newly_evicted.is_empty() {
+            if let Ok(mut guard) = self.evicted_inodes.lock() {
+                guard.extend(newly_evicted);
+            }
+        }
+
+        Ok(affected_count)
+    }
+
+    /// Drains and returns the set of inodes whose content/metadata was updated or removed
+    /// by incremental sync so the FUSE layer can evict any stale read-ahead / exported buffers.
+    pub fn take_evicted_inodes(&self) -> Vec<u64> {
+        match self.evicted_inodes.lock() {
+            Ok(mut guard) => guard.drain().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Clears all cached files, directory edges, and sync state while preserving reserved root (`1`)
+    /// and "Shared with me" (`2`) inodes.
+    pub fn clear_all(&self) -> Result<(), CacheError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+
+        let mut all_inodes = Vec::new();
+        {
+            let mut stmt = tx.prepare("SELECT inode FROM files WHERE inode > ?1")?;
+            let rows = stmt.query_map(params![SHARED_WITH_ME_INODE as i64], |r| {
+                let ino: i64 = r.get(0)?;
+                Ok(ino as u64)
+            })?;
+            for row in rows {
+                all_inodes.push(row?);
+            }
+        }
+
+        tx.execute("DELETE FROM parent_child", [])?;
+        tx.execute("DELETE FROM sync_state", [])?;
+        tx.execute(
+            "DELETE FROM files WHERE inode > ?1",
+            params![SHARED_WITH_ME_INODE as i64],
+        )?;
+        tx.execute(
+            "UPDATE files SET last_synced_at = NULL WHERE inode IN (?1, ?2)",
+            params![ROOT_INODE as i64, SHARED_WITH_ME_INODE as i64],
+        )?;
+
+        tx.commit()?;
+
+        if !all_inodes.is_empty() {
+            if let Ok(mut guard) = self.evicted_inodes.lock() {
+                guard.extend(all_inodes);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Sanitizes a Google Drive filename for POSIX compatibility and deterministically disambiguates
 /// collisions among siblings in the same directory (e.g., `report.pdf` -> `report (1).pdf`).
-fn disambiguate_filename(raw_name: &str, used_names: &mut HashSet<String>) -> String {
+pub(crate) fn disambiguate_filename(raw_name: &str, used_names: &mut HashSet<String>) -> String {
     let base_name = sanitize_posix_filename(raw_name);
     if used_names.insert(base_name.clone()) {
         return base_name;
@@ -511,11 +854,13 @@ mod tests {
             size,
             modified_time: 1_700_000_000,
             parents: vec![ROOT_DRIVE_ID.to_string()],
+            trashed: false,
+            web_view_link: None,
         }
     }
 
     #[test]
-    fn test_root_inode_initialization() {
+    fn test_root_and_shared_with_me_inode_initialization() {
         let cache = Cache::open_in_memory(60).expect("Failed to initialize in-memory cache");
 
         let root_by_ino = cache
@@ -534,10 +879,25 @@ mod tests {
             .expect("Root drive_id must exist");
         assert_eq!(root_by_drive_id.inode, ROOT_INODE);
 
+        let shared_by_ino = cache
+            .get_by_inode(SHARED_WITH_ME_INODE)
+            .expect("Query shared_with_me by inode failed")
+            .expect("Shared with me inode must exist");
+        assert_eq!(shared_by_ino.inode, 2);
+        assert_eq!(shared_by_ino.drive_id, SHARED_WITH_ME_DRIVE_ID);
+        assert_eq!(shared_by_ino.name, SHARED_WITH_ME_NAME);
+        assert!(shared_by_ino.is_dir);
+
         assert_eq!(
             cache
                 .get_parent_inode(ROOT_INODE)
                 .expect("get_parent_inode failed"),
+            ROOT_INODE
+        );
+        assert_eq!(
+            cache
+                .get_parent_inode(SHARED_WITH_ME_INODE)
+                .expect("get_parent_inode for shared_with_me failed"),
             ROOT_INODE
         );
     }
@@ -556,7 +916,7 @@ mod tests {
 
         let ino_1 = initial_entries[0].inode;
         let ino_2 = initial_entries[1].inode;
-        assert!(ino_1 > ROOT_INODE);
+        assert!(ino_1 > SHARED_WITH_ME_INODE);
         assert!(ino_2 > ino_1);
 
         // Update file_v1 name and size, and re-sync directory
@@ -656,6 +1016,10 @@ mod tests {
             .expect("Notes (1) missing");
         assert_eq!(second_notes.drive_id, "id_doc_2");
         assert!(second_notes.is_google_native_doc());
+        assert_eq!(
+            second_notes.web_url(),
+            "https://docs.google.com/document/d/id_doc_2/edit"
+        );
     }
 
     #[test]
@@ -738,6 +1102,88 @@ mod tests {
     }
 
     #[test]
+    fn test_change_page_token_and_incremental_apply_changes() {
+        let cache = Cache::open_in_memory(300).expect("Failed to open cache");
+        assert!(cache.get_change_page_token().unwrap().is_none());
+
+        cache
+            .set_change_page_token("token_100")
+            .expect("set_change_page_token failed");
+        assert_eq!(
+            cache.get_change_page_token().unwrap().as_deref(),
+            Some("token_100")
+        );
+
+        let file_a = sample_drive_file("file_a", "alpha.txt", "text/plain", 100);
+        let file_b = sample_drive_file("file_b", "beta.txt", "text/plain", 200);
+        cache
+            .sync_directory_children(ROOT_INODE, &[file_a.clone(), file_b.clone()])
+            .expect("Initial sync failed");
+        assert!(!cache.is_dir_stale(ROOT_INODE).unwrap());
+
+        // 1. Modify file_a and trash file_b via apply_changes
+        let mut file_a_mod = file_a;
+        file_a_mod.name = "alpha_v2.txt".to_string();
+        file_a_mod.size = 555;
+
+        let changes = vec![
+            ChangeItem {
+                file_id: "file_a".to_string(),
+                removed: false,
+                file: Some(file_a_mod),
+            },
+            ChangeItem {
+                file_id: "file_b".to_string(),
+                removed: true,
+                file: None,
+            },
+        ];
+
+        let affected = cache
+            .apply_changes(&changes, Some("token_101"))
+            .expect("apply_changes failed");
+        assert_eq!(affected, 2);
+        assert_eq!(
+            cache.get_change_page_token().unwrap().as_deref(),
+            Some("token_101")
+        );
+
+        // Root directory should now be invalidated because its children changed
+        assert!(cache.is_dir_stale(ROOT_INODE).unwrap());
+
+        // file_a metadata should be updated in place with the same inode
+        let updated_a = cache
+            .get_by_drive_id("file_a")
+            .unwrap()
+            .expect("file_a should still exist");
+        assert_eq!(updated_a.name, "alpha_v2.txt");
+        assert_eq!(updated_a.size, 555);
+
+        // file_b should be completely removed from files and parent_child
+        assert!(cache.get_by_drive_id("file_b").unwrap().is_none());
+        assert!(cache.lookup_child(ROOT_INODE, "beta.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_clear_all_preserves_reserved_inodes() {
+        let cache = Cache::open_in_memory(60).expect("Failed to open cache");
+        let file = sample_drive_file("file_1", "doc.txt", "text/plain", 42);
+        cache
+            .sync_directory_children(ROOT_INODE, &[file])
+            .expect("Sync failed");
+        cache.set_change_page_token("tok_1").unwrap();
+
+        cache.clear_all().expect("clear_all failed");
+
+        assert!(cache.get_by_inode(ROOT_INODE).unwrap().is_some());
+        assert!(cache.get_by_inode(SHARED_WITH_ME_INODE).unwrap().is_some());
+        assert!(cache.get_by_drive_id("file_1").unwrap().is_none());
+        assert!(cache.list_children(ROOT_INODE).unwrap().is_empty());
+        assert!(cache.get_change_page_token().unwrap().is_none());
+        assert!(cache.is_dir_stale(ROOT_INODE).unwrap());
+    }
+
+    #[test]
     fn test_error_mapping_to_posix_errno() {
         assert_eq!(
             CacheError::NotFound("missing".into()).to_errno(),
@@ -763,5 +1209,123 @@ mod tests {
             .is_dir_stale(999_999)
             .expect_err("Expected NotFound error");
         assert_eq!(not_found_err.to_errno(), libc::ENOENT);
+    }
+
+    #[test]
+    fn test_phase1_inode_2_conflict_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE files (
+                inode INTEGER PRIMARY KEY AUTOINCREMENT,
+                drive_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                modified_time INTEGER NOT NULL DEFAULT 0,
+                is_dir INTEGER NOT NULL DEFAULT 0,
+                last_synced_at INTEGER
+            );
+            CREATE TABLE parent_child (
+                parent_inode INTEGER NOT NULL,
+                child_inode INTEGER NOT NULL,
+                effective_name TEXT NOT NULL,
+                PRIMARY KEY (parent_inode, effective_name)
+            );
+            INSERT INTO files (inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at)
+            VALUES (1, 'root', '', 'application/vnd.google-apps.folder', 0, 1700000000, 1, 1700000000);
+            INSERT INTO files (inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at)
+            VALUES (2, 'legacy_folder_2', 'Projects', 'application/vnd.google-apps.folder', 0, 1700000000, 1, 1700000000);
+            INSERT INTO files (inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at)
+            VALUES (3, 'legacy_child_3', 'readme.md', 'text/markdown', 256, 1700000000, 0, NULL);
+            INSERT INTO parent_child (parent_inode, child_inode, effective_name) VALUES (1, 2, 'Projects');
+            INSERT INTO parent_child (parent_inode, child_inode, effective_name) VALUES (2, 3, 'readme.md');
+            ",
+        )
+        .unwrap();
+
+        let cache = Cache::init_connection(conn, 60).expect("Migration of Phase 1 DB failed");
+
+        // Inode 2 must now be the reserved "Shared with me" directory
+        let shared = cache
+            .get_by_inode(SHARED_WITH_ME_INODE)
+            .unwrap()
+            .expect("SHARED_WITH_ME_INODE must exist");
+        assert_eq!(shared.drive_id, SHARED_WITH_ME_DRIVE_ID);
+        assert_eq!(shared.name, SHARED_WITH_ME_NAME);
+
+        // The legacy folder that previously occupied inode 2 must be remapped to a fresh inode > 2
+        let remapped_folder = cache
+            .get_by_drive_id("legacy_folder_2")
+            .unwrap()
+            .expect("legacy_folder_2 must still exist");
+        assert!(remapped_folder.inode > SHARED_WITH_ME_INODE);
+        assert_eq!(remapped_folder.name, "Projects");
+
+        // Both its parent edge under root and its child edge for readme.md must be preserved
+        let looked_up_folder = cache
+            .lookup_child(ROOT_INODE, "Projects")
+            .unwrap()
+            .expect("Projects must still be a child of root");
+        assert_eq!(looked_up_folder.inode, remapped_folder.inode);
+
+        let looked_up_child = cache
+            .lookup_child(remapped_folder.inode, "readme.md")
+            .unwrap()
+            .expect("readme.md must still be a child of remapped Projects folder");
+        assert_eq!(looked_up_child.drive_id, "legacy_child_3");
+    }
+
+    #[test]
+    fn test_apply_changes_invalidates_shared_with_me_and_tracks_evictions() {
+        let cache = Cache::open_in_memory(300).expect("Failed to open cache");
+        let shared_file = DriveFile {
+            id: "shared_doc_1".to_string(),
+            name: "Shared Spec".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 100,
+            modified_time: 1_700_000_000,
+            parents: vec![],
+            trashed: false,
+            web_view_link: None,
+        };
+        cache
+            .sync_directory_children(SHARED_WITH_ME_INODE, &[shared_file])
+            .unwrap();
+        assert!(!cache.is_dir_stale(SHARED_WITH_ME_INODE).unwrap());
+
+        // Apply a change for a newly shared item with no local parents
+        let new_shared_change = ChangeItem {
+            file_id: "shared_doc_2".to_string(),
+            removed: false,
+            file: Some(DriveFile {
+                id: "shared_doc_2".to_string(),
+                name: "New Shared File".to_string(),
+                mime_type: "text/plain".to_string(),
+                size: 200,
+                modified_time: 1_700_000_500,
+                parents: vec!["external_owner_folder_id".to_string()],
+                trashed: false,
+                web_view_link: None,
+            }),
+        };
+
+        let affected = cache
+            .apply_changes(&[new_shared_change], Some("tok_200"))
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        // SHARED_WITH_ME_INODE must now be invalidated so its listing refreshes
+        assert!(cache.is_dir_stale(SHARED_WITH_ME_INODE).unwrap());
+
+        // Evicted inodes must include the newly upserted shared file's inode
+        let evicted = cache.take_evicted_inodes();
+        let new_shared_ino = cache
+            .get_by_drive_id("shared_doc_2")
+            .unwrap()
+            .unwrap()
+            .inode;
+        assert!(evicted.contains(&new_shared_ino));
+        assert!(cache.take_evicted_inodes().is_empty());
     }
 }

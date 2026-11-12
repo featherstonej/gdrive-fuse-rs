@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -11,8 +12,12 @@ use fuser::{
 };
 use tokio::runtime::Handle;
 
-use crate::api::{DriveClient, FOLDER_MIME_TYPE};
-use crate::cache::{CachedFile, MetadataCache, ROOT_DRIVE_ID, ROOT_INODE};
+use crate::api::{ApiError, DriveClient, StorageQuota, FOLDER_MIME_TYPE};
+use crate::auth::GoogleDocsMode;
+use crate::cache::{
+    disambiguate_filename, CachedFile, MetadataCache, ROOT_DRIVE_ID, ROOT_INODE,
+    SHARED_WITH_ME_DRIVE_ID, SHARED_WITH_ME_INODE, SHARED_WITH_ME_NAME,
+};
 
 /// Default time-to-live for FUSE attribute and directory entry responses.
 pub const DEFAULT_ATTR_TTL: Duration = Duration::from_secs(60);
@@ -26,6 +31,9 @@ pub const MAX_READ_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 /// Standard 512-byte POSIX block size used for reporting `FileAttr::blocks`.
 pub const BLOCK_SIZE: u32 = 512;
 
+/// Time-to-live for cached `statfs` storage quota responses (5 minutes).
+pub const QUOTA_CACHE_TTL: Duration = Duration::from_secs(300);
+
 /// Maximum number of active read-ahead chunks retained in memory simultaneously.
 const MAX_CACHED_CHUNKS: usize = 4;
 
@@ -33,11 +41,23 @@ const MAX_CACHED_CHUNKS: usize = 4;
 const WRITE_OPEN_FLAGS: i32 =
     libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND;
 
+/// Computed `statfs` metrics returned to the kernel and desktop file managers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatfsSnapshot {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub bsize: u32,
+    pub namelen: u32,
+    pub frsize: u32,
+}
+
 /// A single in-memory read-ahead chunk cached for an open file.
 #[derive(Debug, Clone)]
 pub struct ReadChunk {
     pub ino: u64,
     pub offset: u64,
+    pub modified_time: i64,
     pub data: Bytes,
     pub last_accessed: Instant,
 }
@@ -95,11 +115,83 @@ impl ReadChunkBuffer {
         None
     }
 
+    /// Returns a zero-copy `Bytes` slice if `[offset, offset + requested_len)` is cached for `ino`
+    /// and its cached `modified_time` matches the current file metadata; evicts stale entries on mismatch.
+    pub fn get_slice_for_mtime(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        requested_len: usize,
+        modified_time: i64,
+    ) -> Option<Bytes> {
+        if self
+            .chunks
+            .iter()
+            .any(|c| c.ino == ino && c.modified_time != modified_time)
+        {
+            self.evict(ino);
+            return None;
+        }
+        self.get_slice(ino, offset, requested_len)
+    }
+
+    /// Returns the full cached `Bytes` if a chunk starting at `offset == 0` is buffered for `ino`.
+    pub fn get_zero_offset_chunk(&mut self, ino: u64) -> Option<Bytes> {
+        for chunk in &mut self.chunks {
+            if chunk.ino == ino && chunk.offset == 0 {
+                chunk.last_accessed = Instant::now();
+                return Some(chunk.data.clone());
+            }
+        }
+        None
+    }
+
+    /// Returns the full cached `Bytes` if a chunk starting at `offset == 0` is buffered for `ino`
+    /// and its `modified_time` matches; evicts stale entries on mismatch.
+    pub fn get_zero_offset_chunk_for_mtime(
+        &mut self,
+        ino: u64,
+        modified_time: i64,
+    ) -> Option<Bytes> {
+        if self
+            .chunks
+            .iter()
+            .any(|c| c.ino == ino && c.modified_time != modified_time)
+        {
+            self.evict(ino);
+            return None;
+        }
+        self.get_zero_offset_chunk(ino)
+    }
+
+    /// Returns the length of a cached chunk starting at `offset == 0` for `ino` without mutating access timestamps.
+    pub fn peek_zero_offset_len(&self, ino: u64) -> Option<u64> {
+        self.chunks
+            .iter()
+            .find(|c| c.ino == ino && c.offset == 0)
+            .map(|c| c.data.len() as u64)
+    }
+
+    /// Returns the length of a cached chunk starting at `offset == 0` for `ino` if its `modified_time` matches.
+    pub fn peek_zero_offset_len_for_mtime(&self, ino: u64, modified_time: i64) -> Option<u64> {
+        self.chunks
+            .iter()
+            .find(|c| c.ino == ino && c.offset == 0 && c.modified_time == modified_time)
+            .map(|c| c.data.len() as u64)
+    }
+
     /// Inserts or replaces the read-ahead chunk for `ino`, evicting the least-recently accessed chunk if full.
     pub fn insert(&mut self, ino: u64, offset: u64, data: Bytes) {
+        self.insert_with_mtime(ino, offset, 0, data);
+    }
+
+    /// Inserts or replaces the read-ahead chunk for `ino` tagged with `modified_time`,
+    /// evicting the least-recently accessed chunk if full.
+    pub fn insert_with_mtime(&mut self, ino: u64, offset: u64, modified_time: i64, data: Bytes) {
         let now = Instant::now();
         if let Some(existing) = self.chunks.iter_mut().find(|c| c.ino == ino) {
             existing.offset = offset;
+            existing.modified_time = modified_time;
             existing.data = data;
             existing.last_accessed = now;
             return;
@@ -119,6 +211,7 @@ impl ReadChunkBuffer {
         self.chunks.push(ReadChunk {
             ino,
             offset,
+            modified_time,
             data,
             last_accessed: now,
         });
@@ -140,6 +233,71 @@ impl ReadChunkBuffer {
     }
 }
 
+/// Polls Google Drive `changes.list` once (initializing `startPageToken` if not yet recorded)
+/// and applies any remote changes to the local SQLite metadata cache.
+pub async fn sync_changes_once(
+    api: &DriveClient,
+    cache: &MetadataCache,
+) -> Result<usize, ApiError> {
+    let maybe_token = match cache.get_change_page_token() {
+        Ok(tok) => tok,
+        Err(e) => {
+            log::error!("Failed to read change page token from cache: {}", e);
+            None
+        }
+    };
+
+    let Some(token) = maybe_token else {
+        let start_token = api.get_start_page_token().await?;
+        if let Err(e) = cache.set_change_page_token(&start_token) {
+            log::error!("Failed to save initial startPageToken to cache: {}", e);
+        }
+        return Ok(0);
+    };
+
+    let (changes, new_token) = match api.list_changes(&token).await {
+        Ok(res) => res,
+        Err(err) if err.is_expired_page_token() => {
+            log::warn!(
+                "Google Drive change page token '{}' expired ({}); clearing cache and reinitializing startPageToken",
+                token,
+                err
+            );
+            if let Err(clear_err) = cache.clear_all() {
+                log::error!(
+                    "Failed to clear cache after expired change page token: {}",
+                    clear_err
+                );
+            }
+            let fresh_token = api.get_start_page_token().await?;
+            if let Err(set_err) = cache.set_change_page_token(&fresh_token) {
+                log::error!(
+                    "Failed to save fresh startPageToken after token expiry: {}",
+                    set_err
+                );
+            }
+            return Ok(0);
+        }
+        Err(err) => return Err(err),
+    };
+    match cache.apply_changes(&changes, Some(&new_token)) {
+        Ok(affected) => {
+            if affected > 0 {
+                log::info!(
+                    "Applied {} remote Google Drive change(s) (new page token={})",
+                    affected,
+                    new_token
+                );
+            }
+            Ok(affected)
+        }
+        Err(e) => {
+            log::error!("Failed to apply incremental Drive changes to cache: {}", e);
+            Ok(0)
+        }
+    }
+}
+
 /// Read-only Google Drive FUSE filesystem implementation.
 pub struct GDriveFS {
     api: Arc<DriveClient>,
@@ -150,6 +308,9 @@ pub struct GDriveFS {
     chunk_buffer: ReadChunkBuffer,
     uid: u32,
     gid: u32,
+    google_docs_mode: GoogleDocsMode,
+    shared_with_me: bool,
+    quota_cache: Option<(StorageQuota, Instant)>,
 }
 
 impl GDriveFS {
@@ -172,6 +333,27 @@ impl GDriveFS {
         attr_ttl: Duration,
         chunk_size: usize,
     ) -> Self {
+        Self::with_full_config(
+            api,
+            cache,
+            rt_handle,
+            attr_ttl,
+            chunk_size,
+            GoogleDocsMode::Browser,
+            true,
+        )
+    }
+
+    /// Creates a new `GDriveFS` with full Phase 2 configuration options.
+    pub fn with_full_config(
+        api: Arc<DriveClient>,
+        cache: Arc<MetadataCache>,
+        rt_handle: Handle,
+        attr_ttl: Duration,
+        chunk_size: usize,
+        google_docs_mode: GoogleDocsMode,
+        shared_with_me: bool,
+    ) -> Self {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
         Self {
@@ -183,22 +365,167 @@ impl GDriveFS {
             chunk_buffer: ReadChunkBuffer::default(),
             uid,
             gid,
+            google_docs_mode,
+            shared_with_me,
+            quota_cache: None,
         }
+    }
+
+    /// Returns the file extension appended to Google Workspace native files under `mode`.
+    pub fn google_doc_extension(mime_type: &str, mode: GoogleDocsMode) -> &'static str {
+        match mode {
+            GoogleDocsMode::Browser => match mime_type {
+                "application/vnd.google-apps.document" => ".gdoc",
+                "application/vnd.google-apps.spreadsheet" => ".gsheet",
+                "application/vnd.google-apps.presentation" => ".gslides",
+                _ => ".gdrive",
+            },
+            GoogleDocsMode::Desktop => ".desktop",
+            GoogleDocsMode::Pdf => ".pdf",
+            GoogleDocsMode::Office => match mime_type {
+                "application/vnd.google-apps.document" => ".docx",
+                "application/vnd.google-apps.spreadsheet" => ".xlsx",
+                "application/vnd.google-apps.presentation" => ".pptx",
+                _ => ".pdf",
+            },
+        }
+    }
+
+    /// Returns the target MIME type for `/export` when `mode` is `Pdf` or `Office`.
+    pub fn google_doc_export_mime(mime_type: &str, mode: GoogleDocsMode) -> Option<&'static str> {
+        match mode {
+            GoogleDocsMode::Browser | GoogleDocsMode::Desktop => None,
+            GoogleDocsMode::Pdf => Some("application/pdf"),
+            GoogleDocsMode::Office => match mime_type {
+                "application/vnd.google-apps.document" => Some(
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ),
+                "application/vnd.google-apps.spreadsheet" => {
+                    Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                }
+                "application/vnd.google-apps.presentation" => Some(
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                ),
+                _ => Some("application/pdf"),
+            },
+        }
+    }
+
+    /// Returns the display name exposed in `readdir` and `lookup` for `file`.
+    pub fn display_name_for_file(
+        effective_name: &str,
+        file: &CachedFile,
+        mode: GoogleDocsMode,
+    ) -> String {
+        if !file.is_google_native_doc() {
+            return effective_name.to_string();
+        }
+        let ext = Self::google_doc_extension(&file.mime_type, mode);
+        if effective_name.ends_with(ext) {
+            effective_name.to_string()
+        } else {
+            format!("{}{}", effective_name, ext)
+        }
+    }
+
+    /// Generates an in-memory shortcut document (`.gdoc`/`.gsheet`/`.gslides` JSON pointer or `.desktop` launcher)
+    /// for a Google Workspace native document.
+    pub fn synthesize_google_doc_shortcut(file: &CachedFile, mode: GoogleDocsMode) -> Bytes {
+        let url = file.web_url();
+        let clean_name = file.name.replace(['\n', '\r'], " ");
+        match mode {
+            GoogleDocsMode::Desktop => Bytes::from(format!(
+                "[Desktop Entry]\nVersion=1.0\nType=Link\nName={}\nURL={}\nIcon=text-html\n",
+                clean_name, url
+            )),
+            _ => {
+                let payload = serde_json::json!({
+                    "url": url,
+                    "doc_id": file.drive_id,
+                    "title": clean_name,
+                    "mime_type": file.mime_type,
+                });
+                let mut json_str = serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| format!("{{\"url\":\"{}\"}}", url));
+                json_str.push('\n');
+                Bytes::from(json_str)
+            }
+        }
+    }
+
+    /// Evicts any cached read-ahead or exported document chunks for inodes that were
+    /// modified or removed in SQLite by background incremental sync.
+    fn drain_cache_evictions(&mut self) {
+        for ino in self.cache.take_evicted_inodes() {
+            self.chunk_buffer.evict(ino);
+        }
+    }
+
+    fn ensure_google_doc_exported(&mut self, file: &CachedFile) -> Result<Bytes, libc::c_int> {
+        self.drain_cache_evictions();
+        if let Some(existing) = self
+            .chunk_buffer
+            .get_zero_offset_chunk_for_mtime(file.inode, file.modified_time)
+        {
+            return Ok(existing);
+        }
+
+        let export_mime = Self::google_doc_export_mime(&file.mime_type, self.google_docs_mode)
+            .unwrap_or("application/pdf");
+
+        let exported = self
+            .rt_handle
+            .block_on(self.api.export_file(&file.drive_id, export_mime))
+            .map_err(|api_err| {
+                log::error!(
+                    "Failed to export Google Doc inode {} (drive_id={}, mime={}): {}",
+                    file.inode,
+                    file.drive_id,
+                    export_mime,
+                    api_err
+                );
+                api_err.to_errno()
+            })?;
+
+        self.chunk_buffer.insert_with_mtime(
+            file.inode,
+            0,
+            file.modified_time,
+            exported.clone(),
+        );
+        Ok(exported)
     }
 
     /// Converts a `CachedFile` record into a `fuser::FileAttr` structure.
     pub fn file_to_attr(&self, file: &CachedFile) -> FileAttr {
         let mtime = unix_secs_to_system_time(file.modified_time);
         let (kind, perm, nlink) = if file.is_dir {
-            (FileType::Directory, 0o555, 2)
+            (FileType::Directory, 0o755, 2)
+        } else if file.is_google_native_doc() && self.google_docs_mode == GoogleDocsMode::Desktop {
+            (FileType::RegularFile, 0o755, 1)
         } else {
-            (FileType::RegularFile, 0o444, 1)
+            (FileType::RegularFile, 0o644, 1)
         };
-        let blocks = file.size.div_ceil(BLOCK_SIZE as u64);
+
+        let size = if file.is_google_native_doc() {
+            match self.google_docs_mode {
+                GoogleDocsMode::Browser | GoogleDocsMode::Desktop => {
+                    Self::synthesize_google_doc_shortcut(file, self.google_docs_mode).len() as u64
+                }
+                GoogleDocsMode::Pdf | GoogleDocsMode::Office => self
+                    .chunk_buffer
+                    .peek_zero_offset_len_for_mtime(file.inode, file.modified_time)
+                    .unwrap_or(file.size),
+            }
+        } else {
+            file.size
+        };
+
+        let blocks = size.div_ceil(BLOCK_SIZE as u64);
 
         FileAttr {
             ino: file.inode,
-            size: file.size,
+            size,
             blocks,
             atime: mtime,
             mtime,
@@ -248,18 +575,24 @@ impl GDriveFS {
                 dir_inode,
                 dir_file.drive_id
             );
-            let children = self
-                .rt_handle
-                .block_on(self.api.list_children(&dir_file.drive_id))
-                .map_err(|api_err| {
-                    log::error!(
-                        "Failed to list children from Drive API for inode {} (drive_id={}): {}",
-                        dir_inode,
-                        dir_file.drive_id,
-                        api_err
-                    );
-                    api_err.to_errno()
-                })?;
+            let children_res =
+                if dir_inode == SHARED_WITH_ME_INODE || dir_file.drive_id == SHARED_WITH_ME_DRIVE_ID
+                {
+                    self.rt_handle.block_on(self.api.list_shared_with_me())
+                } else {
+                    self.rt_handle
+                        .block_on(self.api.list_children(&dir_file.drive_id))
+                };
+
+            let children = children_res.map_err(|api_err| {
+                log::error!(
+                    "Failed to list children from Drive API for inode {} (drive_id={}): {}",
+                    dir_inode,
+                    dir_file.drive_id,
+                    api_err
+                );
+                api_err.to_errno()
+            })?;
 
             self.cache
                 .sync_directory_children(dir_inode, &children)
@@ -277,9 +610,20 @@ impl GDriveFS {
     }
 
     /// Resolves `getattr` for `ino` without requiring a `fuser::ReplyAttr`.
-    pub fn handle_getattr(&self, ino: u64) -> Result<FileAttr, libc::c_int> {
+    pub fn handle_getattr(&mut self, ino: u64) -> Result<FileAttr, libc::c_int> {
+        self.drain_cache_evictions();
         match self.cache.get_by_inode(ino) {
-            Ok(Some(file)) => Ok(self.file_to_attr(&file)),
+            Ok(Some(file)) => {
+                if file.is_google_native_doc()
+                    && matches!(
+                        self.google_docs_mode,
+                        GoogleDocsMode::Pdf | GoogleDocsMode::Office
+                    )
+                {
+                    let _ = self.ensure_google_doc_exported(&file)?;
+                }
+                Ok(self.file_to_attr(&file))
+            }
             Ok(None) if ino == FUSE_ROOT_ID => {
                 let fallback_root = CachedFile {
                     inode: ROOT_INODE,
@@ -290,6 +634,7 @@ impl GDriveFS {
                     modified_time: 0,
                     is_dir: true,
                     last_synced_at: None,
+                    web_view_link: None,
                 };
                 Ok(self.file_to_attr(&fallback_root))
             }
@@ -301,27 +646,95 @@ impl GDriveFS {
         }
     }
 
+    /// Computes the disambiguated POSIX display names for all cached children of `dir_inode`
+    /// after applying Google Workspace file extensions and reserving `"Shared with me"` in root.
+    fn disambiguated_children(
+        &self,
+        dir_inode: u64,
+    ) -> Result<Vec<(String, CachedFile)>, libc::c_int> {
+        let children = self.cache.list_children(dir_inode).map_err(|e| {
+            log::error!("Cache error listing children for inode {}: {}", dir_inode, e);
+            e.to_errno()
+        })?;
+
+        let raw_display_names: Vec<String> = children
+            .iter()
+            .map(|entry| {
+                Self::display_name_for_file(
+                    &entry.effective_name,
+                    &entry.file,
+                    self.google_docs_mode,
+                )
+            })
+            .collect();
+
+        // Assign deduplicated display names in a deterministic order (base display name, then drive_id)
+        // so that native Google Docs with appended extensions (e.g. `Plan` -> `Plan.gdoc`) cannot
+        // collide with regular sibling files (`Plan.gdoc`) or the reserved root `Shared with me` folder.
+        let mut naming_order: Vec<usize> = (0..children.len()).collect();
+        naming_order.sort_by(|&a, &b| {
+            (
+                raw_display_names[a].as_str(),
+                children[a].file.drive_id.as_str(),
+            )
+                .cmp(&(
+                    raw_display_names[b].as_str(),
+                    children[b].file.drive_id.as_str(),
+                ))
+        });
+
+        let mut used_names = HashSet::with_capacity(children.len() + 1);
+        if dir_inode == FUSE_ROOT_ID && self.shared_with_me {
+            used_names.insert(SHARED_WITH_ME_NAME.to_string());
+        }
+
+        let mut final_names = vec![String::new(); children.len()];
+        for idx in naming_order {
+            final_names[idx] = disambiguate_filename(&raw_display_names[idx], &mut used_names);
+        }
+
+        Ok(final_names
+            .into_iter()
+            .zip(children.into_iter().map(|e| e.file))
+            .collect())
+    }
+
     /// Resolves `lookup` for a child `name` inside `parent` inode.
-    pub fn handle_lookup(&self, parent: u64, name: &str) -> Result<FileAttr, libc::c_int> {
+    pub fn handle_lookup(&mut self, parent: u64, name: &str) -> Result<FileAttr, libc::c_int> {
+        self.drain_cache_evictions();
+        if parent == FUSE_ROOT_ID && self.shared_with_me && name == SHARED_WITH_ME_NAME {
+            return self.handle_getattr(SHARED_WITH_ME_INODE);
+        }
+
         self.ensure_dir_synced(parent)?;
 
-        match self.cache.lookup_child(parent, name) {
-            Ok(Some(child)) => Ok(self.file_to_attr(&child)),
-            Ok(None) => Err(libc::ENOENT),
-            Err(e) => {
-                log::error!(
-                    "Cache error looking up child '{}' in parent inode {}: {}",
-                    name,
-                    parent,
-                    e
-                );
-                Err(e.to_errno())
+        let resolved = self
+            .disambiguated_children(parent)?
+            .into_iter()
+            .find_map(|(display_name, file)| (display_name == name).then_some(file));
+
+        match resolved {
+            Some(child) => {
+                if child.is_google_native_doc()
+                    && matches!(
+                        self.google_docs_mode,
+                        GoogleDocsMode::Pdf | GoogleDocsMode::Office
+                    )
+                {
+                    let _ = self.ensure_google_doc_exported(&child)?;
+                }
+                Ok(self.file_to_attr(&child))
             }
+            None => Err(libc::ENOENT),
         }
     }
 
     /// Resolves `readdir` for `ino`, returning `.` and `..` followed by all cached children.
     pub fn handle_readdir(&self, ino: u64) -> Result<Vec<(u64, FileType, String)>, libc::c_int> {
+        if ino == SHARED_WITH_ME_INODE && !self.shared_with_me {
+            return Err(libc::ENOENT);
+        }
+
         self.ensure_dir_synced(ino)?;
 
         let parent_ino = self.cache.get_parent_inode(ino).map_err(|e| {
@@ -329,27 +742,40 @@ impl GDriveFS {
             e.to_errno()
         })?;
 
-        let children = self.cache.list_children(ino).map_err(|e| {
-            log::error!("Cache error listing children for inode {}: {}", ino, e);
-            e.to_errno()
-        })?;
+        let children = self.disambiguated_children(ino)?;
 
-        let mut entries = Vec::with_capacity(children.len() + 2);
+        let mut entries = Vec::with_capacity(children.len() + 3);
         entries.extend([
             (ino, FileType::Directory, ".".to_string()),
             (parent_ino, FileType::Directory, "..".to_string()),
         ]);
 
-        for entry in children {
-            let kind = if entry.file.is_dir {
+        if ino == FUSE_ROOT_ID && self.shared_with_me {
+            entries.push((
+                SHARED_WITH_ME_INODE,
+                FileType::Directory,
+                SHARED_WITH_ME_NAME.to_string(),
+            ));
+        }
+
+        for (display_name, file) in children {
+            let kind = if file.is_dir {
                 FileType::Directory
             } else {
                 FileType::RegularFile
             };
-            entries.push((entry.inode, kind, entry.effective_name));
+            entries.push((file.inode, kind, display_name));
         }
 
         Ok(entries)
+    }
+
+    /// Validates `access` permissions on `ino`, rejecting `W_OK` with `libc::EROFS` on the read-only mount.
+    pub fn handle_access(&mut self, ino: u64, mask: i32) -> Result<(), libc::c_int> {
+        if (mask & libc::W_OK) != 0 {
+            return Err(libc::EROFS);
+        }
+        self.handle_getattr(ino).map(|_| ())
     }
 
     /// Validates `open` flags and target inode type.
@@ -381,6 +807,7 @@ impl GDriveFS {
 
     /// Reads up to `size` bytes from `ino` starting at `offset`, utilizing the 4 MB read-ahead chunk buffer.
     pub fn handle_read(&mut self, ino: u64, offset: u64, size: u32) -> Result<Bytes, libc::c_int> {
+        self.drain_cache_evictions();
         let file = match self.cache.get_by_inode(ino) {
             Ok(Some(file)) => file,
             Ok(None) => return Err(libc::ENOENT),
@@ -394,15 +821,37 @@ impl GDriveFS {
             return Err(libc::EISDIR);
         }
 
-        // Google Workspace native documents have size == 0 (Option B) and return immediate EOF.
-        if file.is_google_native_doc() || file.size == 0 || offset >= file.size || size == 0 {
+        if file.is_google_native_doc() {
+            let doc_bytes = match self.google_docs_mode {
+                GoogleDocsMode::Browser | GoogleDocsMode::Desktop => {
+                    Self::synthesize_google_doc_shortcut(&file, self.google_docs_mode)
+                }
+                GoogleDocsMode::Pdf | GoogleDocsMode::Office => {
+                    self.ensure_google_doc_exported(&file)?
+                }
+            };
+
+            if size == 0 || offset >= doc_bytes.len() as u64 {
+                return Ok(Bytes::new());
+            }
+            let start = offset as usize;
+            let end = std::cmp::min(start.saturating_add(size as usize), doc_bytes.len());
+            return Ok(doc_bytes.slice(start..end));
+        }
+
+        if file.size == 0 || offset >= file.size || size == 0 {
             return Ok(Bytes::new());
         }
 
         let remaining = file.size - offset;
         let expected_len = std::cmp::min(size as u64, remaining) as usize;
 
-        if let Some(cached_slice) = self.chunk_buffer.get_slice(ino, offset, expected_len) {
+        if let Some(cached_slice) = self.chunk_buffer.get_slice_for_mtime(
+            ino,
+            offset,
+            expected_len,
+            file.modified_time,
+        ) {
             log::trace!(
                 "Read-ahead buffer HIT for inode {} at offset {} (len={})",
                 ino,
@@ -444,9 +893,56 @@ impl GDriveFS {
 
         let actual_len = std::cmp::min(expected_len, downloaded.len());
         let result_slice = downloaded.slice(0..actual_len);
-        self.chunk_buffer.insert(ino, offset, downloaded);
+        self.chunk_buffer
+            .insert_with_mtime(ino, offset, file.modified_time, downloaded);
 
         Ok(result_slice)
+    }
+
+    /// Resolves `statfs` storage quota metrics from Google Drive's `about.get` endpoint,
+    /// caching the result in memory for `QUOTA_CACHE_TTL` (5 minutes).
+    ///
+    /// For unlimited Google Workspace accounts (`quota.limit == 0`), `blocks`, `bfree`, and
+    /// `bavail` are reported as `0` (standard POSIX `statfs` sentinel for unbounded/unknown
+    /// filesystem capacity) rather than fabricating an arbitrary finite quota.
+    pub fn handle_statfs(&mut self) -> Result<StatfsSnapshot, libc::c_int> {
+        let quota = match self.quota_cache {
+            Some((cached_quota, fetched_at)) if fetched_at.elapsed() < QUOTA_CACHE_TTL => {
+                cached_quota
+            }
+            _ => {
+                let fresh = self
+                    .rt_handle
+                    .block_on(self.api.get_storage_quota())
+                    .map_err(|api_err| {
+                        log::warn!("Failed to query Google Drive storage quota: {}", api_err);
+                        api_err.to_errno()
+                    })?;
+                self.quota_cache = Some((fresh, Instant::now()));
+                fresh
+            }
+        };
+
+        const STATFS_BSIZE: u64 = 4096;
+        let used_blocks = quota.usage.div_ceil(STATFS_BSIZE);
+        let (total_blocks, free_blocks) = if quota.limit > 0 {
+            let total = quota.limit.div_ceil(STATFS_BSIZE).max(used_blocks);
+            let free = total.saturating_sub(used_blocks);
+            (total, free)
+        } else {
+            // Unlimited Google Workspace account (`limit == 0`): report 0 (unbounded quota sentinel)
+            // rather than fabricating an arbitrary finite capacity.
+            (0, 0)
+        };
+
+        Ok(StatfsSnapshot {
+            blocks: total_blocks,
+            bfree: free_blocks,
+            bavail: free_blocks,
+            bsize: STATFS_BSIZE as u32,
+            namelen: 255,
+            frsize: STATFS_BSIZE as u32,
+        })
     }
 }
 
@@ -469,10 +965,12 @@ impl Filesystem for GDriveFS {
         _config: &mut KernelConfig,
     ) -> Result<(), libc::c_int> {
         log::info!(
-            "Initializing gdrive-fuse-rs FUSE filesystem (uid={}, gid={}, chunk_size={} bytes)",
+            "Initializing gdrive-fuse-rs FUSE filesystem (uid={}, gid={}, chunk_size={} bytes, google_docs_mode={:?}, shared_with_me={})",
             self.uid,
             self.gid,
-            self.chunk_size
+            self.chunk_size,
+            self.google_docs_mode,
+            self.shared_with_me
         );
         Ok(())
     }
@@ -597,17 +1095,24 @@ impl Filesystem for GDriveFS {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 4096, 255, 0);
+        match self.handle_statfs() {
+            Ok(snap) => reply.statfs(
+                snap.blocks,
+                snap.bfree,
+                snap.bavail,
+                0,
+                0,
+                snap.bsize,
+                snap.namelen,
+                snap.frsize,
+            ),
+            Err(_) => reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096),
+        }
     }
 
     fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
-        if (mask & libc::W_OK) != 0 {
-            reply.error(libc::EROFS);
-            return;
-        }
-
-        match self.handle_getattr(ino) {
-            Ok(_) => reply.ok(),
+        match self.handle_access(ino, mask) {
+            Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
     }
@@ -750,26 +1255,51 @@ mod tests {
     use tokio::runtime::Runtime;
 
     fn make_test_fs(base_url: &str, rt_handle: Handle, chunk_size: usize) -> GDriveFS {
+        make_test_fs_with_options(
+            base_url,
+            rt_handle,
+            chunk_size,
+            GoogleDocsMode::Browser,
+            true,
+        )
+    }
+
+    fn make_test_fs_with_options(
+        base_url: &str,
+        rt_handle: Handle,
+        chunk_size: usize,
+        google_docs_mode: GoogleDocsMode,
+        shared_with_me: bool,
+    ) -> GDriveFS {
         let auth = Arc::new(AuthManager::new_static_for_test("test-token"));
         let api = Arc::new(
             DriveClient::with_base_url(auth, base_url).expect("Failed to create test DriveClient"),
         );
         let cache =
             Arc::new(MetadataCache::open_in_memory(60).expect("Failed to create test cache"));
-        GDriveFS::with_config(api, cache, rt_handle, DEFAULT_ATTR_TTL, chunk_size)
+        GDriveFS::with_full_config(
+            api,
+            cache,
+            rt_handle,
+            DEFAULT_ATTR_TTL,
+            chunk_size,
+            google_docs_mode,
+            shared_with_me,
+        )
     }
 
     #[test]
     fn test_getattr_root_inode_and_file_to_attr() {
         let rt = Runtime::new().unwrap();
-        let fs = make_test_fs("http://127.0.0.1:9", rt.handle().clone(), DEFAULT_READ_CHUNK_SIZE);
+        let mut fs =
+            make_test_fs("http://127.0.0.1:9", rt.handle().clone(), DEFAULT_READ_CHUNK_SIZE);
 
         let root_attr = fs
             .handle_getattr(FUSE_ROOT_ID)
             .expect("getattr on root inode 1 must succeed");
         assert_eq!(root_attr.ino, FUSE_ROOT_ID);
         assert_eq!(root_attr.kind, FileType::Directory);
-        assert_eq!(root_attr.perm, 0o555);
+        assert_eq!(root_attr.perm, 0o755);
         assert_eq!(root_attr.nlink, 2);
 
         let sample_file = CachedFile {
@@ -781,13 +1311,14 @@ mod tests {
             modified_time: 1_700_000_100,
             is_dir: false,
             last_synced_at: None,
+            web_view_link: None,
         };
         let attr = fs.file_to_attr(&sample_file);
         assert_eq!(attr.ino, 42);
         assert_eq!(attr.size, 1025);
         assert_eq!(attr.blocks, 3); // ceil(1025 / 512) = 3
         assert_eq!(attr.kind, FileType::RegularFile);
-        assert_eq!(attr.perm, 0o444);
+        assert_eq!(attr.perm, 0o644);
         assert_eq!(attr.nlink, 1);
         assert_eq!(
             attr.mtime,
@@ -796,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_and_readdir_with_mock_server() {
+    fn test_lookup_and_readdir_with_mock_server_and_clickable_google_docs() {
         let rt = Runtime::new().unwrap();
 
         let (addr, server_handle) = rt.block_on(async {
@@ -838,7 +1369,8 @@ mod tests {
                                 "name": "Roadmap",
                                 "mimeType": "application/vnd.google-apps.document",
                                 "modifiedTime": "2025-01-04T00:00:00Z",
-                                "parents": ["root"]
+                                "parents": ["root"],
+                                "webViewLink": "https://docs.google.com/document/d/gdoc_1/edit?usp=drivesdk"
                             }
                         ]
                     }"#;
@@ -860,14 +1392,22 @@ mod tests {
         let entries = fs
             .handle_readdir(FUSE_ROOT_ID)
             .expect("readdir on root must succeed");
-        assert_eq!(entries.len(), 6); // ".", "..", plus 4 Drive items
+        assert_eq!(entries.len(), 7); // ".", "..", "Shared with me", plus 4 Drive items
         assert_eq!(entries[0], (FUSE_ROOT_ID, FileType::Directory, ".".to_string()));
         assert_eq!(entries[1], (FUSE_ROOT_ID, FileType::Directory, "..".to_string()));
-        assert_eq!(entries[2].2, "Photos");
-        assert_eq!(entries[2].1, FileType::Directory);
-        assert_eq!(entries[3].2, "report.pdf");
-        assert_eq!(entries[4].2, "report (1).pdf");
-        assert_eq!(entries[5].2, "Roadmap");
+        assert_eq!(
+            entries[2],
+            (
+                SHARED_WITH_ME_INODE,
+                FileType::Directory,
+                SHARED_WITH_ME_NAME.to_string()
+            )
+        );
+        assert_eq!(entries[3].2, "Photos");
+        assert_eq!(entries[3].1, FileType::Directory);
+        assert_eq!(entries[4].2, "report.pdf");
+        assert_eq!(entries[5].2, "report (1).pdf");
+        assert_eq!(entries[6].2, "Roadmap.gdoc");
 
         // Subsequent lookups hit SQLite cache within TTL without needing another HTTP request
         let pdf_attr = fs
@@ -882,17 +1422,315 @@ mod tests {
         assert_eq!(dup_pdf_attr.size, 4096);
 
         let gdoc_attr = fs
-            .handle_lookup(FUSE_ROOT_ID, "Roadmap")
-            .expect("lookup Google Doc must succeed");
-        assert_eq!(gdoc_attr.size, 0);
+            .handle_lookup(FUSE_ROOT_ID, "Roadmap.gdoc")
+            .expect("lookup Google Doc by Roadmap.gdoc must succeed");
+        assert!(gdoc_attr.size > 0);
 
-        // Reading a Google Doc returns 0 bytes (EOF) with zero HTTP calls
+        // Reading a Google Doc in Browser mode returns the .gdoc JSON shortcut with zero HTTP calls
         let gdoc_bytes = fs
             .handle_read(gdoc_attr.ino, 0, 4096)
-            .expect("reading Google Doc should return EOF");
-        assert!(gdoc_bytes.is_empty());
+            .expect("reading Google Doc shortcut should succeed");
+        let json_str = std::str::from_utf8(&gdoc_bytes).unwrap();
+        assert_eq!(gdoc_bytes.len() as u64, gdoc_attr.size);
+        assert!(json_str.contains("https://docs.google.com/document/d/gdoc_1/edit?usp=drivesdk"));
+        assert!(json_str.contains("\"doc_id\": \"gdoc_1\""));
 
         rt.block_on(server_handle).unwrap();
+    }
+
+    #[test]
+    fn test_google_docs_desktop_and_pdf_export_modes() {
+        let rt = Runtime::new().unwrap();
+        let fake_pdf_bytes = b"%PDF-1.7\nFake exported Google Doc PDF payload\n%%EOF";
+
+        let (addr, server_handle) = rt.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let handle = tokio::spawn(async move {
+                // Request 1: list_children, Request 2: export_file
+                for req_idx in 0..2 {
+                    if let Ok((mut stream, _)) = listener.accept().await {
+                        let mut buf = vec![0u8; 4096];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        let req_str = String::from_utf8_lossy(&buf[..n]);
+
+                        if req_idx == 0 {
+                            let body = r#"{
+                                "files": [
+                                    {
+                                        "id": "gdoc_pdf_1",
+                                        "name": "Quarterly Spec",
+                                        "mimeType": "application/vnd.google-apps.document",
+                                        "modifiedTime": "2025-01-05T00:00:00Z",
+                                        "parents": ["root"]
+                                    }
+                                ]
+                            }"#;
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                        } else {
+                            assert!(req_str.contains("/files/gdoc_pdf_1/export"));
+                            assert!(req_str.contains("application%2Fpdf"));
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                fake_pdf_bytes.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.write_all(fake_pdf_bytes).await;
+                        }
+                    }
+                }
+            });
+
+            (addr, handle)
+        });
+
+        // Verify Desktop launcher synthesis
+        let sample_doc = CachedFile {
+            inode: 77,
+            drive_id: "sheet_77".to_string(),
+            name: "Budget 2026".to_string(),
+            mime_type: "application/vnd.google-apps.spreadsheet".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            is_dir: false,
+            last_synced_at: None,
+            web_view_link: None,
+        };
+        assert_eq!(
+            GDriveFS::display_name_for_file("Budget 2026", &sample_doc, GoogleDocsMode::Desktop),
+            "Budget 2026.desktop"
+        );
+        assert_eq!(
+            GDriveFS::display_name_for_file("Budget 2026", &sample_doc, GoogleDocsMode::Office),
+            "Budget 2026.xlsx"
+        );
+        let desktop_bytes =
+            GDriveFS::synthesize_google_doc_shortcut(&sample_doc, GoogleDocsMode::Desktop);
+        let desktop_str = std::str::from_utf8(&desktop_bytes).unwrap();
+        assert!(desktop_str.contains("[Desktop Entry]"));
+        assert!(desktop_str.contains("Type=Link"));
+        assert!(desktop_str.contains("URL=https://docs.google.com/spreadsheets/d/sheet_77/edit"));
+
+        // Verify Pdf export mode end-to-end
+        let base_url = format!("http://{}/drive/v3", addr);
+        let mut fs = make_test_fs_with_options(
+            &base_url,
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+            GoogleDocsMode::Pdf,
+            false,
+        );
+
+        let entries = fs.handle_readdir(FUSE_ROOT_ID).unwrap();
+        assert_eq!(entries.len(), 3); // ".", "..", "Quarterly Spec.pdf"
+        assert_eq!(entries[2].2, "Quarterly Spec.pdf");
+
+        let attr = fs
+            .handle_lookup(FUSE_ROOT_ID, "Quarterly Spec.pdf")
+            .expect("lookup Quarterly Spec.pdf must export and return exact PDF size");
+        assert_eq!(attr.size, fake_pdf_bytes.len() as u64);
+
+        let read_data = fs
+            .handle_read(attr.ino, 0, 4096)
+            .expect("reading exported PDF must serve from chunk buffer");
+        assert_eq!(&read_data[..], fake_pdf_bytes);
+
+        rt.block_on(server_handle).unwrap();
+    }
+
+    #[test]
+    fn test_statfs_storage_quota_and_caching() {
+        let rt = Runtime::new().unwrap();
+        let about_calls = Arc::new(AtomicUsize::new(0));
+        let about_calls_clone = Arc::clone(&about_calls);
+
+        let (addr, server_handle) = rt.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let handle = tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    about_calls_clone.fetch_add(1, Ordering::SeqCst);
+
+                    // 15 GiB limit, 5 GiB usage
+                    let body = r#"{
+                        "storageQuota": {
+                            "limit": "16106127360",
+                            "usage": "5368709120"
+                        }
+                    }"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            });
+
+            (addr, handle)
+        });
+
+        let base_url = format!("http://{}/drive/v3", addr);
+        let mut fs = make_test_fs(&base_url, rt.handle().clone(), DEFAULT_READ_CHUNK_SIZE);
+
+        let snap1 = fs.handle_statfs().expect("first statfs should succeed");
+        let snap2 = fs.handle_statfs().expect("second statfs should hit cache");
+        assert_eq!(snap1, snap2);
+        assert_eq!(about_calls.load(Ordering::SeqCst), 1);
+
+        assert_eq!(snap1.bsize, 4096);
+        assert_eq!(snap1.blocks, 16_106_127_360 / 4096);
+        assert_eq!(snap1.bfree, (16_106_127_360 - 5_368_709_120) / 4096);
+        assert_eq!(snap1.bavail, snap1.bfree);
+
+        rt.block_on(server_handle).unwrap();
+    }
+
+    #[test]
+    fn test_shared_with_me_virtual_directory() {
+        let rt = Runtime::new().unwrap();
+
+        let (addr, server_handle) = rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let handle = tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    assert!(req_str.contains("sharedWithMe"));
+
+                    let body = r#"{
+                        "files": [
+                            {
+                                "id": "shared_1",
+                                "name": "Team Notes.txt",
+                                "mimeType": "text/plain",
+                                "size": "512",
+                                "modifiedTime": "2025-02-01T00:00:00Z"
+                            }
+                        ]
+                    }"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            });
+
+            (addr, handle)
+        });
+
+        let base_url = format!("http://{}/drive/v3", addr);
+        let mut fs = make_test_fs(&base_url, rt.handle().clone(), DEFAULT_READ_CHUNK_SIZE);
+
+        let shared_attr = fs
+            .handle_lookup(FUSE_ROOT_ID, SHARED_WITH_ME_NAME)
+            .expect("lookup 'Shared with me' under root must succeed");
+        assert_eq!(shared_attr.ino, SHARED_WITH_ME_INODE);
+        assert_eq!(shared_attr.kind, FileType::Directory);
+
+        let shared_entries = fs
+            .handle_readdir(SHARED_WITH_ME_INODE)
+            .expect("readdir on SHARED_WITH_ME_INODE must succeed");
+        assert_eq!(shared_entries.len(), 3);
+        assert_eq!(
+            shared_entries[0],
+            (SHARED_WITH_ME_INODE, FileType::Directory, ".".to_string())
+        );
+        assert_eq!(
+            shared_entries[1],
+            (FUSE_ROOT_ID, FileType::Directory, "..".to_string())
+        );
+        assert_eq!(shared_entries[2].2, "Team Notes.txt");
+
+        let child_attr = fs
+            .handle_lookup(SHARED_WITH_ME_INODE, "Team Notes.txt")
+            .expect("lookup shared child must succeed");
+        assert_eq!(child_attr.size, 512);
+
+        rt.block_on(server_handle).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sync_changes_once_initializes_and_applies_changes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            for req_idx in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+
+                    let body = if req_idx == 0 {
+                        r#"{"startPageToken": "tok_100"}"#
+                    } else {
+                        r#"{
+                            "newStartPageToken": "tok_101",
+                            "changes": [
+                                {
+                                    "fileId": "f_changed",
+                                    "removed": false,
+                                    "file": {
+                                        "id": "f_changed",
+                                        "name": "fresh.txt",
+                                        "mimeType": "text/plain",
+                                        "size": "99",
+                                        "modifiedTime": "2025-04-01T00:00:00Z",
+                                        "parents": ["root"],
+                                        "trashed": false
+                                    }
+                                }
+                            ]
+                        }"#
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let auth = Arc::new(AuthManager::new_static_for_test("test-token"));
+        let api = DriveClient::with_base_url(auth, format!("http://{}/drive/v3", addr)).unwrap();
+        let cache = MetadataCache::open_in_memory(60).unwrap();
+
+        // First call initializes startPageToken
+        let count1 = sync_changes_once(&api, &cache).await.unwrap();
+        assert_eq!(count1, 0);
+        assert_eq!(
+            cache.get_change_page_token().unwrap().as_deref(),
+            Some("tok_100")
+        );
+
+        // Second call polls changes and applies them
+        let count2 = sync_changes_once(&api, &cache).await.unwrap();
+        assert_eq!(count2, 1);
+        assert_eq!(
+            cache.get_change_page_token().unwrap().as_deref(),
+            Some("tok_101")
+        );
+        let updated = cache.get_by_drive_id("f_changed").unwrap().unwrap();
+        assert_eq!(updated.name, "fresh.txt");
+        assert_eq!(updated.size, 99);
+
+        server_handle.await.unwrap();
     }
 
     #[test]
@@ -1027,6 +1865,8 @@ mod tests {
             size: 10,
             modified_time: 1_700_000_000,
             parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
         };
         let cached_reg = fs.cache.upsert_file(&reg_file).unwrap();
         assert_eq!(
@@ -1039,5 +1879,276 @@ mod tests {
         assert_eq!(fs.handle_readdir(FUSE_ROOT_ID), Err(libc::EACCES));
 
         rt.block_on(server_handle).unwrap();
+    }
+
+    #[test]
+    fn test_desktop_launcher_executable_perm_and_unlimited_statfs_and_cache_eviction() {
+        let rt = Runtime::new().unwrap();
+        let export_calls = Arc::new(AtomicUsize::new(0));
+        let export_calls_clone = Arc::clone(&export_calls);
+
+        let (addr, server_handle) = rt.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let handle = tokio::spawn(async move {
+                // Request 1: about (unlimited quota), Request 2: export v1, Request 3: export v2
+                for req_idx in 0..3 {
+                    if let Ok((mut stream, _)) = listener.accept().await {
+                        let mut buf = vec![0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+
+                        if req_idx == 0 {
+                            let body = r#"{"storageQuota": {"usage": "10737418240"}}"#;
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                        } else {
+                            let call_num = export_calls_clone.fetch_add(1, Ordering::SeqCst) + 1;
+                            let pdf_payload = format!("%PDF-1.7 version {}", call_num);
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                pdf_payload.len(),
+                                pdf_payload
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                        }
+                    }
+                }
+            });
+
+            (addr, handle)
+        });
+
+        let base_url = format!("http://{}/drive/v3", addr);
+
+        // 1. Desktop mode marks only Google Workspace native launchers executable (0o755)
+        let fs_desktop = make_test_fs_with_options(
+            &base_url,
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+            GoogleDocsMode::Desktop,
+            false,
+        );
+        let native_doc = CachedFile {
+            inode: 50,
+            drive_id: "doc_50".to_string(),
+            name: "Notes".to_string(),
+            mime_type: "application/vnd.google-apps.document".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            is_dir: false,
+            last_synced_at: None,
+            web_view_link: None,
+        };
+        let regular_file = CachedFile {
+            inode: 51,
+            drive_id: "file_51".to_string(),
+            name: "notes.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 100,
+            modified_time: 1_700_000_000,
+            is_dir: false,
+            last_synced_at: None,
+            web_view_link: None,
+        };
+        assert_eq!(fs_desktop.file_to_attr(&native_doc).perm, 0o755);
+        assert_eq!(fs_desktop.file_to_attr(&regular_file).perm, 0o644);
+
+        // 2. Unlimited storage quota (`limit == 0`) reports 0 blocks instead of a fabricated 1 TiB quota
+        let mut fs_pdf = make_test_fs_with_options(
+            &base_url,
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+            GoogleDocsMode::Pdf,
+            false,
+        );
+        let snap = fs_pdf.handle_statfs().expect("statfs for unlimited account must succeed");
+        assert_eq!(snap.blocks, 0);
+        assert_eq!(snap.bfree, 0);
+        assert_eq!(snap.bavail, 0);
+
+        // 3. Remote change application evicts cached exported Google Doc bytes
+        let doc_v1 = crate::api::DriveFile {
+            id: "doc_export_1".to_string(),
+            name: "Spec".to_string(),
+            mime_type: "application/vnd.google-apps.document".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let cached_doc = fs_pdf.cache.upsert_file(&doc_v1).unwrap();
+
+        let bytes_v1 = fs_pdf.handle_read(cached_doc.inode, 0, 4096).unwrap();
+        assert_eq!(&bytes_v1[..], b"%PDF-1.7 version 1");
+        assert_eq!(export_calls.load(Ordering::SeqCst), 1);
+
+        // Apply incremental change for doc_export_1 and verify stale export buffer is evicted
+        let mut doc_v2 = doc_v1.clone();
+        doc_v2.modified_time = 1_700_000_100;
+        fs_pdf
+            .cache
+            .apply_changes(
+                &[crate::api::ChangeItem {
+                    file_id: "doc_export_1".to_string(),
+                    removed: false,
+                    file: Some(doc_v2),
+                }],
+                Some("tok_next"),
+            )
+            .unwrap();
+
+        let bytes_v2 = fs_pdf.handle_read(cached_doc.inode, 0, 4096).unwrap();
+        assert_eq!(&bytes_v2[..], b"%PDF-1.7 version 2");
+        assert_eq!(export_calls.load(Ordering::SeqCst), 2);
+
+        rt.block_on(server_handle).unwrap();
+    }
+
+    #[test]
+    fn test_display_name_disambiguation_and_access_w_ok_rejection() {
+        let rt = Runtime::new().unwrap();
+        let mut fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+
+        // Populate root in cache with:
+        // 1. A real folder named "Shared with me" (collides with virtual SHARED_WITH_ME_NAME)
+        // 2. A native Google Doc named "Plan" (whose display name becomes "Plan.gdoc")
+        // 3. A regular binary file named "Plan.gdoc"
+        let real_shared_folder = crate::api::DriveFile {
+            id: "real_shared_folder".to_string(),
+            name: "Shared with me".to_string(),
+            mime_type: FOLDER_MIME_TYPE.to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let native_plan_doc = crate::api::DriveFile {
+            id: "doc_plan_a".to_string(),
+            name: "Plan".to_string(),
+            mime_type: "application/vnd.google-apps.document".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let regular_plan_file = crate::api::DriveFile {
+            id: "file_plan_b".to_string(),
+            name: "Plan.gdoc".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            size: 321,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+
+        fs.cache
+            .sync_directory_children(
+                FUSE_ROOT_ID,
+                &[real_shared_folder, native_plan_doc, regular_plan_file],
+            )
+            .unwrap();
+
+        let entries = fs.handle_readdir(FUSE_ROOT_ID).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(_, _, n)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                ".",
+                "..",
+                "Shared with me",
+                "Shared with me (1)",
+                "Plan.gdoc",
+                "Plan (1).gdoc"
+            ]
+        );
+
+        // Virtual "Shared with me" resolves to SHARED_WITH_ME_INODE (2), while "Shared with me (1)" resolves to the real folder
+        let virt_attr = fs.handle_lookup(FUSE_ROOT_ID, "Shared with me").unwrap();
+        assert_eq!(virt_attr.ino, SHARED_WITH_ME_INODE);
+
+        let real_attr = fs
+            .handle_lookup(FUSE_ROOT_ID, "Shared with me (1)")
+            .unwrap();
+        assert!(real_attr.ino > SHARED_WITH_ME_INODE);
+        assert_eq!(real_attr.kind, FileType::Directory);
+
+        // Both "Plan.gdoc" and "Plan (1).gdoc" are uniquely addressable via handle_lookup
+        let plan_1 = fs.handle_lookup(FUSE_ROOT_ID, "Plan.gdoc").unwrap();
+        let plan_2 = fs.handle_lookup(FUSE_ROOT_ID, "Plan (1).gdoc").unwrap();
+        assert_ne!(plan_1.ino, plan_2.ino);
+
+        // Verify handle_access rejects W_OK with EROFS while allowing R_OK
+        assert_eq!(fs.handle_access(FUSE_ROOT_ID, libc::R_OK), Ok(()));
+        assert_eq!(fs.handle_access(FUSE_ROOT_ID, libc::W_OK), Err(libc::EROFS));
+        assert_eq!(
+            fs.handle_access(FUSE_ROOT_ID, libc::R_OK | libc::W_OK),
+            Err(libc::EROFS)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_changes_once_recovers_from_expired_page_token_410() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            // Request 1: list_changes returns 410 Gone, Request 2: get_start_page_token returns fresh token
+            for req_idx in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+
+                    if req_idx == 0 {
+                        let body = r#"{"error": {"code": 410, "message": "pageTokenExpired"}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let body = r#"{"startPageToken": "fresh_tok_500"}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    }
+                }
+            }
+        });
+
+        let auth = Arc::new(AuthManager::new_static_for_test("test-token"));
+        let api = DriveClient::with_base_url(auth, format!("http://{}/drive/v3", addr)).unwrap();
+        let cache = MetadataCache::open_in_memory(300).unwrap();
+        cache.set_change_page_token("expired_tok_1").unwrap();
+        cache.sync_directory_children(FUSE_ROOT_ID, &[]).unwrap();
+        assert!(!cache.is_dir_stale(FUSE_ROOT_ID).unwrap());
+
+        let count = sync_changes_once(&api, &cache)
+            .await
+            .expect("sync_changes_once must recover from 410 Gone");
+        assert_eq!(count, 0);
+        assert_eq!(
+            cache.get_change_page_token().unwrap().as_deref(),
+            Some("fresh_tok_500")
+        );
+        assert!(cache.is_dir_stale(FUSE_ROOT_ID).unwrap());
+
+        server_handle.await.unwrap();
     }
 }

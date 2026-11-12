@@ -70,6 +70,21 @@ impl AuthError {
     }
 }
 
+/// Controls how Google Workspace native documents (Docs, Sheets, Slides) are presented in FUSE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GoogleDocsMode {
+    /// Present as clickable `.gdoc`/`.gsheet`/`.gslides` browser shortcut files (default; opens in default web browser).
+    #[default]
+    Browser,
+    /// Present as FreeDesktop `.desktop` launcher files.
+    Desktop,
+    /// Export on-the-fly as `.pdf` documents via the Drive Export API.
+    Pdf,
+    /// Export on-the-fly as Office documents (`.docx`, `.xlsx`, `.pptx`) via the Drive Export API.
+    Office,
+}
+
 /// User configuration loaded from `~/.config/gdrive-fuse-rs/config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -78,6 +93,9 @@ pub struct AppConfig {
     pub cache_ttl_secs: Option<u64>,
     pub cache_db_path: Option<PathBuf>,
     pub chunk_size_bytes: Option<usize>,
+    pub google_docs_mode: Option<GoogleDocsMode>,
+    pub change_poll_secs: Option<u64>,
+    pub shared_with_me: Option<bool>,
 }
 
 impl AppConfig {
@@ -220,6 +238,28 @@ fn load_refresh_token_from_keyring() -> Option<String> {
     } else {
         Some(trimmed)
     }
+}
+
+/// Removes stored OAuth2 refresh tokens and cached client credentials from the system keyring.
+pub fn clear_keyring_credentials() -> Result<(), AuthError> {
+    for user in [KEYRING_REFRESH_TOKEN_USER, KEYRING_CLIENT_CONFIG_USER] {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| {
+            AuthError::KeyringError(format!(
+                "Failed to access keyring entry for '{}': {}",
+                user, e
+            ))
+        })?;
+        match entry.delete_password() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => {
+                return Err(AuthError::KeyringError(format!(
+                    "Failed to delete keyring entry for '{}': {}",
+                    user, e
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Represents an in-memory cached OAuth2 access token with its expiration timestamp.
@@ -586,6 +626,34 @@ mod tests {
         let missing = Path::new("/tmp/non_existent_gdrive_fuse_rs_config_12345.toml");
         let default_cfg = AppConfig::load_from_path(missing).expect("missing file returns default");
         assert_eq!(default_cfg, AppConfig::default());
+        assert_eq!(default_cfg.google_docs_mode, None);
+        assert_eq!(default_cfg.change_poll_secs, None);
+        assert_eq!(default_cfg.shared_with_me, None);
+        assert_eq!(GoogleDocsMode::default(), GoogleDocsMode::Browser);
+    }
+
+    #[test]
+    fn test_app_config_phase2_fields_toml_deserialization() {
+        let raw_toml = r#"
+            google_docs_mode = "pdf"
+            change_poll_secs = 45
+            shared_with_me = false
+        "#;
+        let parsed: AppConfig = toml::from_str(raw_toml).expect("Phase 2 TOML should parse");
+        assert_eq!(parsed.google_docs_mode, Some(GoogleDocsMode::Pdf));
+        assert_eq!(parsed.change_poll_secs, Some(45));
+        assert_eq!(parsed.shared_with_me, Some(false));
+
+        for (raw_mode, expected) in [
+            ("browser", GoogleDocsMode::Browser),
+            ("desktop", GoogleDocsMode::Desktop),
+            ("pdf", GoogleDocsMode::Pdf),
+            ("office", GoogleDocsMode::Office),
+        ] {
+            let mode_toml = format!("google_docs_mode = \"{}\"", raw_mode);
+            let cfg: AppConfig = toml::from_str(&mode_toml).expect("mode should parse");
+            assert_eq!(cfg.google_docs_mode, Some(expected));
+        }
     }
 
     #[test]
