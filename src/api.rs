@@ -65,6 +65,18 @@ impl ApiError {
             ApiError::UnexpectedStatus { .. } | ApiError::Serialization(_) => libc::EIO,
         }
     }
+
+    /// Returns `true` if this error indicates an expired or invalid `changes.list` page token
+    /// (HTTP `410 Gone`, or HTTP `400 Bad Request` referencing `pageToken` / `Invalid Value`).
+    pub fn is_expired_page_token(&self) -> bool {
+        match self {
+            ApiError::UnexpectedStatus { status: 410, .. } => true,
+            ApiError::UnexpectedStatus { status: 400, body } => {
+                body.contains("pageToken") || body.contains("Invalid Value")
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Represents a file or folder returned by Google Drive API v3.
@@ -317,6 +329,7 @@ impl DriveClient {
         loop {
             let token = self.auth.get_access_token().await?;
 
+            // Enable request compatibility for shared items/folders residing on Shared Drives.
             let mut params = vec![
                 ("q", query),
                 ("pageSize", LIST_PAGE_SIZE),

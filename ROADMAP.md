@@ -29,7 +29,7 @@ This document tracks the development phases, architectural milestones, and featu
 
 ## Phase 2: GNOME Desktop Integration & Smart Sync (Completed)
 
-**Goal:** Elevate the read-only mount into a seamless Linux/GNOME desktop experience with clickable Google Docs, accurate disk quota reporting, real-time change polling, Shared Drive access, and background service management.
+**Goal:** Elevate the read-only mount into a seamless Linux/GNOME desktop experience with clickable Google Docs, accurate disk quota reporting, real-time change polling, "Shared with me" access, and background service management.
 
 ### 2.1 Clickable Google Workspace Native Files (Docs, Sheets, Slides)
 - [x] **Browser Shortcut Mode (Default -- `--google-docs-mode=browser` / `.desktop` or `.html`):**
@@ -48,8 +48,8 @@ This document tracks the development phases, architectural milestones, and featu
 - [x] Spawn a lightweight background Tokio task that periodically polls `GET /drive/v3/changes` (`pageToken`, `includeItemsFromAllDrives=true`, `supportsAllDrives=true`).
 - [x] When remote changes are detected (file created, renamed, modified, moved, or trashed), atomically update or invalidate the affected inodes and parent directories in SQLite so local directory listings stay fresh even with longer directory TTLs.
 
-### 2.4 "Shared with me" & Shared Drives Support
-- [x] Add `supportsAllDrives=true` and `includeItemsFromAllDrives=true` to Drive API v3 requests.
+### 2.4 "Shared with me" & Shared Drive Request Compatibility
+- [x] Add `supportsAllDrives=true` and `includeItemsFromAllDrives=true` to Drive API v3 requests so shared items residing on Shared Drives can be listed, exported, and downloaded.
 - [x] Expose an optional virtual top-level directory (e.g., `Shared with me` at a reserved virtual inode) populated via `q = "sharedWithMe = true and trashed = false"`.
 
 ### 2.5 Systemd User Service & Lifecycle CLI Utilities

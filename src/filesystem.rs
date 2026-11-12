@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -14,8 +15,8 @@ use tokio::runtime::Handle;
 use crate::api::{ApiError, DriveClient, StorageQuota, FOLDER_MIME_TYPE};
 use crate::auth::GoogleDocsMode;
 use crate::cache::{
-    CachedFile, MetadataCache, ROOT_DRIVE_ID, ROOT_INODE, SHARED_WITH_ME_DRIVE_ID,
-    SHARED_WITH_ME_INODE, SHARED_WITH_ME_NAME,
+    disambiguate_filename, CachedFile, MetadataCache, ROOT_DRIVE_ID, ROOT_INODE,
+    SHARED_WITH_ME_DRIVE_ID, SHARED_WITH_ME_INODE, SHARED_WITH_ME_NAME,
 };
 
 /// Default time-to-live for FUSE attribute and directory entry responses.
@@ -254,7 +255,31 @@ pub async fn sync_changes_once(
         return Ok(0);
     };
 
-    let (changes, new_token) = api.list_changes(&token).await?;
+    let (changes, new_token) = match api.list_changes(&token).await {
+        Ok(res) => res,
+        Err(err) if err.is_expired_page_token() => {
+            log::warn!(
+                "Google Drive change page token '{}' expired ({}); clearing cache and reinitializing startPageToken",
+                token,
+                err
+            );
+            if let Err(clear_err) = cache.clear_all() {
+                log::error!(
+                    "Failed to clear cache after expired change page token: {}",
+                    clear_err
+                );
+            }
+            let fresh_token = api.get_start_page_token().await?;
+            if let Err(set_err) = cache.set_change_page_token(&fresh_token) {
+                log::error!(
+                    "Failed to save fresh startPageToken after token expiry: {}",
+                    set_err
+                );
+            }
+            return Ok(0);
+        }
+        Err(err) => return Err(err),
+    };
     match cache.apply_changes(&changes, Some(&new_token)) {
         Ok(affected) => {
             if affected > 0 {
@@ -621,6 +646,59 @@ impl GDriveFS {
         }
     }
 
+    /// Computes the disambiguated POSIX display names for all cached children of `dir_inode`
+    /// after applying Google Workspace file extensions and reserving `"Shared with me"` in root.
+    fn disambiguated_children(
+        &self,
+        dir_inode: u64,
+    ) -> Result<Vec<(String, CachedFile)>, libc::c_int> {
+        let children = self.cache.list_children(dir_inode).map_err(|e| {
+            log::error!("Cache error listing children for inode {}: {}", dir_inode, e);
+            e.to_errno()
+        })?;
+
+        let raw_display_names: Vec<String> = children
+            .iter()
+            .map(|entry| {
+                Self::display_name_for_file(
+                    &entry.effective_name,
+                    &entry.file,
+                    self.google_docs_mode,
+                )
+            })
+            .collect();
+
+        // Assign deduplicated display names in a deterministic order (base display name, then drive_id)
+        // so that native Google Docs with appended extensions (e.g. `Plan` -> `Plan.gdoc`) cannot
+        // collide with regular sibling files (`Plan.gdoc`) or the reserved root `Shared with me` folder.
+        let mut naming_order: Vec<usize> = (0..children.len()).collect();
+        naming_order.sort_by(|&a, &b| {
+            (
+                raw_display_names[a].as_str(),
+                children[a].file.drive_id.as_str(),
+            )
+                .cmp(&(
+                    raw_display_names[b].as_str(),
+                    children[b].file.drive_id.as_str(),
+                ))
+        });
+
+        let mut used_names = HashSet::with_capacity(children.len() + 1);
+        if dir_inode == FUSE_ROOT_ID && self.shared_with_me {
+            used_names.insert(SHARED_WITH_ME_NAME.to_string());
+        }
+
+        let mut final_names = vec![String::new(); children.len()];
+        for idx in naming_order {
+            final_names[idx] = disambiguate_filename(&raw_display_names[idx], &mut used_names);
+        }
+
+        Ok(final_names
+            .into_iter()
+            .zip(children.into_iter().map(|e| e.file))
+            .collect())
+    }
+
     /// Resolves `lookup` for a child `name` inside `parent` inode.
     pub fn handle_lookup(&mut self, parent: u64, name: &str) -> Result<FileAttr, libc::c_int> {
         self.drain_cache_evictions();
@@ -630,21 +708,10 @@ impl GDriveFS {
 
         self.ensure_dir_synced(parent)?;
 
-        let direct = self.cache.lookup_child(parent, name).map_err(|e| {
-            log::error!(
-                "Cache error looking up child '{}' in parent inode {}: {}",
-                name,
-                parent,
-                e
-            );
-            e.to_errno()
-        })?;
-
-        let resolved = if let Some(child) = direct {
-            Some(child)
-        } else {
-            self.lookup_google_doc_by_display_name(parent, name)?
-        };
+        let resolved = self
+            .disambiguated_children(parent)?
+            .into_iter()
+            .find_map(|(display_name, file)| (display_name == name).then_some(file));
 
         match resolved {
             Some(child) => {
@@ -662,44 +729,6 @@ impl GDriveFS {
         }
     }
 
-    fn lookup_google_doc_by_display_name(
-        &self,
-        parent: u64,
-        name: &str,
-    ) -> Result<Option<CachedFile>, libc::c_int> {
-        let candidate_exts: &[&str] = match self.google_docs_mode {
-            GoogleDocsMode::Browser => &[".gdoc", ".gsheet", ".gslides", ".gdrive"],
-            GoogleDocsMode::Desktop => &[".desktop"],
-            GoogleDocsMode::Pdf => &[".pdf"],
-            GoogleDocsMode::Office => &[".docx", ".xlsx", ".pptx", ".pdf"],
-        };
-
-        for ext in candidate_exts {
-            if let Some(stripped) = name.strip_suffix(ext) {
-                let maybe_child = self.cache.lookup_child(parent, stripped).map_err(|e| {
-                    log::error!(
-                        "Cache error looking up stripped child '{}' in parent inode {}: {}",
-                        stripped,
-                        parent,
-                        e
-                    );
-                    e.to_errno()
-                })?;
-
-                if let Some(child) = maybe_child {
-                    if child.is_google_native_doc()
-                        && Self::display_name_for_file(stripped, &child, self.google_docs_mode)
-                            == name
-                    {
-                        return Ok(Some(child));
-                    }
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Resolves `readdir` for `ino`, returning `.` and `..` followed by all cached children.
     pub fn handle_readdir(&self, ino: u64) -> Result<Vec<(u64, FileType, String)>, libc::c_int> {
         if ino == SHARED_WITH_ME_INODE && !self.shared_with_me {
@@ -713,10 +742,7 @@ impl GDriveFS {
             e.to_errno()
         })?;
 
-        let children = self.cache.list_children(ino).map_err(|e| {
-            log::error!("Cache error listing children for inode {}: {}", ino, e);
-            e.to_errno()
-        })?;
+        let children = self.disambiguated_children(ino)?;
 
         let mut entries = Vec::with_capacity(children.len() + 3);
         entries.extend([
@@ -732,21 +758,24 @@ impl GDriveFS {
             ));
         }
 
-        for entry in children {
-            let kind = if entry.file.is_dir {
+        for (display_name, file) in children {
+            let kind = if file.is_dir {
                 FileType::Directory
             } else {
                 FileType::RegularFile
             };
-            let display_name = Self::display_name_for_file(
-                &entry.effective_name,
-                &entry.file,
-                self.google_docs_mode,
-            );
-            entries.push((entry.inode, kind, display_name));
+            entries.push((file.inode, kind, display_name));
         }
 
         Ok(entries)
+    }
+
+    /// Validates `access` permissions on `ino`, rejecting `W_OK` with `libc::EROFS` on the read-only mount.
+    pub fn handle_access(&mut self, ino: u64, mask: i32) -> Result<(), libc::c_int> {
+        if (mask & libc::W_OK) != 0 {
+            return Err(libc::EROFS);
+        }
+        self.handle_getattr(ino).map(|_| ())
     }
 
     /// Validates `open` flags and target inode type.
@@ -1081,9 +1110,9 @@ impl Filesystem for GDriveFS {
         }
     }
 
-    fn access(&mut self, _req: &Request<'_>, ino: u64, _mask: i32, reply: ReplyEmpty) {
-        match self.handle_getattr(ino) {
-            Ok(_) => reply.ok(),
+    fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
+        match self.handle_access(ino, mask) {
+            Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
     }
@@ -1979,5 +2008,147 @@ mod tests {
         assert_eq!(export_calls.load(Ordering::SeqCst), 2);
 
         rt.block_on(server_handle).unwrap();
+    }
+
+    #[test]
+    fn test_display_name_disambiguation_and_access_w_ok_rejection() {
+        let rt = Runtime::new().unwrap();
+        let mut fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+
+        // Populate root in cache with:
+        // 1. A real folder named "Shared with me" (collides with virtual SHARED_WITH_ME_NAME)
+        // 2. A native Google Doc named "Plan" (whose display name becomes "Plan.gdoc")
+        // 3. A regular binary file named "Plan.gdoc"
+        let real_shared_folder = crate::api::DriveFile {
+            id: "real_shared_folder".to_string(),
+            name: "Shared with me".to_string(),
+            mime_type: FOLDER_MIME_TYPE.to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let native_plan_doc = crate::api::DriveFile {
+            id: "doc_plan_a".to_string(),
+            name: "Plan".to_string(),
+            mime_type: "application/vnd.google-apps.document".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let regular_plan_file = crate::api::DriveFile {
+            id: "file_plan_b".to_string(),
+            name: "Plan.gdoc".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            size: 321,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+
+        fs.cache
+            .sync_directory_children(
+                FUSE_ROOT_ID,
+                &[real_shared_folder, native_plan_doc, regular_plan_file],
+            )
+            .unwrap();
+
+        let entries = fs.handle_readdir(FUSE_ROOT_ID).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(_, _, n)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                ".",
+                "..",
+                "Shared with me",
+                "Shared with me (1)",
+                "Plan.gdoc",
+                "Plan (1).gdoc"
+            ]
+        );
+
+        // Virtual "Shared with me" resolves to SHARED_WITH_ME_INODE (2), while "Shared with me (1)" resolves to the real folder
+        let virt_attr = fs.handle_lookup(FUSE_ROOT_ID, "Shared with me").unwrap();
+        assert_eq!(virt_attr.ino, SHARED_WITH_ME_INODE);
+
+        let real_attr = fs
+            .handle_lookup(FUSE_ROOT_ID, "Shared with me (1)")
+            .unwrap();
+        assert!(real_attr.ino > SHARED_WITH_ME_INODE);
+        assert_eq!(real_attr.kind, FileType::Directory);
+
+        // Both "Plan.gdoc" and "Plan (1).gdoc" are uniquely addressable via handle_lookup
+        let plan_1 = fs.handle_lookup(FUSE_ROOT_ID, "Plan.gdoc").unwrap();
+        let plan_2 = fs.handle_lookup(FUSE_ROOT_ID, "Plan (1).gdoc").unwrap();
+        assert_ne!(plan_1.ino, plan_2.ino);
+
+        // Verify handle_access rejects W_OK with EROFS while allowing R_OK
+        assert_eq!(fs.handle_access(FUSE_ROOT_ID, libc::R_OK), Ok(()));
+        assert_eq!(fs.handle_access(FUSE_ROOT_ID, libc::W_OK), Err(libc::EROFS));
+        assert_eq!(
+            fs.handle_access(FUSE_ROOT_ID, libc::R_OK | libc::W_OK),
+            Err(libc::EROFS)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_changes_once_recovers_from_expired_page_token_410() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            // Request 1: list_changes returns 410 Gone, Request 2: get_start_page_token returns fresh token
+            for req_idx in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+
+                    if req_idx == 0 {
+                        let body = r#"{"error": {"code": 410, "message": "pageTokenExpired"}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let body = r#"{"startPageToken": "fresh_tok_500"}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    }
+                }
+            }
+        });
+
+        let auth = Arc::new(AuthManager::new_static_for_test("test-token"));
+        let api = DriveClient::with_base_url(auth, format!("http://{}/drive/v3", addr)).unwrap();
+        let cache = MetadataCache::open_in_memory(300).unwrap();
+        cache.set_change_page_token("expired_tok_1").unwrap();
+        cache.sync_directory_children(FUSE_ROOT_ID, &[]).unwrap();
+        assert!(!cache.is_dir_stale(FUSE_ROOT_ID).unwrap());
+
+        let count = sync_changes_once(&api, &cache)
+            .await
+            .expect("sync_changes_once must recover from 410 Gone");
+        assert_eq!(count, 0);
+        assert_eq!(
+            cache.get_change_page_token().unwrap().as_deref(),
+            Some("fresh_tok_500")
+        );
+        assert!(cache.is_dir_stale(FUSE_ROOT_ID).unwrap());
+
+        server_handle.await.unwrap();
     }
 }

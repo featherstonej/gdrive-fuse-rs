@@ -125,6 +125,7 @@ Options:
       --clear-cache                Wipe the local SQLite metadata cache before mounting (or exit if no mount point)
       --logout                     Remove saved OAuth2 tokens from the system keyring
       --install-systemd            Install a systemd user service at ~/.config/systemd/user/gdrive-fuse-rs.service
+      --open-doc <FILE>            Open a .gdoc/.gsheet/.gslides/.gdrive shortcut file in the default web browser and exit
       --no-browser                 Do not automatically launch the web browser during interactive OAuth2 login
       --allow-other                Allow other system users to access the FUSE mount
   -h, --help                       Print help
@@ -145,7 +146,7 @@ Options:
 - Clickable Google Workspace native files (`--google-docs-mode=browser|desktop|pdf|office`) so double-clicking Google Docs/Sheets/Slides opens them in your browser or exports them as PDF/Office files on the fly.
 - Real Google Drive storage quota reporting in `df -h` and GNOME Files (`statfs` via `/drive/v3/about`).
 - Background incremental change polling (`/drive/v3/changes`) for automatic SQLite cache invalidation and updates.
-- Virtual `"Shared with me"` folder (`inode = 2`) and Shared Drives support (`supportsAllDrives=true`).
+- Virtual `"Shared with me"` folder (`inode = 2`) and Shared Drive item request compatibility (`supportsAllDrives=true` / `includeItemsFromAllDrives=true`).
 - Lifecycle CLI utilities (`--clear-cache`, `--logout`, `--install-systemd`).
 
 ## License

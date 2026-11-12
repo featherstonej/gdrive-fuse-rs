@@ -388,7 +388,7 @@ fn install_gdrive_mime_handlers(exe_path: &Path) -> Result<()> {
 "#;
 
     let desktop_path = apps_dir.join("gdrive-fuse-rs-open.desktop");
-    let exe_str = exe_path.display();
+    let exe_str = escape_systemd_double_quoted(&exe_path.display().to_string());
     let desktop_entry = format!(
         "[Desktop Entry]\n\
          Version=1.0\n\
@@ -433,10 +433,28 @@ fn install_gdrive_mime_handlers(exe_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Escapes a path string for safe inclusion inside a double-quoted systemd command argument,
+/// doubling `%` specifiers (`%%`) and escaping `\`, `"`, `$`, and `` ` ``.
+fn escape_systemd_double_quoted(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    for ch in raw.chars() {
+        match ch {
+            '%' => out.push_str("%%"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            '`' => out.push_str("\\`"),
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Generates a user-level systemd service unit file (`gdrive-fuse-rs.service`) for auto-mounting on login.
 pub fn generate_systemd_unit(exe_path: &Path, mount_point: &Path) -> String {
-    let exe = exe_path.display();
-    let mp = mount_point.display();
+    let exe = escape_systemd_double_quoted(&exe_path.display().to_string());
+    let mp = escape_systemd_double_quoted(&mount_point.display().to_string());
     format!(
         "[Unit]\n\
          Description=Google Drive FUSE Filesystem (gdrive-fuse-rs)\n\
@@ -447,7 +465,7 @@ pub fn generate_systemd_unit(exe_path: &Path, mount_point: &Path) -> String {
          Type=simple\n\
          ExecStartPre=/bin/mkdir -p \"{mp}\"\n\
          ExecStart=\"{exe}\" --mount-point \"{mp}\" --no-browser\n\
-         ExecStop=/bin/sh -c 'fusermount3 -u \"{mp}\" || fusermount -u \"{mp}\"'\n\
+         ExecStop=/bin/sh -c 'fusermount3 -u \"$1\" || fusermount -u \"$1\"' sh \"{mp}\"\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
@@ -560,9 +578,19 @@ mod tests {
         assert!(unit.contains(
             "ExecStart=\"/usr/local/bin/gdrive-fuse-rs\" --mount-point \"/home/alice/GoogleDrive\" --no-browser"
         ));
-        assert!(unit.contains("fusermount3 -u \"/home/alice/GoogleDrive\""));
+        assert!(unit.contains(
+            "ExecStop=/bin/sh -c 'fusermount3 -u \"$1\" || fusermount -u \"$1\"' sh \"/home/alice/GoogleDrive\""
+        ));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
+
+        // Verify special characters (%, ", ') are safely escaped for systemd and sh
+        let escaped_unit = generate_systemd_unit(
+            Path::new("/opt/bin%/gdrive\"bin"),
+            Path::new("/home/alice/100% 'Drive' \"Test\""),
+        );
+        assert!(escaped_unit.contains("\"/opt/bin%%/gdrive\\\"bin\""));
+        assert!(escaped_unit.contains("\"/home/alice/100%% 'Drive' \\\"Test\\\"\""));
     }
 
     #[test]

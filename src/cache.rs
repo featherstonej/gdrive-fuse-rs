@@ -798,7 +798,7 @@ impl MetadataCache {
 
 /// Sanitizes a Google Drive filename for POSIX compatibility and deterministically disambiguates
 /// collisions among siblings in the same directory (e.g., `report.pdf` -> `report (1).pdf`).
-fn disambiguate_filename(raw_name: &str, used_names: &mut HashSet<String>) -> String {
+pub(crate) fn disambiguate_filename(raw_name: &str, used_names: &mut HashSet<String>) -> String {
     let base_name = sanitize_posix_filename(raw_name);
     if used_names.insert(base_name.clone()) {
         return base_name;
