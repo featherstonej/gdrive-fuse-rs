@@ -109,6 +109,12 @@ fn main() -> Result<()> {
 
     let args = CliArgs::parse();
 
+    if args.install_systemd && args.client_secret.is_some() {
+        bail!(
+            "--client-secret cannot be stored in a systemd unit; configure it in the config file or system keyring"
+        );
+    }
+
     if let Some(ref doc_path) = args.open_doc {
         return open_google_doc_shortcut(doc_path);
     }
@@ -159,7 +165,8 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("GoogleDrive")
         });
-        let unit_contents = generate_systemd_unit(&exe_path, &unit_mount_point);
+        let unit_args = systemd_mount_args(&args);
+        let unit_contents = generate_systemd_unit(&exe_path, &unit_mount_point, &unit_args);
         let config_dir = dirs::config_dir()
             .context("Could not determine user ~/.config directory for systemd unit")?;
         let unit_dir = config_dir.join("systemd").join("user");
@@ -452,9 +459,13 @@ fn escape_systemd_double_quoted(raw: &str) -> String {
 }
 
 /// Generates a user-level systemd service unit file (`gdrive-fuse-rs.service`) for auto-mounting on login.
-pub fn generate_systemd_unit(exe_path: &Path, mount_point: &Path) -> String {
+pub fn generate_systemd_unit(exe_path: &Path, mount_point: &Path, args: &[String]) -> String {
     let exe = escape_systemd_double_quoted(&exe_path.display().to_string());
     let mp = escape_systemd_double_quoted(&mount_point.display().to_string());
+    let args = args
+        .iter()
+        .map(|arg| format!(" \"{}\"", escape_systemd_double_quoted(arg)))
+        .collect::<String>();
     format!(
         "[Unit]\n\
          Description=Google Drive FUSE Filesystem (gdrive-fuse-rs)\n\
@@ -464,7 +475,7 @@ pub fn generate_systemd_unit(exe_path: &Path, mount_point: &Path) -> String {
          [Service]\n\
          Type=simple\n\
          ExecStartPre=/bin/mkdir -p \"{mp}\"\n\
-         ExecStart=\"{exe}\" --mount-point \"{mp}\" --no-browser\n\
+         ExecStart=\"{exe}\" --mount-point \"{mp}\" --no-browser{args}\n\
          ExecStop=/bin/sh -c 'fusermount3 -u \"$1\" || fusermount -u \"$1\"' sh \"{mp}\"\n\
          Restart=on-failure\n\
          RestartSec=5\n\
@@ -472,6 +483,42 @@ pub fn generate_systemd_unit(exe_path: &Path, mount_point: &Path) -> String {
          [Install]\n\
          WantedBy=default.target\n"
     )
+}
+
+fn systemd_mount_args(args: &CliArgs) -> Vec<String> {
+    let mut unit_args = Vec::new();
+    for (option, value) in [
+        ("--config", args.config.as_ref().map(|path| path.display().to_string())),
+        ("--client-id", args.client_id.clone()),
+        ("--cache-db", args.cache_db.as_ref().map(|path| path.display().to_string())),
+        ("--cache-ttl", args.cache_ttl.map(|value| value.to_string())),
+        ("--chunk-size", args.chunk_size.map(|value| value.to_string())),
+        (
+            "--google-docs-mode",
+            args.google_docs_mode.map(|mode| match mode {
+                GoogleDocsMode::Browser => "browser",
+                GoogleDocsMode::Desktop => "desktop",
+                GoogleDocsMode::Pdf => "pdf",
+                GoogleDocsMode::Office => "office",
+            }.to_owned()),
+        ),
+        (
+            "--change-poll-secs",
+            args.change_poll_secs.map(|value| value.to_string()),
+        ),
+    ] {
+        if let Some(value) = value {
+            unit_args.push(option.to_owned());
+            unit_args.push(value);
+        }
+    }
+    if args.no_shared_with_me {
+        unit_args.push("--no-shared-with-me".to_owned());
+    }
+    if args.allow_other {
+        unit_args.push("--allow-other".to_owned());
+    }
+    unit_args
 }
 
 fn resolve_chunk_size(cli_size: Option<usize>, config_size: Option<usize>) -> Result<usize> {
@@ -572,6 +619,7 @@ mod tests {
         let unit = generate_systemd_unit(
             Path::new("/usr/local/bin/gdrive-fuse-rs"),
             Path::new("/home/alice/GoogleDrive"),
+            &[],
         );
         assert!(unit.contains("[Unit]"));
         assert!(unit.contains("[Service]"));
@@ -588,9 +636,43 @@ mod tests {
         let escaped_unit = generate_systemd_unit(
             Path::new("/opt/bin%/gdrive\"bin"),
             Path::new("/home/alice/100% 'Drive' \"Test\""),
+            &[],
         );
         assert!(escaped_unit.contains("\"/opt/bin%%/gdrive\\\"bin\""));
         assert!(escaped_unit.contains("\"/home/alice/100%% 'Drive' \\\"Test\\\"\""));
+    }
+
+    #[test]
+    fn test_systemd_unit_preserves_mount_options() {
+        let args = CliArgs::try_parse_from([
+            "gdrive-fuse-rs",
+            "--config",
+            "/tmp/gdrive config.toml",
+            "--client-id",
+            "client-id",
+            "--cache-db",
+            "/tmp/cache.db",
+            "--cache-ttl",
+            "120",
+            "--chunk-size",
+            "8388608",
+            "--google-docs-mode",
+            "pdf",
+            "--change-poll-secs",
+            "45",
+            "--no-shared-with-me",
+            "--allow-other",
+        ])
+        .expect("Mount options must parse");
+        let unit = generate_systemd_unit(
+            Path::new("/usr/local/bin/gdrive-fuse-rs"),
+            Path::new("/home/alice/GoogleDrive"),
+            &systemd_mount_args(&args),
+        );
+
+        assert!(unit.contains(
+            "ExecStart=\"/usr/local/bin/gdrive-fuse-rs\" --mount-point \"/home/alice/GoogleDrive\" --no-browser \"--config\" \"/tmp/gdrive config.toml\" \"--client-id\" \"client-id\" \"--cache-db\" \"/tmp/cache.db\" \"--cache-ttl\" \"120\" \"--chunk-size\" \"8388608\" \"--google-docs-mode\" \"pdf\" \"--change-poll-secs\" \"45\" \"--no-shared-with-me\" \"--allow-other\""
+        ));
     }
 
     #[test]
