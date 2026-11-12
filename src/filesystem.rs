@@ -56,6 +56,7 @@ pub struct StatfsSnapshot {
 pub struct ReadChunk {
     pub ino: u64,
     pub offset: u64,
+    pub modified_time: i64,
     pub data: Bytes,
     pub last_accessed: Instant,
 }
@@ -113,6 +114,26 @@ impl ReadChunkBuffer {
         None
     }
 
+    /// Returns a zero-copy `Bytes` slice if `[offset, offset + requested_len)` is cached for `ino`
+    /// and its cached `modified_time` matches the current file metadata; evicts stale entries on mismatch.
+    pub fn get_slice_for_mtime(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        requested_len: usize,
+        modified_time: i64,
+    ) -> Option<Bytes> {
+        if self
+            .chunks
+            .iter()
+            .any(|c| c.ino == ino && c.modified_time != modified_time)
+        {
+            self.evict(ino);
+            return None;
+        }
+        self.get_slice(ino, offset, requested_len)
+    }
+
     /// Returns the full cached `Bytes` if a chunk starting at `offset == 0` is buffered for `ino`.
     pub fn get_zero_offset_chunk(&mut self, ino: u64) -> Option<Bytes> {
         for chunk in &mut self.chunks {
@@ -124,6 +145,24 @@ impl ReadChunkBuffer {
         None
     }
 
+    /// Returns the full cached `Bytes` if a chunk starting at `offset == 0` is buffered for `ino`
+    /// and its `modified_time` matches; evicts stale entries on mismatch.
+    pub fn get_zero_offset_chunk_for_mtime(
+        &mut self,
+        ino: u64,
+        modified_time: i64,
+    ) -> Option<Bytes> {
+        if self
+            .chunks
+            .iter()
+            .any(|c| c.ino == ino && c.modified_time != modified_time)
+        {
+            self.evict(ino);
+            return None;
+        }
+        self.get_zero_offset_chunk(ino)
+    }
+
     /// Returns the length of a cached chunk starting at `offset == 0` for `ino` without mutating access timestamps.
     pub fn peek_zero_offset_len(&self, ino: u64) -> Option<u64> {
         self.chunks
@@ -132,11 +171,26 @@ impl ReadChunkBuffer {
             .map(|c| c.data.len() as u64)
     }
 
+    /// Returns the length of a cached chunk starting at `offset == 0` for `ino` if its `modified_time` matches.
+    pub fn peek_zero_offset_len_for_mtime(&self, ino: u64, modified_time: i64) -> Option<u64> {
+        self.chunks
+            .iter()
+            .find(|c| c.ino == ino && c.offset == 0 && c.modified_time == modified_time)
+            .map(|c| c.data.len() as u64)
+    }
+
     /// Inserts or replaces the read-ahead chunk for `ino`, evicting the least-recently accessed chunk if full.
     pub fn insert(&mut self, ino: u64, offset: u64, data: Bytes) {
+        self.insert_with_mtime(ino, offset, 0, data);
+    }
+
+    /// Inserts or replaces the read-ahead chunk for `ino` tagged with `modified_time`,
+    /// evicting the least-recently accessed chunk if full.
+    pub fn insert_with_mtime(&mut self, ino: u64, offset: u64, modified_time: i64, data: Bytes) {
         let now = Instant::now();
         if let Some(existing) = self.chunks.iter_mut().find(|c| c.ino == ino) {
             existing.offset = offset;
+            existing.modified_time = modified_time;
             existing.data = data;
             existing.last_accessed = now;
             return;
@@ -156,6 +210,7 @@ impl ReadChunkBuffer {
         self.chunks.push(ReadChunk {
             ino,
             offset,
+            modified_time,
             data,
             last_accessed: now,
         });
@@ -373,8 +428,20 @@ impl GDriveFS {
         }
     }
 
+    /// Evicts any cached read-ahead or exported document chunks for inodes that were
+    /// modified or removed in SQLite by background incremental sync.
+    fn drain_cache_evictions(&mut self) {
+        for ino in self.cache.take_evicted_inodes() {
+            self.chunk_buffer.evict(ino);
+        }
+    }
+
     fn ensure_google_doc_exported(&mut self, file: &CachedFile) -> Result<Bytes, libc::c_int> {
-        if let Some(existing) = self.chunk_buffer.get_zero_offset_chunk(file.inode) {
+        self.drain_cache_evictions();
+        if let Some(existing) = self
+            .chunk_buffer
+            .get_zero_offset_chunk_for_mtime(file.inode, file.modified_time)
+        {
             return Ok(existing);
         }
 
@@ -395,7 +462,12 @@ impl GDriveFS {
                 api_err.to_errno()
             })?;
 
-        self.chunk_buffer.insert(file.inode, 0, exported.clone());
+        self.chunk_buffer.insert_with_mtime(
+            file.inode,
+            0,
+            file.modified_time,
+            exported.clone(),
+        );
         Ok(exported)
     }
 
@@ -404,6 +476,8 @@ impl GDriveFS {
         let mtime = unix_secs_to_system_time(file.modified_time);
         let (kind, perm, nlink) = if file.is_dir {
             (FileType::Directory, 0o755, 2)
+        } else if file.is_google_native_doc() && self.google_docs_mode == GoogleDocsMode::Desktop {
+            (FileType::RegularFile, 0o755, 1)
         } else {
             (FileType::RegularFile, 0o644, 1)
         };
@@ -415,7 +489,7 @@ impl GDriveFS {
                 }
                 GoogleDocsMode::Pdf | GoogleDocsMode::Office => self
                     .chunk_buffer
-                    .peek_zero_offset_len(file.inode)
+                    .peek_zero_offset_len_for_mtime(file.inode, file.modified_time)
                     .unwrap_or(file.size),
             }
         } else {
@@ -512,6 +586,7 @@ impl GDriveFS {
 
     /// Resolves `getattr` for `ino` without requiring a `fuser::ReplyAttr`.
     pub fn handle_getattr(&mut self, ino: u64) -> Result<FileAttr, libc::c_int> {
+        self.drain_cache_evictions();
         match self.cache.get_by_inode(ino) {
             Ok(Some(file)) => {
                 if file.is_google_native_doc()
@@ -548,6 +623,7 @@ impl GDriveFS {
 
     /// Resolves `lookup` for a child `name` inside `parent` inode.
     pub fn handle_lookup(&mut self, parent: u64, name: &str) -> Result<FileAttr, libc::c_int> {
+        self.drain_cache_evictions();
         if parent == FUSE_ROOT_ID && self.shared_with_me && name == SHARED_WITH_ME_NAME {
             return self.handle_getattr(SHARED_WITH_ME_INODE);
         }
@@ -702,6 +778,7 @@ impl GDriveFS {
 
     /// Reads up to `size` bytes from `ino` starting at `offset`, utilizing the 4 MB read-ahead chunk buffer.
     pub fn handle_read(&mut self, ino: u64, offset: u64, size: u32) -> Result<Bytes, libc::c_int> {
+        self.drain_cache_evictions();
         let file = match self.cache.get_by_inode(ino) {
             Ok(Some(file)) => file,
             Ok(None) => return Err(libc::ENOENT),
@@ -740,7 +817,12 @@ impl GDriveFS {
         let remaining = file.size - offset;
         let expected_len = std::cmp::min(size as u64, remaining) as usize;
 
-        if let Some(cached_slice) = self.chunk_buffer.get_slice(ino, offset, expected_len) {
+        if let Some(cached_slice) = self.chunk_buffer.get_slice_for_mtime(
+            ino,
+            offset,
+            expected_len,
+            file.modified_time,
+        ) {
             log::trace!(
                 "Read-ahead buffer HIT for inode {} at offset {} (len={})",
                 ino,
@@ -782,13 +864,18 @@ impl GDriveFS {
 
         let actual_len = std::cmp::min(expected_len, downloaded.len());
         let result_slice = downloaded.slice(0..actual_len);
-        self.chunk_buffer.insert(ino, offset, downloaded);
+        self.chunk_buffer
+            .insert_with_mtime(ino, offset, file.modified_time, downloaded);
 
         Ok(result_slice)
     }
 
     /// Resolves `statfs` storage quota metrics from Google Drive's `about.get` endpoint,
     /// caching the result in memory for `QUOTA_CACHE_TTL` (5 minutes).
+    ///
+    /// For unlimited Google Workspace accounts (`quota.limit == 0`), `blocks`, `bfree`, and
+    /// `bavail` are reported as `0` (standard POSIX `statfs` sentinel for unbounded/unknown
+    /// filesystem capacity) rather than fabricating an arbitrary finite quota.
     pub fn handle_statfs(&mut self) -> Result<StatfsSnapshot, libc::c_int> {
         let quota = match self.quota_cache {
             Some((cached_quota, fetched_at)) if fetched_at.elapsed() < QUOTA_CACHE_TTL => {
@@ -814,10 +901,9 @@ impl GDriveFS {
             let free = total.saturating_sub(used_blocks);
             (total, free)
         } else {
-            // Unlimited Google Workspace account (`limit == 0`): report 1 TiB available
-            let free = (1024u64 * 1024 * 1024 * 1024) / STATFS_BSIZE;
-            let total = used_blocks.saturating_add(free);
-            (total, free)
+            // Unlimited Google Workspace account (`limit == 0`): report 0 (unbounded quota sentinel)
+            // rather than fabricating an arbitrary finite capacity.
+            (0, 0)
         };
 
         Ok(StatfsSnapshot {
@@ -1762,6 +1848,135 @@ mod tests {
 
         // 5. HTTP 401 from Drive API -> EACCES
         assert_eq!(fs.handle_readdir(FUSE_ROOT_ID), Err(libc::EACCES));
+
+        rt.block_on(server_handle).unwrap();
+    }
+
+    #[test]
+    fn test_desktop_launcher_executable_perm_and_unlimited_statfs_and_cache_eviction() {
+        let rt = Runtime::new().unwrap();
+        let export_calls = Arc::new(AtomicUsize::new(0));
+        let export_calls_clone = Arc::clone(&export_calls);
+
+        let (addr, server_handle) = rt.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let handle = tokio::spawn(async move {
+                // Request 1: about (unlimited quota), Request 2: export v1, Request 3: export v2
+                for req_idx in 0..3 {
+                    if let Ok((mut stream, _)) = listener.accept().await {
+                        let mut buf = vec![0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+
+                        if req_idx == 0 {
+                            let body = r#"{"storageQuota": {"usage": "10737418240"}}"#;
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                        } else {
+                            let call_num = export_calls_clone.fetch_add(1, Ordering::SeqCst) + 1;
+                            let pdf_payload = format!("%PDF-1.7 version {}", call_num);
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                pdf_payload.len(),
+                                pdf_payload
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                        }
+                    }
+                }
+            });
+
+            (addr, handle)
+        });
+
+        let base_url = format!("http://{}/drive/v3", addr);
+
+        // 1. Desktop mode marks only Google Workspace native launchers executable (0o755)
+        let fs_desktop = make_test_fs_with_options(
+            &base_url,
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+            GoogleDocsMode::Desktop,
+            false,
+        );
+        let native_doc = CachedFile {
+            inode: 50,
+            drive_id: "doc_50".to_string(),
+            name: "Notes".to_string(),
+            mime_type: "application/vnd.google-apps.document".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            is_dir: false,
+            last_synced_at: None,
+            web_view_link: None,
+        };
+        let regular_file = CachedFile {
+            inode: 51,
+            drive_id: "file_51".to_string(),
+            name: "notes.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 100,
+            modified_time: 1_700_000_000,
+            is_dir: false,
+            last_synced_at: None,
+            web_view_link: None,
+        };
+        assert_eq!(fs_desktop.file_to_attr(&native_doc).perm, 0o755);
+        assert_eq!(fs_desktop.file_to_attr(&regular_file).perm, 0o644);
+
+        // 2. Unlimited storage quota (`limit == 0`) reports 0 blocks instead of a fabricated 1 TiB quota
+        let mut fs_pdf = make_test_fs_with_options(
+            &base_url,
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+            GoogleDocsMode::Pdf,
+            false,
+        );
+        let snap = fs_pdf.handle_statfs().expect("statfs for unlimited account must succeed");
+        assert_eq!(snap.blocks, 0);
+        assert_eq!(snap.bfree, 0);
+        assert_eq!(snap.bavail, 0);
+
+        // 3. Remote change application evicts cached exported Google Doc bytes
+        let doc_v1 = crate::api::DriveFile {
+            id: "doc_export_1".to_string(),
+            name: "Spec".to_string(),
+            mime_type: "application/vnd.google-apps.document".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let cached_doc = fs_pdf.cache.upsert_file(&doc_v1).unwrap();
+
+        let bytes_v1 = fs_pdf.handle_read(cached_doc.inode, 0, 4096).unwrap();
+        assert_eq!(&bytes_v1[..], b"%PDF-1.7 version 1");
+        assert_eq!(export_calls.load(Ordering::SeqCst), 1);
+
+        // Apply incremental change for doc_export_1 and verify stale export buffer is evicted
+        let mut doc_v2 = doc_v1.clone();
+        doc_v2.modified_time = 1_700_000_100;
+        fs_pdf
+            .cache
+            .apply_changes(
+                &[crate::api::ChangeItem {
+                    file_id: "doc_export_1".to_string(),
+                    removed: false,
+                    file: Some(doc_v2),
+                }],
+                Some("tok_next"),
+            )
+            .unwrap();
+
+        let bytes_v2 = fs_pdf.handle_read(cached_doc.inode, 0, 4096).unwrap();
+        assert_eq!(&bytes_v2[..], b"%PDF-1.7 version 2");
+        assert_eq!(export_calls.load(Ordering::SeqCst), 2);
 
         rt.block_on(server_handle).unwrap();
     }

@@ -418,16 +418,16 @@ fn install_gdrive_mime_handlers(exe_path: &Path) -> Result<()> {
         let _ = std::process::Command::new("update-desktop-database")
             .arg(&apps_dir)
             .status();
-        let _ = std::process::Command::new("xdg-mime")
-            .args([
-                "default",
-                "gdrive-fuse-rs-open.desktop",
-                "application/x-gdrive-doc",
-                "application/x-gdrive-sheet",
-                "application/x-gdrive-slides",
-                "application/x-gdrive-link",
-            ])
-            .status();
+        for mime_type in [
+            "application/x-gdrive-doc",
+            "application/x-gdrive-sheet",
+            "application/x-gdrive-slides",
+            "application/x-gdrive-link",
+        ] {
+            let _ = std::process::Command::new("xdg-mime")
+                .args(["default", "gdrive-fuse-rs-open.desktop", mime_type])
+                .status();
+        }
     }
 
     Ok(())
