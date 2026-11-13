@@ -453,7 +453,7 @@ fn install_gdrive_mime_handlers(exe_path: &Path) -> Result<()> {
 "#;
 
     let desktop_path = apps_dir.join("gdrive-fuse-rs-open.desktop");
-    let exe_str = escape_systemd_double_quoted(&exe_path.display().to_string());
+    let exe_str = escape_desktop_entry_double_quoted(&exe_path.display().to_string());
     let desktop_entry = format!(
         "[Desktop Entry]\n\
          Version=1.0\n\
@@ -499,8 +499,24 @@ fn install_gdrive_mime_handlers(exe_path: &Path) -> Result<()> {
 }
 
 /// Escapes a path string for safe inclusion inside a double-quoted systemd command argument,
-/// doubling `%` specifiers (`%%`) and escaping `\`, `"`, `$`, and `` ` ``.
+/// doubling `%` specifiers (`%%`) and `$` characters (`$$`), and escaping `\`, `"`, and `` ` ``.
 fn escape_systemd_double_quoted(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    for ch in raw.chars() {
+        match ch {
+            '%' => out.push_str("%%"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("$$"),
+            '`' => out.push_str("\\`"),
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn escape_desktop_entry_double_quoted(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 8);
     for ch in raw.chars() {
         match ch {
@@ -699,12 +715,20 @@ mod tests {
 
         // Verify special characters (%, ", ') are safely escaped for systemd and sh
         let escaped_unit = generate_systemd_unit(
-            Path::new("/opt/bin%/gdrive\"bin"),
-            Path::new("/home/alice/100% 'Drive' \"Test\""),
+            Path::new("/opt/bin%/gdrive\"bin$HOME"),
+            Path::new("/home/alice/100% 'Drive' \"Test\"/$DRIVE"),
             &[],
         );
-        assert!(escaped_unit.contains("\"/opt/bin%%/gdrive\\\"bin\""));
-        assert!(escaped_unit.contains("\"/home/alice/100%% 'Drive' \\\"Test\\\"\""));
+        assert!(escaped_unit.contains("\"/opt/bin%%/gdrive\\\"bin$$HOME\""));
+        assert!(escaped_unit.contains("\"/home/alice/100%% 'Drive' \\\"Test\\\"/$$DRIVE\""));
+    }
+
+    #[test]
+    fn test_desktop_entry_path_escaping() {
+        assert_eq!(
+            escape_desktop_entry_double_quoted("/opt/bin%/gdrive\"bin$HOME"),
+            "/opt/bin%%/gdrive\\\"bin\\$HOME"
+        );
     }
 
     #[test]
