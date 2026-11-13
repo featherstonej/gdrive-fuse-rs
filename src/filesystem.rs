@@ -329,6 +329,8 @@ pub struct GDriveFS {
     read_only: bool,
     staging_dir: PathBuf,
     staged_files: HashMap<u64, StagedFileState>,
+    open_handles: HashMap<u64, HashSet<u64>>,
+    unlinked_inodes: HashSet<u64>,
     next_fh: u64,
 }
 
@@ -406,7 +408,7 @@ impl GDriveFS {
         if !read_only {
             let _ = std::fs::create_dir_all(&staging_dir);
         }
-        Self {
+        let mut fs = Self {
             api,
             cache,
             rt_handle,
@@ -421,8 +423,14 @@ impl GDriveFS {
             read_only,
             staging_dir,
             staged_files: HashMap::new(),
+            open_handles: HashMap::new(),
+            unlinked_inodes: HashSet::new(),
             next_fh: 1,
+        };
+        if !read_only {
+            fs.recover_dirty_staged_files();
         }
+        fs
     }
 
     /// Sets whether this filesystem instance enforces strict read-only mode (`libc::EROFS`).
@@ -430,6 +438,7 @@ impl GDriveFS {
         self.read_only = read_only;
         if !read_only {
             let _ = std::fs::create_dir_all(&self.staging_dir);
+            self.recover_dirty_staged_files();
         }
         self
     }
@@ -439,8 +448,66 @@ impl GDriveFS {
         self.staging_dir = staging_dir.into();
         if !self.read_only {
             let _ = std::fs::create_dir_all(&self.staging_dir);
+            self.recover_dirty_staged_files();
         }
         self
+    }
+
+    /// Recovers in-memory `staged_files` entries for any dirty/pending inodes in SQLite that already
+    /// have an unsent `inode_*.stage` file on disk (e.g. after a restart or 410-token cache recovery).
+    fn recover_dirty_staged_files(&mut self) {
+        let Ok(dirty_files) = self.cache.list_dirty_or_pending_files() else {
+            return;
+        };
+        for file in dirty_files {
+            if self.staged_files.len() >= MAX_STAGED_WRITE_FILES
+                && !self.staged_files.contains_key(&file.inode)
+            {
+                break;
+            }
+            let stage_path = self.staging_file_path(file.inode);
+            if stage_path.exists() {
+                let entry = self
+                    .staged_files
+                    .entry(file.inode)
+                    .or_insert_with(|| StagedFileState {
+                        ino: file.inode,
+                        path: stage_path.clone(),
+                        dirty: true,
+                        populated_from_remote: true,
+                        open_handles: HashSet::new(),
+                    });
+                entry.path = stage_path;
+                entry.dirty = true;
+                entry.populated_from_remote = true;
+            }
+        }
+    }
+
+    fn track_open_handle(&mut self, ino: u64, fh: u64) {
+        self.open_handles.entry(ino).or_default().insert(fh);
+    }
+
+    fn untrack_open_handle(&mut self, ino: u64, fh: u64) {
+        if let Some(handles) = self.open_handles.get_mut(&ino) {
+            handles.remove(&fh);
+            if handles.is_empty() {
+                self.open_handles.remove(&ino);
+            }
+        }
+        if let Some(st) = self.staged_files.get_mut(&ino) {
+            st.open_handles.remove(&fh);
+        }
+    }
+
+    fn has_open_handles(&self, ino: u64) -> bool {
+        self.open_handles
+            .get(&ino)
+            .is_some_and(|handles| !handles.is_empty())
+            || self
+                .staged_files
+                .get(&ino)
+                .is_some_and(|st| !st.open_handles.is_empty())
     }
 
     /// Returns `true` if the filesystem is mounted in strict read-only mode.
@@ -935,6 +1002,8 @@ impl GDriveFS {
                 std::fs::create_dir_all(parent_dir).map_err(|_| libc::EIO)?;
             }
 
+            let has_dirty_stage_on_disk =
+                (file.dirty || file.is_pending_upload()) && stage_path.exists();
             let truncate = (flags & libc::O_TRUNC) != 0;
             if truncate {
                 File::create(&stage_path).map_err(|e| {
@@ -951,6 +1020,7 @@ impl GDriveFS {
                     .map_err(|e| e.to_errno())?;
                 self.chunk_buffer.evict(ino);
             } else if !self.staged_files.contains_key(&ino)
+                && !has_dirty_stage_on_disk
                 && file.size == 0
                 && !file.is_pending_upload()
             {
@@ -963,17 +1033,21 @@ impl GDriveFS {
                 .or_insert_with(|| StagedFileState {
                     ino,
                     path: stage_path,
-                    dirty: truncate,
-                    populated_from_remote: truncate || file.size == 0 || file.is_pending_upload(),
+                    dirty: truncate || file.dirty || file.is_pending_upload(),
+                    populated_from_remote: truncate
+                        || has_dirty_stage_on_disk
+                        || file.size == 0
+                        || file.is_pending_upload(),
                     open_handles: HashSet::new(),
                 });
-            if truncate {
-                entry.dirty = true;
+            if truncate || has_dirty_stage_on_disk {
+                entry.dirty |= truncate || file.dirty || file.is_pending_upload();
                 entry.populated_from_remote = true;
             }
             entry.open_handles.insert(fh);
         }
 
+        self.track_open_handle(ino, fh);
         Ok(fh)
     }
 
@@ -995,13 +1069,18 @@ impl GDriveFS {
             std::fs::create_dir_all(parent_dir).map_err(|_| libc::EIO)?;
         }
 
+        let has_dirty_stage_on_disk =
+            (file.dirty || file.is_pending_upload()) && stage_path.exists();
         let already_populated = self
             .staged_files
             .get(&file.inode)
             .is_some_and(|st| st.populated_from_remote);
 
         if !already_populated {
-            if !overwrite_all_from_zero && file.size > 0 && !file.is_pending_upload() {
+            if has_dirty_stage_on_disk && !overwrite_all_from_zero {
+                // Treat an existing local staging file for a dirty/pending inode as authoritative
+                // (e.g. after a restart or 410-token cache recovery) rather than overwriting it.
+            } else if !overwrite_all_from_zero && file.size > 0 && !file.is_pending_upload() {
                 let downloaded = self
                     .rt_handle
                     .block_on(
@@ -1034,10 +1113,13 @@ impl GDriveFS {
             .or_insert_with(|| StagedFileState {
                 ino: file.inode,
                 path: stage_path.clone(),
-                dirty: false,
+                dirty: file.dirty || file.is_pending_upload(),
                 populated_from_remote: true,
                 open_handles: HashSet::new(),
             });
+        if has_dirty_stage_on_disk {
+            entry.dirty = true;
+        }
         entry.populated_from_remote = true;
 
         Ok(stage_path)
@@ -1079,18 +1161,7 @@ impl GDriveFS {
             if (flags & libc::O_EXCL) != 0 {
                 return Err(libc::EEXIST);
             }
-            if existing.is_dir {
-                return Err(libc::EISDIR);
-            }
-            if existing.is_google_native_doc() {
-                return Err(libc::EACCES);
-            }
-
-            let open_flags = if (flags & libc::O_ACCMODE) == libc::O_RDONLY {
-                (flags & !libc::O_ACCMODE) | libc::O_WRONLY
-            } else {
-                flags
-            };
+            let open_flags = flags & !(libc::O_CREAT | libc::O_EXCL);
             let fh = self.handle_open_with_fh(existing.inode, open_flags)?;
             let attr = self.handle_getattr(existing.inode)?;
             return Ok((attr, fh));
@@ -1152,6 +1223,7 @@ impl GDriveFS {
                 open_handles,
             },
         );
+        self.track_open_handle(ino, fh);
 
         Ok((self.file_to_attr(&created_entry.file), fh))
     }
@@ -1243,8 +1315,27 @@ impl GDriveFS {
         ino: u64,
         remove_state_when_clean: bool,
     ) -> Result<(), libc::c_int> {
-        let (is_dirty, stage_path, has_open_handles) = match self.staged_files.get(&ino) {
-            Some(st) => (st.dirty, st.path.clone(), !st.open_handles.is_empty()),
+        if !self.staged_files.contains_key(&ino) {
+            if let Ok(Some(file)) = self.cache.get_by_inode(ino) {
+                let stage_path = self.staging_file_path(ino);
+                if (file.dirty || file.is_pending_upload()) && stage_path.exists() {
+                    self.staged_files.insert(
+                        ino,
+                        StagedFileState {
+                            ino,
+                            path: stage_path,
+                            dirty: true,
+                            populated_from_remote: true,
+                            open_handles: HashSet::new(),
+                        },
+                    );
+                }
+            }
+        }
+
+        let has_open_handles = self.has_open_handles(ino);
+        let (is_dirty, stage_path) = match self.staged_files.get(&ino) {
+            Some(st) => (st.dirty, st.path.clone()),
             None => return Ok(()),
         };
 
@@ -1328,17 +1419,30 @@ impl GDriveFS {
 
     /// Flushes any dirty staged writes for `ino` to Google Drive via Resumable Upload.
     pub fn handle_flush(&mut self, ino: u64, _fh: u64) -> Result<(), libc::c_int> {
+        if self.unlinked_inodes.contains(&ino) {
+            return Ok(());
+        }
         self.upload_staged_if_dirty(ino, false)
     }
 
     /// Releases an open file handle `fh` on `ino`, uploading any remaining dirty staged data
     /// and cleaning up the local staging file and read-ahead buffer.
     pub fn handle_release(&mut self, ino: u64, fh: u64) -> Result<(), libc::c_int> {
-        if let Some(st) = self.staged_files.get_mut(&ino) {
-            st.open_handles.remove(&fh);
+        self.untrack_open_handle(ino, fh);
+        let still_open = self.has_open_handles(ino);
+        if self.unlinked_inodes.contains(&ino) {
+            if !still_open {
+                self.unlinked_inodes.remove(&ino);
+                self.discard_staged_file(ino);
+                self.chunk_buffer.evict(ino);
+                let _ = self.cache.remove_file(ino);
+            }
+            return Ok(());
         }
-        let res = self.upload_staged_if_dirty(ino, true);
-        self.chunk_buffer.evict(ino);
+        let res = self.upload_staged_if_dirty(ino, !still_open);
+        if !still_open {
+            self.chunk_buffer.evict(ino);
+        }
         res
     }
 
@@ -1397,15 +1501,9 @@ impl GDriveFS {
                 .update_local_write(ino, new_size, target_mtime, true)
                 .map_err(|e| e.to_errno())?;
 
-            let has_open_handles = self
-                .staged_files
-                .get(&ino)
-                .is_some_and(|st| !st.open_handles.is_empty());
-            if fh.is_none() && !has_open_handles {
-                if let Err(errno) = self.upload_staged_if_dirty(ino, true) {
-                    self.discard_staged_file(ino);
-                    return Err(errno);
-                }
+            let has_open_handles = self.has_open_handles(ino);
+            if fh.is_none() && !has_open_handles && !self.unlinked_inodes.contains(&ino) {
+                self.upload_staged_if_dirty(ino, true)?;
             }
         } else if mtime.is_some() {
             let is_dirty_or_pending = file.dirty
@@ -1497,7 +1595,8 @@ impl GDriveFS {
     }
 
     /// Moves a file in `parent` to Google Drive Trash (`{"trashed": true}`) rather than permanently deleting it,
-    /// and removes the entry from the SQLite cache and local staging directory.
+    /// and removes the entry from the SQLite cache and local staging directory (deferring inode/staging removal
+    /// until the final `release` if the file still has open handles).
     pub fn handle_unlink(&mut self, parent: u64, name: &str) -> Result<(), libc::c_int> {
         if self.read_only {
             return Err(libc::EROFS);
@@ -1533,12 +1632,19 @@ impl GDriveFS {
                 })?;
         }
 
-        self.discard_staged_file(child.inode);
-        self.chunk_buffer.evict(child.inode);
         self.quota_cache = None;
-        self.cache
-            .remove_file(child.inode)
-            .map_err(|e| e.to_errno())?;
+        if self.has_open_handles(child.inode) {
+            self.unlinked_inodes.insert(child.inode);
+            self.cache
+                .unlink_child_entry(parent, child.inode)
+                .map_err(|e| e.to_errno())?;
+        } else {
+            self.discard_staged_file(child.inode);
+            self.chunk_buffer.evict(child.inode);
+            self.cache
+                .remove_file(child.inode)
+                .map_err(|e| e.to_errno())?;
+        }
         Ok(())
     }
 
@@ -1656,6 +1762,7 @@ impl GDriveFS {
             }
         }
 
+        let mut overwrite_dst: Option<CachedFile> = None;
         if let Some(dst_file) = self.find_child_by_display_name(newparent, newname)? {
             if dst_file.inode == src_file.inode {
                 return Ok(());
@@ -1681,16 +1788,11 @@ impl GDriveFS {
                 }
             }
 
-            if !dst_file.is_pending_upload() {
-                self.rt_handle
-                    .block_on(self.api.trash_file(&dst_file.drive_id))
-                    .map_err(|e| e.to_errno())?;
+            // Native Google Workspace documents coexist with regular files via display-name
+            // disambiguation in `rename_entry` / `disambiguated_children`; do not trash them.
+            if !dst_file.is_google_native_doc() {
+                overwrite_dst = Some(dst_file);
             }
-            self.discard_staged_file(dst_file.inode);
-            self.chunk_buffer.evict(dst_file.inode);
-            self.cache
-                .remove_file(dst_file.inode)
-                .map_err(|e| e.to_errno())?;
         }
 
         // For Google Workspace native documents, strip the synthesized virtual extension
@@ -1709,7 +1811,9 @@ impl GDriveFS {
             newname
         };
 
-        if !src_file.is_pending_upload() {
+        // 1. Perform the source rename/move in Google Drive FIRST before trashing any overwritten destination,
+        // so that if the source update fails, the pre-existing destination remains untouched.
+        let updated_drive_file = if !src_file.is_pending_upload() {
             let (add_parents, remove_parents) = if parent != newparent {
                 (
                     Some(new_parent_file.drive_id.as_str()),
@@ -1719,7 +1823,7 @@ impl GDriveFS {
                 (None, None)
             };
 
-            let updated_drive_file = self
+            let updated = self
                 .rt_handle
                 .block_on(self.api.update_file_metadata(
                     &src_file.drive_id,
@@ -1738,21 +1842,70 @@ impl GDriveFS {
                     );
                     e.to_errno()
                 })?;
-
-            self.cache
-                .rename_entry(
-                    parent,
-                    src_file.inode,
-                    newparent,
-                    effective_target_name,
-                    Some(&updated_drive_file),
-                )
-                .map_err(|e| e.to_errno())?;
+            Some(updated)
         } else {
-            self.cache
-                .rename_entry(parent, src_file.inode, newparent, effective_target_name, None)
-                .map_err(|e| e.to_errno())?;
+            None
+        };
+
+        // 2. Now that the source operation succeeded, trash and remove any overwritten non-native destination.
+        if let Some(dst_file) = overwrite_dst {
+            if !dst_file.is_pending_upload() {
+                if let Err(trash_err) = self
+                    .rt_handle
+                    .block_on(self.api.trash_file(&dst_file.drive_id))
+                {
+                    log::error!(
+                        "Failed to move overwritten destination '{}' (inode={}, drive_id={}) to Trash during rename: {}",
+                        newname,
+                        dst_file.inode,
+                        dst_file.drive_id,
+                        trash_err
+                    );
+                    if !src_file.is_pending_upload() {
+                        let (rollback_add, rollback_remove) = if parent != newparent {
+                            (
+                                Some(old_parent_file.drive_id.as_str()),
+                                Some(new_parent_file.drive_id.as_str()),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        let _ = self.rt_handle.block_on(self.api.update_file_metadata(
+                            &src_file.drive_id,
+                            Some(&src_file.name),
+                            None,
+                            rollback_add,
+                            rollback_remove,
+                        ));
+                    }
+                    return Err(trash_err.to_errno());
+                }
+            }
+
+            if self.has_open_handles(dst_file.inode) {
+                self.unlinked_inodes.insert(dst_file.inode);
+                self.cache
+                    .unlink_child_entry(newparent, dst_file.inode)
+                    .map_err(|e| e.to_errno())?;
+            } else {
+                self.discard_staged_file(dst_file.inode);
+                self.chunk_buffer.evict(dst_file.inode);
+                self.cache
+                    .remove_file(dst_file.inode)
+                    .map_err(|e| e.to_errno())?;
+            }
         }
+
+        // 3. Commit the rename/move in SQLite.
+        self.cache
+            .rename_entry(
+                parent,
+                src_file.inode,
+                newparent,
+                effective_target_name,
+                updated_drive_file.as_ref(),
+            )
+            .map_err(|e| e.to_errno())?;
 
         Ok(())
     }
@@ -1772,6 +1925,22 @@ impl GDriveFS {
 
         if file.is_dir {
             return Err(libc::EISDIR);
+        }
+
+        if !self.staged_files.contains_key(&ino) && (file.dirty || file.is_pending_upload()) {
+            let stage_path = self.staging_file_path(ino);
+            if stage_path.exists() {
+                self.staged_files.insert(
+                    ino,
+                    StagedFileState {
+                        ino,
+                        path: stage_path,
+                        dirty: true,
+                        populated_from_remote: true,
+                        open_handles: HashSet::new(),
+                    },
+                );
+            }
         }
 
         // If this inode is actively staged on disk with local data, read directly from the staging file.
@@ -3720,6 +3889,172 @@ mod tests {
             fs.cache.get_by_inode(plan_reg_attr.ino).unwrap().is_some(),
             "dirty/pending file must survive clear_all()"
         );
+
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+
+    #[test]
+    fn test_phase3_review_edge_cases_unlink_open_setattr_retry_rename_and_stage_recovery() {
+        let rt = Runtime::new().unwrap();
+        let staging_dir = std::env::temp_dir().join(format!(
+            "gdrive-fuse-rs-fs-review-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+
+        let gdoc = crate::api::DriveFile {
+            id: "gdoc_plan_1".to_string(),
+            name: "Plan".to_string(),
+            mime_type: "application/vnd.google-apps.document".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let remote_a = crate::api::DriveFile {
+            id: "remote_a_1".to_string(),
+            name: "alpha.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 10,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let remote_b = crate::api::DriveFile {
+            id: "remote_b_1".to_string(),
+            name: "beta.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 10,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+
+        let mut fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        )
+        .with_read_only(false)
+        .with_staging_dir(staging_dir.clone());
+
+        fs.cache
+            .sync_directory_children(FUSE_ROOT_ID, &[gdoc, remote_a, remote_b])
+            .unwrap();
+
+        // 1. `handle_create` with `O_CREAT | O_RDONLY` on an existing Google Workspace document
+        // must succeed for read-only access while rejecting write/truncate flags with EACCES.
+        let (gdoc_attr, gdoc_fh) = fs
+            .handle_create(FUSE_ROOT_ID, "Plan.gdoc", 0o644, libc::O_CREAT | libc::O_RDONLY)
+            .expect("open(O_CREAT | O_RDONLY) on existing Google Doc must succeed");
+        fs.handle_release(gdoc_attr.ino, gdoc_fh).unwrap();
+        assert_eq!(
+            fs.handle_create(FUSE_ROOT_ID, "Plan.gdoc", 0o644, libc::O_CREAT | libc::O_WRONLY),
+            Err(libc::EACCES)
+        );
+
+        // 2. Renaming a pending regular file to `Plan.gdoc` when native Google Doc `Plan` exists
+        // must NOT trash or remove the native Google Doc; both must coexist via disambiguation.
+        let (pending_attr, pending_fh) = fs
+            .handle_create(FUSE_ROOT_ID, "notes.txt", 0o644, libc::O_CREAT | libc::O_RDWR)
+            .unwrap();
+        fs.handle_write(pending_attr.ino, pending_fh, 0, b"local notes", 0)
+            .unwrap();
+        fs.handle_rename(FUSE_ROOT_ID, "notes.txt", FUSE_ROOT_ID, "Plan.gdoc", 0)
+            .expect("renaming pending regular file to Plan.gdoc must succeed without trashing native doc");
+        assert!(
+            fs.cache.get_by_drive_id("gdoc_plan_1").unwrap().is_some(),
+            "Native Google Doc must not be removed when a regular file is renamed to Plan.gdoc"
+        );
+        assert!(fs.handle_lookup(FUSE_ROOT_ID, "Plan.gdoc").is_ok());
+        assert!(fs.handle_lookup(FUSE_ROOT_ID, "Plan (1).gdoc").is_ok());
+
+        // 3. Overwrite rename where the source remote update fails (unreachable server `127.0.0.1:9`)
+        // must NOT trash or remove the existing destination (`beta.txt`).
+        let rename_err = fs.handle_rename(FUSE_ROOT_ID, "alpha.txt", FUSE_ROOT_ID, "beta.txt", 0);
+        assert!(rename_err.is_err());
+        assert!(
+            fs.handle_lookup(FUSE_ROOT_ID, "beta.txt").is_ok(),
+            "Destination file beta.txt must remain intact when source rename fails"
+        );
+        assert!(
+            fs.handle_lookup(FUSE_ROOT_ID, "alpha.txt").is_ok(),
+            "Source file alpha.txt must remain intact when source rename fails"
+        );
+
+        // 4. `handle_unlink` on a file with an open handle must remove the directory entry immediately
+        // (`lookup` -> ENOENT) while preserving the inode and staged data until the final `handle_release`.
+        let (temp_attr, temp_fh) = fs
+            .handle_create(FUSE_ROOT_ID, "temp_open.txt", 0o644, libc::O_CREAT | libc::O_RDWR)
+            .unwrap();
+        fs.handle_write(temp_attr.ino, temp_fh, 0, b"open-unlink", 0)
+            .unwrap();
+        fs.handle_unlink(FUSE_ROOT_ID, "temp_open.txt")
+            .expect("unlink of open file must succeed");
+        assert_eq!(
+            fs.handle_lookup(FUSE_ROOT_ID, "temp_open.txt"),
+            Err(libc::ENOENT),
+            "Directory entry must be gone immediately after unlink"
+        );
+        // Reading, writing, and flushing via the still-open handle must succeed:
+        fs.handle_write(temp_attr.ino, temp_fh, 11, b" works", 0)
+            .expect("write on unlinked open handle must succeed");
+        let read_open = fs
+            .handle_read(temp_attr.ino, 0, 64)
+            .expect("read on unlinked open handle must succeed");
+        assert_eq!(&read_open[..], b"open-unlink works");
+        fs.handle_flush(temp_attr.ino, temp_fh)
+            .expect("flush on unlinked open file must succeed without uploading");
+        // Final release removes the staging file and the inode from SQLite:
+        fs.handle_release(temp_attr.ino, temp_fh)
+            .expect("final release on unlinked file must succeed");
+        assert!(fs.cache.get_by_inode(temp_attr.ino).unwrap().is_none());
+        assert!(!fs.staging_file_path(temp_attr.ino).exists());
+
+        // 5. `handle_setattr` size truncation with no open handle when the upload fails must preserve
+        // the staged file and state so subsequent reads see the new local bytes rather than losing them.
+        let alpha_attr = fs.handle_lookup(FUSE_ROOT_ID, "alpha.txt").unwrap();
+        let setattr_err = fs.handle_setattr(alpha_attr.ino, Some(0), None, None);
+        assert!(setattr_err.is_err());
+        assert!(
+            fs.staging_file_path(alpha_attr.ino).exists(),
+            "Staged file must be preserved when immediate setattr upload fails"
+        );
+        let alpha_bytes = fs.handle_read(alpha_attr.ino, 0, 64).unwrap();
+        assert!(alpha_bytes.is_empty());
+
+        // 6. Restart / 410-recovery staging preservation: simulate a new GDriveFS instance attached to
+        // the same cache and staging_dir while `pending_attr.ino` is dirty on disk.
+        let auth = Arc::new(AuthManager::new_static_for_test("test-token"));
+        let api = Arc::new(
+            DriveClient::with_base_url(auth, "http://127.0.0.1:9".to_string()).unwrap(),
+        );
+        let mut restarted_fs = GDriveFS::with_phase3_config(
+            api,
+            fs.cache.clone(),
+            rt.handle().clone(),
+            DEFAULT_ATTR_TTL,
+            DEFAULT_READ_CHUNK_SIZE,
+            GoogleDocsMode::Browser,
+            true,
+            false,
+            staging_dir.clone(),
+        );
+        let recovered_bytes = restarted_fs
+            .handle_read(pending_attr.ino, 0, 64)
+            .expect("reading recovered dirty file after restart must succeed");
+        assert_eq!(&recovered_bytes[..], b"local notes");
+        // Partial write at offset 6 must modify the recovered staging file without truncating bytes 0..6:
+        restarted_fs
+            .handle_write(pending_attr.ino, 1, 6, b"NOTES!", 0)
+            .expect("partial write on recovered dirty file must succeed");
+        let after_partial_write = restarted_fs
+            .handle_read(pending_attr.ino, 0, 64)
+            .unwrap();
+        assert_eq!(&after_partial_write[..], b"local NOTES!");
 
         let _ = std::fs::remove_dir_all(&staging_dir);
     }

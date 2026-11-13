@@ -607,10 +607,35 @@ impl MetadataCache {
             return Err(CacheError::NotADirectory(parent_inode));
         }
 
-        // Preserve any locally created/modified dirty children in this directory that haven't been flushed yet.
+        // Preserve any locally created/modified dirty children in this directory (and any child folders
+        // that contain dirty/pending descendants in their subtree) that haven't been flushed yet.
+        let mut preserved_inodes_in_dir = HashSet::new();
+        {
+            let mut stmt = tx.prepare(
+                "WITH RECURSIVE dirty_tree(inode) AS (
+                    SELECT inode FROM files WHERE dirty != 0 OR drive_id LIKE 'pending:%'
+                    UNION
+                    SELECT pc.parent_inode
+                    FROM parent_child pc
+                    INNER JOIN dirty_tree dt ON pc.child_inode = dt.inode
+                )
+                SELECT inode FROM dirty_tree",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                let ino: i64 = r.get(0)?;
+                Ok(ino as u64)
+            })?;
+            for row in rows {
+                preserved_inodes_in_dir.insert(row?);
+            }
+        }
         let existing_dirty: Vec<DirectoryEntry> = Self::list_children_with_conn(&tx, parent_inode)?
             .into_iter()
-            .filter(|e| e.file.dirty)
+            .filter(|e| {
+                e.file.dirty
+                    || e.file.is_pending_upload()
+                    || preserved_inodes_in_dir.contains(&e.inode)
+            })
             .collect();
 
         // Clear previous parent_child edges for this directory so deleted/moved remote files are removed.
@@ -926,6 +951,38 @@ impl MetadataCache {
         })
     }
 
+    /// Returns all cached files that are currently marked `dirty` or have a `pending:` Drive ID.
+    pub fn list_dirty_or_pending_files(&self) -> Result<Vec<CachedFile>, CacheError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link, dirty
+             FROM files
+             WHERE dirty != 0 OR drive_id LIKE 'pending:%'
+             ORDER BY inode ASC",
+        )?;
+        let rows = stmt.query_map([], Self::map_cached_file_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Removes only the directory entry edge `(parent_inode, child_inode)` from `parent_child`
+    /// while retaining the `files` record so open file handles can continue reading/writing until final release.
+    pub fn unlink_child_entry(
+        &self,
+        parent_inode: u64,
+        child_inode: u64,
+    ) -> Result<(), CacheError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM parent_child WHERE parent_inode = ?1 AND child_inode = ?2",
+            params![parent_inode as i64, child_inode as i64],
+        )?;
+        Ok(())
+    }
+
     /// Removes a file or folder and its `parent_child` edges from the SQLite cache (`unlink` / `rmdir`).
     pub fn remove_file(&self, inode: u64) -> Result<(), CacheError> {
         let mut conn = self.lock_conn()?;
@@ -1197,46 +1254,60 @@ impl MetadataCache {
     }
 
     /// Clears all clean cached files, directory edges, and sync state while preserving reserved root (`1`),
-    /// "Shared with me" (`2`), and any locally dirty/pending inodes that have not yet been uploaded.
+    /// "Shared with me" (`2`), and any locally dirty/pending inodes (along with their ancestor directory chain
+    /// and parent-child edges so nested dirty files remain reachable).
     pub fn clear_all(&self) -> Result<(), CacheError> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
 
-        let mut all_inodes = Vec::new();
+        const PRESERVED_CTE: &str = "
+            WITH RECURSIVE preserved(inode) AS (
+                SELECT inode FROM files
+                WHERE inode <= ?1 OR dirty != 0 OR drive_id LIKE 'pending:%'
+                UNION
+                SELECT pc.parent_inode
+                FROM parent_child pc
+                INNER JOIN preserved p ON pc.child_inode = p.inode
+            )
+        ";
+
+        let mut evicted_inodes = Vec::new();
         {
-            let mut stmt = tx.prepare(
-                "SELECT inode FROM files WHERE inode > ?1 AND dirty = 0 AND drive_id NOT LIKE 'pending:%'",
-            )?;
+            let sql = format!(
+                "{} SELECT inode FROM files WHERE inode NOT IN (SELECT inode FROM preserved)",
+                PRESERVED_CTE
+            );
+            let mut stmt = tx.prepare(&sql)?;
             let rows = stmt.query_map(params![SHARED_WITH_ME_INODE as i64], |r| {
                 let ino: i64 = r.get(0)?;
                 Ok(ino as u64)
             })?;
             for row in rows {
-                all_inodes.push(row?);
+                evicted_inodes.push(row?);
             }
         }
 
-        tx.execute(
-            "DELETE FROM parent_child WHERE child_inode IN (
-                SELECT inode FROM files WHERE inode > ?1 AND dirty = 0 AND drive_id NOT LIKE 'pending:%'
-            )",
-            params![SHARED_WITH_ME_INODE as i64],
-        )?;
+        let delete_edges_sql = format!(
+            "{} DELETE FROM parent_child WHERE child_inode NOT IN (SELECT inode FROM preserved) OR parent_inode NOT IN (SELECT inode FROM preserved)",
+            PRESERVED_CTE
+        );
+        tx.execute(&delete_edges_sql, params![SHARED_WITH_ME_INODE as i64])?;
+
         tx.execute("DELETE FROM sync_state", [])?;
-        tx.execute(
-            "DELETE FROM files WHERE inode > ?1 AND dirty = 0 AND drive_id NOT LIKE 'pending:%'",
-            params![SHARED_WITH_ME_INODE as i64],
-        )?;
-        tx.execute(
-            "UPDATE files SET last_synced_at = NULL WHERE inode IN (?1, ?2)",
-            params![ROOT_INODE as i64, SHARED_WITH_ME_INODE as i64],
-        )?;
+
+        let delete_files_sql = format!(
+            "{} DELETE FROM files WHERE inode NOT IN (SELECT inode FROM preserved)",
+            PRESERVED_CTE
+        );
+        tx.execute(&delete_files_sql, params![SHARED_WITH_ME_INODE as i64])?;
+
+        tx.execute("UPDATE files SET last_synced_at = NULL WHERE is_dir != 0", [])?;
 
         tx.commit()?;
 
-        if !all_inodes.is_empty() {
+        if !evicted_inodes.is_empty() {
             if let Ok(mut guard) = self.evicted_inodes.lock() {
-                guard.extend(all_inodes);
+                guard.extend(evicted_inodes);
             }
         }
 
@@ -1863,5 +1934,24 @@ mod tests {
         cache.remove_file(draft_ino).expect("remove_file failed");
         assert!(cache.get_by_inode(draft_ino).unwrap().is_none());
         assert!(cache.lookup_child(sub_ino, "final.txt").unwrap().is_none());
+
+        // 7. Create a dirty pending file nested inside clean directory `Archive`, then call `clear_all()`.
+        // Both `Archive` (its clean ancestor directory) and `nested_dirty.txt` must remain reachable from root.
+        let nested_dirty = cache
+            .create_pending_file(sub_ino, "nested_dirty.txt", "text/plain", 1_750_000_030)
+            .expect("create_pending_file in subfolder failed");
+        cache.clear_all().expect("clear_all failed");
+
+        assert!(
+            cache.lookup_child(ROOT_INODE, "Archive").unwrap().is_some(),
+            "Ancestor directory of dirty file must remain reachable from root after clear_all()"
+        );
+        assert_eq!(cache.get_parent_inode(sub_ino).unwrap(), ROOT_INODE);
+        let preserved_nested = cache
+            .lookup_child(sub_ino, "nested_dirty.txt")
+            .unwrap()
+            .expect("Nested dirty file must remain reachable under its parent folder after clear_all()");
+        assert_eq!(preserved_nested.inode, nested_dirty.inode);
+        assert_eq!(cache.get_parent_inode(nested_dirty.inode).unwrap(), sub_ino);
     }
 }

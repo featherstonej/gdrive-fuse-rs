@@ -961,6 +961,8 @@ impl DriveClient {
 
         let mut offset: u64 = 0;
         let chunk_cap = self.upload_chunk_size.max(1);
+        let mut stalled_308_retries: u8 = 0;
+        const MAX_STALLED_308_RETRIES: u8 = 3;
 
         while offset < total_size {
             let remaining = (total_size - offset) as usize;
@@ -987,17 +989,32 @@ impl DriveClient {
 
             let status = response.status();
             if status == StatusCode::PERMANENT_REDIRECT {
-                // HTTP 308 Resume Incomplete: advance offset using Range header if provided
-                let next_offset = response
+                // HTTP 308 Resume Incomplete: only advance offset from an acknowledged Range upper bound.
+                // When Range is absent, the server accepted 0 bytes, so retry from the current offset.
+                let acknowledged_next = response
                     .headers()
                     .get(RANGE)
                     .and_then(|v| v.to_str().ok())
                     .and_then(parse_resumable_range_upper)
                     .map(|upper| upper.saturating_add(1))
-                    .filter(|&next| next > offset && next <= total_size)
-                    .unwrap_or(offset + to_read as u64);
+                    .filter(|&next| next <= total_size);
 
-                offset = next_offset;
+                if let Some(next_offset) = acknowledged_next {
+                    if next_offset > offset {
+                        offset = next_offset;
+                        stalled_308_retries = 0;
+                        continue;
+                    }
+                    offset = next_offset;
+                }
+
+                stalled_308_retries += 1;
+                if stalled_308_retries > MAX_STALLED_308_RETRIES {
+                    return Err(ApiError::UnexpectedStatus {
+                        status: status.as_u16(),
+                        body: "Resumable upload stalled: 308 Resume Incomplete did not advance acknowledged byte Range".to_string(),
+                    });
+                }
                 continue;
             }
 
@@ -1638,7 +1655,20 @@ mod tests {
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
 
-            // Request 3: resumable_upload_new_file chunk 1 (PUT bytes 0-7/12 -> 308 Resume Incomplete)
+            // Request 3a: resumable_upload_new_file chunk 1 attempt 1 (PUT bytes 0-7/12 -> 308 without Range header)
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.starts_with("PUT /upload/drive/v3/files?uploadType=resumable&upload_id=sess_1"));
+                assert!(req_str.to_ascii_lowercase().contains("content-range: bytes 0-7/12"));
+                assert!(req_str.ends_with("Hello, G"));
+
+                let resp = "HTTP/1.1 308 Permanent Redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+
+            // Request 3b: resumable_upload_new_file chunk 1 retry (PUT bytes 0-7/12 -> 308 with Range: bytes=0-7)
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
