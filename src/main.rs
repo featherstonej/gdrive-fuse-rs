@@ -174,12 +174,21 @@ fn main() -> Result<()> {
     if args.install_systemd {
         let exe_path = std::env::current_exe()
             .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/gdrive-fuse-rs"));
-        let unit_mount_point = args.mount_point.clone().unwrap_or_else(|| {
+        let cwd = std::env::current_dir()
+            .context("Failed to resolve paths for systemd unit")?;
+        let absolute_path = |path: PathBuf| {
+            if path.is_absolute() { path } else { cwd.join(path) }
+        };
+        let unit_mount_point = absolute_path(args.mount_point.clone().unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("GoogleDrive")
-        });
-        let unit_args = systemd_mount_args(&args);
+        }));
+        let mut unit_cli_args = args.clone();
+        unit_cli_args.config = unit_cli_args.config.map(&absolute_path);
+        unit_cli_args.cache_db = unit_cli_args.cache_db.map(&absolute_path);
+        unit_cli_args.staging_dir = unit_cli_args.staging_dir.map(&absolute_path);
+        let unit_args = systemd_mount_args(&unit_cli_args);
         let unit_contents = generate_systemd_unit(&exe_path, &unit_mount_point, &unit_args);
         let config_dir = dirs::config_dir()
             .context("Could not determine user ~/.config directory for systemd unit")?;
