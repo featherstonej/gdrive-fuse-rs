@@ -401,6 +401,7 @@ pub struct GDriveFS {
     read_only: bool,
     staging_dir: PathBuf,
     staged_files: HashMap<u64, StagedFileState>,
+    pending_upload_sessions: HashMap<u64, String>,
     open_handles: HashMap<u64, HashMap<u64, i32>>,
     unlinked_inodes: HashSet<u64>,
     next_fh: u64,
@@ -501,6 +502,7 @@ impl GDriveFS {
             read_only,
             staging_dir: scoped_staging_dir,
             staged_files: HashMap::new(),
+            pending_upload_sessions: HashMap::new(),
             open_handles: HashMap::new(),
             unlinked_inodes: HashSet::new(),
             next_fh: 1,
@@ -1252,6 +1254,7 @@ impl GDriveFS {
     }
 
     fn discard_staged_file(&mut self, ino: u64) {
+        self.pending_upload_sessions.remove(&ino);
         if let Some(st) = self.staged_files.remove(&ino) {
             let _ = std::fs::remove_file(&st.path);
         } else {
@@ -1488,14 +1491,19 @@ impl GDriveFS {
                     .map_err(|e| e.to_errno())?
                     .ok_or(libc::ENOENT)?;
 
-                self.rt_handle
-                    .block_on(self.api.resumable_upload_new_file(
-                        &parent_file.drive_id,
-                        &file.name,
-                        &file.mime_type,
-                        Some(file.modified_time),
-                        &stage_path,
-                    ))
+                let mut session_uri = self.pending_upload_sessions.remove(&ino);
+                let result = self.rt_handle.block_on(self.api.resumable_upload_new_file(
+                    &parent_file.drive_id,
+                    &file.name,
+                    &file.mime_type,
+                    Some(file.modified_time),
+                    &stage_path,
+                    &mut session_uri,
+                ));
+                if let Some(uri) = session_uri {
+                    self.pending_upload_sessions.insert(ino, uri);
+                }
+                result
             } else {
                 self.rt_handle
                     .block_on(self.api.resumable_upload_existing_file(
@@ -1527,6 +1535,7 @@ impl GDriveFS {
                     );
                     cache_err.to_errno()
                 })?;
+            self.pending_upload_sessions.remove(&ino);
 
             self.chunk_buffer.evict(ino);
             self.quota_cache = None;

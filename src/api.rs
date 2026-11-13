@@ -793,6 +793,7 @@ impl DriveClient {
         mime_type: &str,
         modified_time: Option<i64>,
         staging_path: &Path,
+        session_uri: &mut Option<String>,
     ) -> Result<DriveFile, ApiError> {
         let mut file = tokio::fs::File::open(staging_path).await?;
         let total_size = file.metadata().await?.len();
@@ -819,16 +820,24 @@ impl DriveClient {
             );
         }
 
-        let session_uri = self
-            .initiate_resumable_session(
-                None,
-                mime_type,
-                total_size,
-                &serde_json::Value::Object(metadata),
-            )
-            .await?;
+        let resume_session = session_uri.is_some();
+        let uri = match session_uri.as_ref() {
+            Some(uri) => uri.clone(),
+            None => {
+                let uri = self
+                    .initiate_resumable_session(
+                        None,
+                        mime_type,
+                        total_size,
+                        &serde_json::Value::Object(metadata),
+                    )
+                    .await?;
+                *session_uri = Some(uri.clone());
+                uri
+            }
+        };
 
-        self.upload_file_to_session_uri(&session_uri, &mut file, total_size, mime_type)
+        self.upload_file_to_session_uri(&uri, &mut file, total_size, mime_type, resume_session)
             .await
     }
 
@@ -861,7 +870,7 @@ impl DriveClient {
             )
             .await?;
 
-        self.upload_file_to_session_uri(&session_uri, &mut file, total_size, mime_type)
+        self.upload_file_to_session_uri(&session_uri, &mut file, total_size, mime_type, false)
             .await
     }
 
@@ -936,7 +945,42 @@ impl DriveClient {
         file: &mut tokio::fs::File,
         total_size: u64,
         mime_type: &str,
+        resume_session: bool,
     ) -> Result<DriveFile, ApiError> {
+        let mut offset = 0;
+        if resume_session {
+            let token = self.auth.get_access_token().await?;
+            let response = self
+                .http
+                .put(session_uri)
+                .header(AUTHORIZATION, format!("{} {}", "Bearer", token))
+                .header(CONTENT_TYPE, mime_type)
+                .header(CONTENT_LENGTH, "0")
+                .header(CONTENT_RANGE, format!("bytes */{}", total_size))
+                .body(Vec::<u8>::new())
+                .send()
+                .await?;
+
+            let status = response.status();
+            if status == StatusCode::PERMANENT_REDIRECT {
+                offset = response
+                    .headers()
+                    .get(RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_resumable_range_upper)
+                    .map(|upper| upper.saturating_add(1))
+                    .filter(|&next| next <= total_size)
+                    .unwrap_or(0);
+            } else if status.is_success() {
+                let body_bytes = response.bytes().await?;
+                let uploaded: DriveFile = serde_json::from_slice(&body_bytes)?;
+                return Ok(uploaded);
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                return Err(Self::map_status_error(status, body));
+            }
+        }
+
         if total_size == 0 {
             let token = self.auth.get_access_token().await?;
             let response = self
@@ -959,7 +1003,6 @@ impl DriveClient {
             return Ok(uploaded);
         }
 
-        let mut offset: u64 = 0;
         let chunk_cap = self.upload_chunk_size.max(1);
         let mut stalled_308_retries: u8 = 0;
         const MAX_STALLED_308_RETRIES: u8 = 3;
@@ -1065,7 +1108,35 @@ fn parse_resumable_range_upper(range_header: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_full_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        request
+    }
 
     #[test]
     fn test_deserialize_binary_file() {
@@ -1819,6 +1890,7 @@ mod tests {
         ));
         std::fs::write(&stage_path, b"Hello, Googl").unwrap();
 
+        let mut session_uri = None;
         let uploaded = client
             .resumable_upload_new_file(
                 "folder_new_1",
@@ -1826,6 +1898,7 @@ mod tests {
                 guess_mime_type("hello.txt"),
                 Some(1_748_779_200),
                 &stage_path,
+                &mut session_uri,
             )
             .await
             .expect("resumable_upload_new_file failed");
@@ -1854,6 +1927,7 @@ mod tests {
 
         // Verify 0-byte resumable upload
         std::fs::write(&stage_path, b"").unwrap();
+        let mut empty_session_uri = None;
         let empty_uploaded = client
             .resumable_upload_new_file(
                 "root",
@@ -1861,6 +1935,7 @@ mod tests {
                 guess_mime_type("empty.txt"),
                 None,
                 &stage_path,
+                &mut empty_session_uri,
             )
             .await
             .expect("0-byte resumable upload failed");
@@ -1868,6 +1943,103 @@ mod tests {
         assert_eq!(empty_uploaded.id, "uploaded_empty_1");
         assert_eq!(empty_uploaded.size, 0);
 
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_new_file_upload_retry_queries_retained_session() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req =
+                    String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+                assert!(req.starts_with("POST /upload/drive/v3/files?uploadType=resumable"));
+                let session_url = format!("http://{}/upload/drive/v3/session/retry_1", addr);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    session_url
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req =
+                    String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+                assert!(req.starts_with("PUT /upload/drive/v3/session/retry_1"));
+                assert!(req
+                    .to_ascii_lowercase()
+                    .contains("content-range: bytes 0-10/11"));
+                assert!(req.ends_with("create once"));
+            }
+
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req =
+                    String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+                assert!(req.starts_with("PUT /upload/drive/v3/session/retry_1"));
+                assert!(req
+                    .to_ascii_lowercase()
+                    .contains("content-range: bytes */11"));
+                assert!(!req.ends_with("create once"));
+
+                let body = r#"{
+                    "id": "uploaded_once",
+                    "name": "retry.txt",
+                    "mimeType": "text/plain",
+                    "size": "11",
+                    "modifiedTime": "2026-11-13T00:00:00Z",
+                    "parents": ["root"]
+                }"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let auth = Arc::new(AuthManager::new_static_for_test("test-access-token"));
+        let client = DriveClient::with_base_url(auth, format!("http://{}/drive/v3", addr))
+            .expect("Client init failed");
+        let stage_path = std::env::temp_dir().join(format!(
+            "gdrive_fuse_api_retry_test_{}.stage",
+            std::process::id()
+        ));
+        std::fs::write(&stage_path, b"create once").unwrap();
+
+        let mut session_uri = None;
+        assert!(client
+            .resumable_upload_new_file(
+                "root",
+                "retry.txt",
+                "text/plain",
+                None,
+                &stage_path,
+                &mut session_uri,
+            )
+            .await
+            .is_err());
+        let expected_session_uri = format!("http://{}/upload/drive/v3/session/retry_1", addr);
+        assert_eq!(session_uri.as_deref(), Some(expected_session_uri.as_str()));
+
+        let uploaded = client
+            .resumable_upload_new_file(
+                "root",
+                "retry.txt",
+                "text/plain",
+                None,
+                &stage_path,
+                &mut session_uri,
+            )
+            .await
+            .expect("retry must query and reuse the existing session");
+        assert_eq!(uploaded.id, "uploaded_once");
+        assert!(session_uri.is_some());
+
+        let _ = std::fs::remove_file(&stage_path);
         server_handle.await.unwrap();
     }
 }
