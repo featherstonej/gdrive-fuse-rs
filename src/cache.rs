@@ -157,13 +157,65 @@ impl MetadataCache {
         base_dir.join(APP_CACHE_DIR_NAME).join("staging")
     }
 
+    /// Normalizes a database path for staging namespace computation so that a relative path whose
+    /// database file does not exist yet resolves to the exact same canonical path as after
+    /// `MetadataCache::open` creates the database file on disk.
+    fn normalize_db_path_for_namespace(db_path: &Path) -> PathBuf {
+        if let Ok(canonical) = fs::canonicalize(db_path) {
+            return canonical;
+        }
+
+        let abs_path = if db_path.is_absolute() {
+            db_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(db_path))
+                .unwrap_or_else(|_| db_path.to_path_buf())
+        };
+
+        let mut normalized = PathBuf::new();
+        for comp in abs_path.components() {
+            match comp {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    let _ = normalized.pop();
+                }
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+
+        // Canonicalize the deepest existing ancestor directory and append the remaining tail components
+        // so symlinks in parent directories (e.g., `/var/run` -> `/run`) resolve identically before and after file creation.
+        let mut cursor = normalized.as_path();
+        let mut tail_components = Vec::new();
+        while let Some(name) = cursor.file_name() {
+            if cursor.exists() {
+                if let Ok(canon_ancestor) = fs::canonicalize(cursor) {
+                    let mut result = canon_ancestor;
+                    for part in tail_components.into_iter().rev() {
+                        result.push(part);
+                    }
+                    return result;
+                }
+                break;
+            }
+            tail_components.push(name.to_os_string());
+            match cursor.parent() {
+                Some(parent) => cursor = parent,
+                None => break,
+            }
+        }
+
+        normalized
+    }
+
     /// Computes a deterministic per-database staging namespace directory name (`db_<64-bit-fnv1a-hex>`)
     /// when `db_path` differs from `default_db_path()`, preventing staging file collisions across
     /// concurrent mounts that use separate `--cache-db` files.
     pub fn staging_namespace_for_db_path(db_path: &Path) -> Option<String> {
-        let canonical = fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+        let canonical = Self::normalize_db_path_for_namespace(db_path);
         let default_path = Self::default_db_path();
-        let canonical_default = fs::canonicalize(&default_path).unwrap_or(default_path);
+        let canonical_default = Self::normalize_db_path_for_namespace(&default_path);
         if canonical == canonical_default {
             return None;
         }
@@ -2025,5 +2077,26 @@ mod tests {
         let stage_b = MetadataCache::default_staging_dir_for_db(Path::new("/tmp/account_b.db"));
         assert_ne!(stage_a, stage_b);
         assert_ne!(stage_a, MetadataCache::default_staging_dir());
+
+        // 10. A relative `--cache-db` path must compute the exact same staging namespace before
+        // `MetadataCache::open` creates the database file on disk and after the file exists.
+        let rel_db_path = PathBuf::from(format!(
+            "target/test-rel-cache-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = MetadataCache::remove_db_files(&rel_db_path);
+        assert!(!rel_db_path.exists());
+        let stage_before_open = MetadataCache::default_staging_dir_for_db(&rel_db_path);
+        let opened_rel_cache = MetadataCache::open(&rel_db_path, 60).unwrap();
+        assert!(rel_db_path.exists());
+        let stage_after_open = MetadataCache::default_staging_dir_for_db(&rel_db_path);
+        assert_eq!(
+            stage_before_open, stage_after_open,
+            "Relative cache DB path must produce identical staging directory before and after DB file creation"
+        );
+        assert_eq!(opened_rel_cache.scoped_default_staging_dir(), stage_after_open);
+        drop(opened_rel_cache);
+        let _ = MetadataCache::remove_db_files(&rel_db_path);
     }
 }

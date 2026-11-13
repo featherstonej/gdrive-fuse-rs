@@ -327,17 +327,7 @@ fn main() -> Result<()> {
         staging_dir,
     );
 
-    let mut mount_options = vec![
-        MountOption::FSName("gdrive".to_string()),
-        MountOption::Subtype("gdrive-fuse-rs".to_string()),
-    ];
-    if read_only {
-        mount_options.push(MountOption::RO);
-    }
-    if args.allow_other {
-        mount_options.push(MountOption::AllowOther);
-        mount_options.push(MountOption::AutoUnmount);
-    }
+    let mount_options = build_mount_options(read_only, args.allow_other);
 
     log::info!(
         "Mounting Google Drive ({}) at {}... (Press Ctrl+C to unmount)",
@@ -370,6 +360,25 @@ fn main() -> Result<()> {
 
     log::info!("Unmounted {} cleanly.", mount_point.display());
     Ok(())
+}
+
+/// Builds the FUSE mount options for `Session::new`, always enabling `MountOption::DefaultPermissions`
+/// so the kernel enforces the `0644`/`0755` `uid`/`gid` ownership attributes returned by `GDriveFS`
+/// (especially critical when `--allow-other` is enabled in read-write mode).
+fn build_mount_options(read_only: bool, allow_other: bool) -> Vec<MountOption> {
+    let mut mount_options = vec![
+        MountOption::FSName("gdrive".to_string()),
+        MountOption::Subtype("gdrive-fuse-rs".to_string()),
+        MountOption::DefaultPermissions,
+    ];
+    if read_only {
+        mount_options.push(MountOption::RO);
+    }
+    if allow_other {
+        mount_options.push(MountOption::AllowOther);
+        mount_options.push(MountOption::AutoUnmount);
+    }
+    mount_options
 }
 
 /// Parses a `.gdoc`, `.gsheet`, `.gslides`, or `.gdrive` shortcut file and opens its `"url"` in the default browser.
@@ -782,5 +791,19 @@ mod tests {
         assert!(unit_args.contains(&"--read-only".to_string()));
         assert!(unit_args.contains(&"--staging-dir".to_string()));
         assert!(unit_args.contains(&"/tmp/gdrive-staging".to_string()));
+    }
+
+    #[test]
+    fn test_build_mount_options_includes_default_permissions() {
+        let rw_opts = build_mount_options(false, false);
+        assert!(rw_opts.contains(&MountOption::DefaultPermissions));
+        assert!(!rw_opts.contains(&MountOption::RO));
+        assert!(!rw_opts.contains(&MountOption::AllowOther));
+
+        let ro_allow_other_opts = build_mount_options(true, true);
+        assert!(ro_allow_other_opts.contains(&MountOption::DefaultPermissions));
+        assert!(ro_allow_other_opts.contains(&MountOption::RO));
+        assert!(ro_allow_other_opts.contains(&MountOption::AllowOther));
+        assert!(ro_allow_other_opts.contains(&MountOption::AutoUnmount));
     }
 }

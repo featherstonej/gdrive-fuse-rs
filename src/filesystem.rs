@@ -610,6 +610,18 @@ impl GDriveFS {
                 .is_some_and(|st| !st.open_handles.is_empty())
     }
 
+    fn has_writable_open_handles(&self, ino: u64) -> bool {
+        self.open_handles.get(&ino).is_some_and(|handles| {
+            handles.values().any(|&flags| {
+                let acc = flags & libc::O_ACCMODE;
+                acc == libc::O_WRONLY || acc == libc::O_RDWR
+            })
+        }) || self
+            .staged_files
+            .get(&ino)
+            .is_some_and(|st| !st.open_handles.is_empty())
+    }
+
     /// Returns `true` if the filesystem is mounted in strict read-only mode.
     pub fn is_read_only(&self) -> bool {
         self.read_only
@@ -1352,7 +1364,7 @@ impl GDriveFS {
     pub fn handle_write(
         &mut self,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: u64,
         data: &[u8],
         flags: i32,
@@ -1372,6 +1384,9 @@ impl GDriveFS {
         }
         if file.is_google_native_doc() {
             return Err(libc::EACCES);
+        }
+        if !self.is_handle_writable(ino, fh) {
+            return Err(libc::EBADF);
         }
 
         let overwrite_all = offset == 0 && (data.len() as u64) >= file.size && (flags & libc::O_APPEND) == 0;
@@ -1560,15 +1575,15 @@ impl GDriveFS {
             }
             return Ok(());
         }
-        if !was_writable || still_open {
-            if !still_open && !self.staged_files.contains_key(&ino) {
-                self.chunk_buffer.evict(ino);
-            }
-            return Ok(());
+        if !still_open {
+            let res = self.upload_staged_if_dirty(ino, true);
+            self.chunk_buffer.evict(ino);
+            return res;
         }
-        let res = self.upload_staged_if_dirty(ino, true);
-        self.chunk_buffer.evict(ino);
-        res
+        if was_writable && !self.has_writable_open_handles(ino) {
+            return self.upload_staged_if_dirty(ino, false);
+        }
+        Ok(())
     }
 
     /// Updates file attributes (`size` truncation and/or `mtime` modification) on `ino`.
@@ -3663,19 +3678,28 @@ mod tests {
         // Release handle
         fs.handle_release(ino, fh).expect("handle_release must succeed");
 
-        // 5. Re-open existing file with O_RDWR | O_TRUNC, write new content, and release
+        // 5. Re-open existing file with O_RDWR | O_TRUNC AND a concurrent O_RDONLY handle, write new content,
+        // release the writable handle while the O_RDONLY handle remains open (must upload immediately on last writer close),
+        // then release the final O_RDONLY handle (must clean up staged_files state cleanly).
         let fh2 = fs
             .handle_open_with_fh(ino, libc::O_RDWR | libc::O_TRUNC)
             .expect("open existing file with O_RDWR | O_TRUNC must succeed");
+        let concurrent_ro_fh = fs
+            .handle_open_with_fh(ino, libc::O_RDONLY)
+            .expect("concurrent O_RDONLY open must succeed");
         assert_eq!(fs.handle_getattr(ino).unwrap().size, 0);
         fs.handle_write(ino, fh2, 0, b"Updated!", 0).unwrap();
         fs.handle_release(ino, fh2)
-            .expect("release must upload modified existing file via PATCH resumable session");
+            .expect("releasing last writable handle while O_RDONLY handle is open must upload modified file");
         assert!(!expected_stage_path.exists());
 
         let updated_meta = fs.cache.get_by_inode(ino).unwrap().unwrap();
         assert_eq!(updated_meta.size, 8);
         assert!(!updated_meta.dirty);
+
+        fs.handle_release(ino, concurrent_ro_fh)
+            .expect("releasing final O_RDONLY handle must succeed and clean up staged_files");
+        assert!(!fs.staged_files.contains_key(&ino));
 
         let _ = std::fs::remove_dir_all(&staging_dir);
         rt.block_on(server_handle).unwrap();
@@ -4173,8 +4197,11 @@ mod tests {
             .expect("reading recovered dirty file after restart must succeed");
         assert_eq!(&recovered_bytes[..], b"local notes");
         // Partial write at offset 6 must modify the recovered staging file without truncating bytes 0..6:
+        let rw_fh = restarted_fs
+            .handle_open_with_fh(pending_attr.ino, libc::O_RDWR)
+            .unwrap();
         restarted_fs
-            .handle_write(pending_attr.ino, 1, 6, b"NOTES!", 0)
+            .handle_write(pending_attr.ino, rw_fh, 6, b"NOTES!", 0)
             .expect("partial write on recovered dirty file must succeed");
         let after_partial_write = restarted_fs
             .handle_read(pending_attr.ino, 0, 64)
@@ -4195,11 +4222,17 @@ mod tests {
             assert_eq!(file_mode, 0o600, "staging file must be mode 0600");
         }
 
-        // 8. Size-changing `handle_setattr` (`ftruncate`) with an `O_RDONLY` file handle must fail
+        // 8. `handle_write` with an `O_RDONLY` handle must be rejected with `EBADF`, and
+        // size-changing `handle_setattr` (`ftruncate`) with an `O_RDONLY` file handle must fail
         // with `EINVAL`, while an `O_RDWR` file handle succeeds.
         let ro_fh = restarted_fs
             .handle_open_with_fh(pending_attr.ino, libc::O_RDONLY)
             .unwrap();
+        assert_eq!(
+            restarted_fs.handle_write(pending_attr.ino, ro_fh, 0, b"nope", 0),
+            Err(libc::EBADF),
+            "handle_write via an O_RDONLY handle must be rejected with EBADF"
+        );
         assert_eq!(
             restarted_fs.handle_setattr(pending_attr.ino, Some(5), None, Some(ro_fh)),
             Err(libc::EINVAL),
@@ -4207,9 +4240,6 @@ mod tests {
         );
         restarted_fs.handle_release(pending_attr.ino, ro_fh).unwrap();
 
-        let rw_fh = restarted_fs
-            .handle_open_with_fh(pending_attr.ino, libc::O_RDWR)
-            .unwrap();
         let trunc_attr = restarted_fs
             .handle_setattr(pending_attr.ino, Some(5), None, Some(rw_fh))
             .expect("ftruncate via an O_RDWR handle must succeed");
