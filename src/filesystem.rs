@@ -56,6 +56,12 @@ pub struct StagedFileState {
     pub open_handles: HashSet<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingUploadSession {
+    uri: String,
+    snapshot_path: PathBuf,
+}
+
 fn ensure_private_staging_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -91,6 +97,81 @@ fn create_truncated_stage_file(path: &Path) -> std::io::Result<File> {
         .truncate(true)
         .open(path)?;
     Ok(file)
+}
+
+fn create_upload_snapshot(ino: u64, staging_path: &Path) -> std::io::Result<PathBuf> {
+    let parent = staging_path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "staging path has no parent directory",
+        )
+    })?;
+    ensure_private_staging_dir(parent)?;
+
+    for attempt in 0u64.. {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let snapshot_path = parent.join(format!(
+            ".inode_{}_upload_{}_{}_{}.stage",
+            ino,
+            std::process::id(),
+            nonce,
+            attempt
+        ));
+        #[cfg(unix)]
+        let snapshot = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&snapshot_path)
+        };
+        #[cfg(not(unix))]
+        let snapshot = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&snapshot_path);
+
+        match snapshot {
+            Ok(mut snapshot) => {
+                let result = (|| {
+                    let mut staged = File::open(staging_path)?;
+                    std::io::copy(&mut staged, &mut snapshot)?;
+                    snapshot.flush()
+                })();
+                if let Err(error) = result {
+                    let _ = std::fs::remove_file(&snapshot_path);
+                    return Err(error);
+                }
+                return Ok(snapshot_path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!()
+}
+
+fn files_equal(left_path: &Path, right_path: &Path) -> std::io::Result<bool> {
+    let mut left = File::open(left_path)?;
+    let mut right = File::open(right_path)?;
+    let mut left_buffer = [0; 8192];
+    let mut right_buffer = [0; 8192];
+
+    loop {
+        let left_read = left.read(&mut left_buffer)?;
+        let right_read = right.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
 }
 
 fn open_existing_stage_file_rw(path: &Path) -> std::io::Result<File> {
@@ -401,7 +482,7 @@ pub struct GDriveFS {
     read_only: bool,
     staging_dir: PathBuf,
     staged_files: HashMap<u64, StagedFileState>,
-    pending_upload_sessions: HashMap<u64, String>,
+    pending_upload_sessions: HashMap<u64, PendingUploadSession>,
     open_handles: HashMap<u64, HashMap<u64, i32>>,
     unlinked_inodes: HashSet<u64>,
     next_fh: u64,
@@ -1265,7 +1346,9 @@ impl GDriveFS {
     }
 
     fn discard_staged_file(&mut self, ino: u64) {
-        self.pending_upload_sessions.remove(&ino);
+        if let Some(session) = self.pending_upload_sessions.remove(&ino) {
+            let _ = std::fs::remove_file(session.snapshot_path);
+        }
         if let Some(st) = self.staged_files.remove(&ino) {
             let _ = std::fs::remove_file(&st.path);
         } else {
@@ -1502,19 +1585,89 @@ impl GDriveFS {
                     .map_err(|e| e.to_errno())?
                     .ok_or(libc::ENOENT)?;
 
-                let mut session_uri = self.pending_upload_sessions.remove(&ino);
+                if !self.pending_upload_sessions.contains_key(&ino) {
+                    let snapshot_path =
+                        create_upload_snapshot(ino, &stage_path).map_err(|error| {
+                            log::error!(
+                                "Failed to snapshot staged file for inode {} before upload: {}",
+                                ino,
+                                error
+                            );
+                            libc::EIO
+                        })?;
+                    self.pending_upload_sessions.insert(
+                        ino,
+                        PendingUploadSession {
+                            uri: String::new(),
+                            snapshot_path,
+                        },
+                    );
+                }
+
+                let session = self.pending_upload_sessions.get(&ino).unwrap().clone();
+                let mut session_uri = (!session.uri.is_empty()).then(|| session.uri.clone());
                 let result = self.rt_handle.block_on(self.api.resumable_upload_new_file(
                     &parent_file.drive_id,
                     &file.name,
                     &file.mime_type,
                     Some(file.modified_time),
-                    &stage_path,
+                    &session.snapshot_path,
                     &mut session_uri,
                 ));
                 if let Some(uri) = session_uri {
-                    self.pending_upload_sessions.insert(ino, uri);
+                    if let Some(session) = self.pending_upload_sessions.get_mut(&ino) {
+                        session.uri = uri;
+                    }
                 }
-                result
+                if result.is_err()
+                    && self
+                        .pending_upload_sessions
+                        .get(&ino)
+                        .is_some_and(|session| session.uri.is_empty())
+                {
+                    if let Some(session) = self.pending_upload_sessions.remove(&ino) {
+                        let _ = std::fs::remove_file(session.snapshot_path);
+                    }
+                }
+                let mut uploaded = result.map_err(|api_err| {
+                    log::error!(
+                        "Resumable upload failed for inode {} (name='{}', drive_id='{}'): {}",
+                        ino,
+                        file.name,
+                        file.drive_id,
+                        api_err
+                    );
+                    api_err.to_errno()
+                })?;
+
+                let contents_match =
+                    files_equal(&session.snapshot_path, &stage_path).map_err(|error| {
+                        log::error!(
+                            "Failed to compare staged file snapshot for inode {}: {}",
+                            ino,
+                            error
+                        );
+                        libc::EIO
+                    })?;
+                if !contents_match {
+                    uploaded = self
+                        .rt_handle
+                        .block_on(self.api.resumable_upload_existing_file(
+                            &uploaded.id,
+                            &file.mime_type,
+                            Some(file.modified_time),
+                            &stage_path,
+                        ))
+                        .map_err(|api_err| {
+                            log::error!(
+                                "Failed to upload newer staged contents for inode {}: {}",
+                                ino,
+                                api_err
+                            );
+                            api_err.to_errno()
+                        })?;
+                }
+                Ok(uploaded)
             } else {
                 self.rt_handle
                     .block_on(self.api.resumable_upload_existing_file(
@@ -1546,7 +1699,9 @@ impl GDriveFS {
                     );
                     cache_err.to_errno()
                 })?;
-            self.pending_upload_sessions.remove(&ino);
+            if let Some(session) = self.pending_upload_sessions.remove(&ino) {
+                let _ = std::fs::remove_file(session.snapshot_path);
+            }
 
             self.chunk_buffer.evict(ino);
             self.quota_cache = None;
@@ -2649,7 +2804,7 @@ mod tests {
     use crate::auth::AuthManager;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::runtime::Runtime;
 
     fn make_test_fs(base_url: &str, rt_handle: Handle, chunk_size: usize) -> GDriveFS {
@@ -2684,6 +2839,34 @@ mod tests {
             google_docs_mode,
             shared_with_me,
         )
+    }
+
+    async fn read_test_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        request
     }
 
     #[test]
@@ -4119,6 +4302,118 @@ mod tests {
             "dirty/pending file must survive clear_all()"
         );
 
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+
+    #[test]
+    fn test_pending_upload_retry_preserves_newer_staged_writes() {
+        let rt = Runtime::new().unwrap();
+        let (addr, server_handle) = rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = String::from_utf8_lossy(&read_test_request(&mut stream).await).into_owned();
+                assert!(request.starts_with("POST /upload/drive/v3/files?uploadType=resumable"));
+                let session_url = format!("http://{}/upload/drive/v3/session/create_1", addr);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    session_url
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = String::from_utf8_lossy(&read_test_request(&mut stream).await).into_owned();
+                assert!(request.starts_with("PUT /upload/drive/v3/session/create_1"));
+                assert!(request.to_ascii_lowercase().contains("content-range: bytes 0-10/11"));
+                assert!(request.ends_with("create once"));
+                drop(stream);
+
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = String::from_utf8_lossy(&read_test_request(&mut stream).await).into_owned();
+                assert!(request.starts_with("PUT /upload/drive/v3/session/create_1"));
+                assert!(request.to_ascii_lowercase().contains("content-range: bytes */11"));
+                let created = r#"{"id":"created_file","name":"retry.txt","mimeType":"text/plain","size":"11","modifiedTime":"2026-11-13T00:00:00Z","parents":["root"]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    created.len(),
+                    created
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = String::from_utf8_lossy(&read_test_request(&mut stream).await).into_owned();
+                assert!(request.starts_with("PATCH /upload/drive/v3/files/created_file?uploadType=resumable"));
+                assert!(request.to_ascii_lowercase().contains("x-upload-content-length: 12"));
+                let update_url = format!("http://{}/upload/drive/v3/session/update_1", addr);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    update_url
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = String::from_utf8_lossy(&read_test_request(&mut stream).await).into_owned();
+                assert!(request.starts_with("PUT /upload/drive/v3/session/update_1"));
+                assert!(request.to_ascii_lowercase().contains("content-range: bytes 0-11/12"));
+                assert!(request.ends_with("updated data"));
+                let updated = r#"{"id":"created_file","name":"retry.txt","mimeType":"text/plain","size":"12","modifiedTime":"2026-11-13T00:01:00Z","parents":["root"]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    updated.len(),
+                    updated
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            (addr, handle)
+        });
+
+        let staging_dir = std::env::temp_dir().join(format!(
+            "gdrive-fuse-fs-retry-snapshot-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let mut fs = make_test_fs(
+            &format!("http://{}/drive/v3", addr),
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        )
+        .with_read_only(false)
+        .with_staging_dir(staging_dir.clone());
+        fs.cache.sync_directory_children(FUSE_ROOT_ID, &[]).unwrap();
+        let (attr, fh) = fs
+            .handle_create(
+                FUSE_ROOT_ID,
+                "retry.txt",
+                0o644,
+                libc::O_CREAT | libc::O_RDWR,
+            )
+            .unwrap();
+        fs.handle_write(attr.ino, fh, 0, b"create once", 0).unwrap();
+
+        assert!(fs.handle_flush(attr.ino, fh).is_err());
+        assert!(fs
+            .cache
+            .get_by_inode(attr.ino)
+            .unwrap()
+            .unwrap()
+            .is_pending_upload());
+
+        fs.handle_write(attr.ino, fh, 0, b"updated data", 0)
+            .unwrap();
+        fs.handle_flush(attr.ino, fh)
+            .expect("retry must upload staged changes to the recovered Drive file");
+
+        let uploaded = fs.cache.get_by_inode(attr.ino).unwrap().unwrap();
+        assert_eq!(uploaded.drive_id, "created_file");
+        assert_eq!(uploaded.size, 12);
+        assert!(!uploaded.dirty);
+        assert!(!staging_dir
+            .join(format!("inode_{}.stage", attr.ino))
+            .exists());
+        assert!(fs.pending_upload_sessions.is_empty());
+
+        rt.block_on(server_handle).unwrap();
         let _ = std::fs::remove_dir_all(&staging_dir);
     }
 
