@@ -1219,7 +1219,23 @@ impl MetadataCache {
 
             if is_removed_or_trashed {
                 if let Some(existing) = Self::get_by_drive_id_with_conn(&tx, &change.file_id)? {
-                    if !existing.dirty {
+                    let contains_local_writes: bool = tx.query_row(
+                        "WITH RECURSIVE descendants(inode) AS (
+                            SELECT ?1
+                            UNION
+                            SELECT pc.child_inode
+                            FROM parent_child pc
+                            INNER JOIN descendants d ON pc.parent_inode = d.inode
+                        )
+                        SELECT EXISTS (
+                            SELECT 1 FROM files f
+                            INNER JOIN descendants d ON f.inode = d.inode
+                            WHERE f.dirty != 0 OR f.drive_id LIKE 'pending:%'
+                        )",
+                        params![existing.inode as i64],
+                        |r| r.get(0),
+                    )?;
+                    if !contains_local_writes {
                         let child_inode_i64 = existing.inode as i64;
                         tx.execute(
                             "UPDATE files SET last_synced_at = NULL
