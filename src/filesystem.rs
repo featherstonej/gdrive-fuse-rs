@@ -56,6 +56,78 @@ pub struct StagedFileState {
     pub open_handles: HashSet<u64>,
 }
 
+fn ensure_private_staging_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_truncated_stage_file(path: &Path) -> std::io::Result<File> {
+    if let Some(parent) = path.parent() {
+        ensure_private_staging_dir(parent)?;
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f
+    };
+    #[cfg(not(unix))]
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    Ok(file)
+}
+
+fn open_existing_stage_file_rw(path: &Path) -> std::io::Result<File> {
+    if let Some(parent) = path.parent() {
+        ensure_private_staging_dir(parent)?;
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f
+    };
+    #[cfg(not(unix))]
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    Ok(file)
+}
+
+fn tighten_stage_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
 /// Computed `statfs` metrics returned to the kernel and desktop file managers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatfsSnapshot {
@@ -329,7 +401,7 @@ pub struct GDriveFS {
     read_only: bool,
     staging_dir: PathBuf,
     staged_files: HashMap<u64, StagedFileState>,
-    open_handles: HashMap<u64, HashSet<u64>>,
+    open_handles: HashMap<u64, HashMap<u64, i32>>,
     unlinked_inodes: HashSet<u64>,
     next_fh: u64,
 }
@@ -376,6 +448,7 @@ impl GDriveFS {
         google_docs_mode: GoogleDocsMode,
         shared_with_me: bool,
     ) -> Self {
+        let default_staging = cache.scoped_default_staging_dir();
         Self::with_phase3_config(
             api,
             cache,
@@ -385,7 +458,7 @@ impl GDriveFS {
             google_docs_mode,
             shared_with_me,
             true,
-            MetadataCache::default_staging_dir(),
+            default_staging,
         )
     }
 
@@ -405,8 +478,13 @@ impl GDriveFS {
     ) -> Self {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
+        let scoped_staging_dir = if staging_dir == MetadataCache::default_staging_dir() {
+            cache.scoped_default_staging_dir()
+        } else {
+            staging_dir
+        };
         if !read_only {
-            let _ = std::fs::create_dir_all(&staging_dir);
+            let _ = ensure_private_staging_dir(&scoped_staging_dir);
         }
         let mut fs = Self {
             api,
@@ -421,7 +499,7 @@ impl GDriveFS {
             shared_with_me,
             quota_cache: None,
             read_only,
-            staging_dir,
+            staging_dir: scoped_staging_dir,
             staged_files: HashMap::new(),
             open_handles: HashMap::new(),
             unlinked_inodes: HashSet::new(),
@@ -437,7 +515,7 @@ impl GDriveFS {
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
         if !read_only {
-            let _ = std::fs::create_dir_all(&self.staging_dir);
+            let _ = ensure_private_staging_dir(&self.staging_dir);
             self.recover_dirty_staged_files();
         }
         self
@@ -445,9 +523,14 @@ impl GDriveFS {
 
     /// Overrides the local temporary staging directory path (`~/.cache/gdrive-fuse-rs/staging/`).
     pub fn with_staging_dir(mut self, staging_dir: impl Into<PathBuf>) -> Self {
-        self.staging_dir = staging_dir.into();
+        let raw_dir = staging_dir.into();
+        self.staging_dir = if raw_dir == MetadataCache::default_staging_dir() {
+            self.cache.scoped_default_staging_dir()
+        } else {
+            raw_dir
+        };
         if !self.read_only {
-            let _ = std::fs::create_dir_all(&self.staging_dir);
+            let _ = ensure_private_staging_dir(&self.staging_dir);
             self.recover_dirty_staged_files();
         }
         self
@@ -467,6 +550,7 @@ impl GDriveFS {
             }
             let stage_path = self.staging_file_path(file.inode);
             if stage_path.exists() {
+                tighten_stage_file_permissions(&stage_path);
                 let entry = self
                     .staged_files
                     .entry(file.inode)
@@ -484,20 +568,36 @@ impl GDriveFS {
         }
     }
 
-    fn track_open_handle(&mut self, ino: u64, fh: u64) {
-        self.open_handles.entry(ino).or_default().insert(fh);
+    fn track_open_handle(&mut self, ino: u64, fh: u64, flags: i32) {
+        self.open_handles.entry(ino).or_default().insert(fh, flags);
     }
 
-    fn untrack_open_handle(&mut self, ino: u64, fh: u64) {
+    fn is_handle_writable(&self, ino: u64, fh: u64) -> bool {
+        self.open_handles
+            .get(&ino)
+            .and_then(|handles| handles.get(&fh))
+            .is_some_and(|&flags| {
+                let acc = flags & libc::O_ACCMODE;
+                acc == libc::O_WRONLY || acc == libc::O_RDWR
+            })
+    }
+
+    fn untrack_open_handle(&mut self, ino: u64, fh: u64) -> bool {
+        let mut was_writable = false;
         if let Some(handles) = self.open_handles.get_mut(&ino) {
-            handles.remove(&fh);
+            if let Some(flags) = handles.remove(&fh) {
+                was_writable = (flags & WRITE_OPEN_FLAGS) != 0;
+            }
             if handles.is_empty() {
                 self.open_handles.remove(&ino);
             }
         }
         if let Some(st) = self.staged_files.get_mut(&ino) {
-            st.open_handles.remove(&fh);
+            if st.open_handles.remove(&fh) {
+                was_writable = true;
+            }
         }
+        was_writable
     }
 
     fn has_open_handles(&self, ino: u64) -> bool {
@@ -522,7 +622,15 @@ impl GDriveFS {
 
     /// Returns the path of the temporary staging file for `ino` inside `self.staging_dir`.
     pub fn staging_file_path(&self, ino: u64) -> PathBuf {
-        self.staging_dir.join(format!("inode_{}.stage", ino))
+        let base_dir = if self.staging_dir == MetadataCache::default_staging_dir() {
+            match self.cache.staging_namespace() {
+                Some(ns) => self.staging_dir.join(ns),
+                None => self.staging_dir.clone(),
+            }
+        } else {
+            self.staging_dir.clone()
+        };
+        base_dir.join(format!("inode_{}.stage", ino))
     }
 
     fn alloc_fh(&mut self) -> u64 {
@@ -999,14 +1107,17 @@ impl GDriveFS {
 
             let stage_path = self.staging_file_path(ino);
             if let Some(parent_dir) = stage_path.parent() {
-                std::fs::create_dir_all(parent_dir).map_err(|_| libc::EIO)?;
+                ensure_private_staging_dir(parent_dir).map_err(|_| libc::EIO)?;
             }
 
             let has_dirty_stage_on_disk =
                 (file.dirty || file.is_pending_upload()) && stage_path.exists();
+            if has_dirty_stage_on_disk {
+                tighten_stage_file_permissions(&stage_path);
+            }
             let truncate = (flags & libc::O_TRUNC) != 0;
             if truncate {
-                File::create(&stage_path).map_err(|e| {
+                create_truncated_stage_file(&stage_path).map_err(|e| {
                     log::error!(
                         "Failed to create/truncate staging file {}: {}",
                         stage_path.display(),
@@ -1024,7 +1135,7 @@ impl GDriveFS {
                 && file.size == 0
                 && !file.is_pending_upload()
             {
-                File::create(&stage_path).map_err(|_| libc::EIO)?;
+                create_truncated_stage_file(&stage_path).map_err(|_| libc::EIO)?;
             }
 
             let entry = self
@@ -1047,7 +1158,7 @@ impl GDriveFS {
             entry.open_handles.insert(fh);
         }
 
-        self.track_open_handle(ino, fh);
+        self.track_open_handle(ino, fh, flags);
         Ok(fh)
     }
 
@@ -1066,7 +1177,7 @@ impl GDriveFS {
 
         let stage_path = self.staging_file_path(file.inode);
         if let Some(parent_dir) = stage_path.parent() {
-            std::fs::create_dir_all(parent_dir).map_err(|_| libc::EIO)?;
+            ensure_private_staging_dir(parent_dir).map_err(|_| libc::EIO)?;
         }
 
         let has_dirty_stage_on_disk =
@@ -1080,6 +1191,7 @@ impl GDriveFS {
             if has_dirty_stage_on_disk && !overwrite_all_from_zero {
                 // Treat an existing local staging file for a dirty/pending inode as authoritative
                 // (e.g. after a restart or 410-token cache recovery) rather than overwriting it.
+                tighten_stage_file_permissions(&stage_path);
             } else if !overwrite_all_from_zero && file.size > 0 && !file.is_pending_upload() {
                 let downloaded = self
                     .rt_handle
@@ -1097,14 +1209,16 @@ impl GDriveFS {
                         e.to_errno()
                     })?;
 
-                let mut f = File::create(&stage_path).map_err(|_| libc::EIO)?;
+                let mut f = create_truncated_stage_file(&stage_path).map_err(|_| libc::EIO)?;
                 f.write_all(&downloaded).map_err(|_| libc::EIO)?;
                 f.flush().map_err(|_| libc::EIO)?;
             } else {
-                File::create(&stage_path).map_err(|_| libc::EIO)?;
+                create_truncated_stage_file(&stage_path).map_err(|_| libc::EIO)?;
             }
         } else if !stage_path.exists() {
-            File::create(&stage_path).map_err(|_| libc::EIO)?;
+            create_truncated_stage_file(&stage_path).map_err(|_| libc::EIO)?;
+        } else {
+            tighten_stage_file_permissions(&stage_path);
         }
 
         let entry = self
@@ -1189,7 +1303,7 @@ impl GDriveFS {
         let ino = created_entry.inode;
         let stage_path = self.staging_file_path(ino);
         if let Some(parent_dir) = stage_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent_dir) {
+            if let Err(e) = ensure_private_staging_dir(parent_dir) {
                 log::error!(
                     "Failed to create staging directory {}: {}",
                     parent_dir.display(),
@@ -1200,7 +1314,7 @@ impl GDriveFS {
             }
         }
 
-        if let Err(e) = File::create(&stage_path) {
+        if let Err(e) = create_truncated_stage_file(&stage_path) {
             log::error!(
                 "Failed to create local staging file {}: {}",
                 stage_path.display(),
@@ -1223,7 +1337,12 @@ impl GDriveFS {
                 open_handles,
             },
         );
-        self.track_open_handle(ino, fh);
+        let create_open_flags = if (flags & libc::O_ACCMODE) == libc::O_RDONLY {
+            (flags & !libc::O_ACCMODE) | libc::O_WRONLY
+        } else {
+            flags
+        };
+        self.track_open_handle(ino, fh, create_open_flags);
 
         Ok((self.file_to_attr(&created_entry.file), fh))
     }
@@ -1258,20 +1377,14 @@ impl GDriveFS {
         let overwrite_all = offset == 0 && (data.len() as u64) >= file.size && (flags & libc::O_APPEND) == 0;
         let stage_path = self.ensure_staging_populated(&file, overwrite_all)?;
 
-        let mut stage_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&stage_path)
-            .map_err(|e| {
-                log::error!(
-                    "Failed to open staging file {} for write: {}",
-                    stage_path.display(),
-                    e
-                );
-                libc::EIO
-            })?;
+        let mut stage_file = open_existing_stage_file_rw(&stage_path).map_err(|e| {
+            log::error!(
+                "Failed to open staging file {} for write: {}",
+                stage_path.display(),
+                e
+            );
+            libc::EIO
+        })?;
 
         if (flags & libc::O_APPEND) != 0 {
             stage_file.seek(SeekFrom::End(0)).map_err(|_| libc::EIO)?;
@@ -1319,6 +1432,7 @@ impl GDriveFS {
             if let Ok(Some(file)) = self.cache.get_by_inode(ino) {
                 let stage_path = self.staging_file_path(ino);
                 if (file.dirty || file.is_pending_upload()) && stage_path.exists() {
+                    tighten_stage_file_permissions(&stage_path);
                     self.staged_files.insert(
                         ino,
                         StagedFileState {
@@ -1346,7 +1460,9 @@ impl GDriveFS {
             };
 
             if !stage_path.exists() {
-                File::create(&stage_path).map_err(|_| libc::EIO)?;
+                create_truncated_stage_file(&stage_path).map_err(|_| libc::EIO)?;
+            } else {
+                tighten_stage_file_permissions(&stage_path);
             }
 
             let uploaded_res = if file.is_pending_upload() {
@@ -1418,9 +1534,14 @@ impl GDriveFS {
     }
 
     /// Flushes any dirty staged writes for `ino` to Google Drive via Resumable Upload.
-    pub fn handle_flush(&mut self, ino: u64, _fh: u64) -> Result<(), libc::c_int> {
+    pub fn handle_flush(&mut self, ino: u64, fh: u64) -> Result<(), libc::c_int> {
         if self.unlinked_inodes.contains(&ino) {
             return Ok(());
+        }
+        if let Some(flags) = self.open_handles.get(&ino).and_then(|h| h.get(&fh)) {
+            if (*flags & WRITE_OPEN_FLAGS) == 0 {
+                return Ok(());
+            }
         }
         self.upload_staged_if_dirty(ino, false)
     }
@@ -1428,7 +1549,7 @@ impl GDriveFS {
     /// Releases an open file handle `fh` on `ino`, uploading any remaining dirty staged data
     /// and cleaning up the local staging file and read-ahead buffer.
     pub fn handle_release(&mut self, ino: u64, fh: u64) -> Result<(), libc::c_int> {
-        self.untrack_open_handle(ino, fh);
+        let was_writable = self.untrack_open_handle(ino, fh);
         let still_open = self.has_open_handles(ino);
         if self.unlinked_inodes.contains(&ino) {
             if !still_open {
@@ -1439,10 +1560,14 @@ impl GDriveFS {
             }
             return Ok(());
         }
-        let res = self.upload_staged_if_dirty(ino, !still_open);
-        if !still_open {
-            self.chunk_buffer.evict(ino);
+        if !was_writable || still_open {
+            if !still_open && !self.staged_files.contains_key(&ino) {
+                self.chunk_buffer.evict(ino);
+            }
+            return Ok(());
         }
+        let res = self.upload_staged_if_dirty(ino, true);
+        self.chunk_buffer.evict(ino);
         res
     }
 
@@ -1480,15 +1605,14 @@ impl GDriveFS {
             if file.is_google_native_doc() {
                 return Err(libc::EACCES);
             }
+            if let Some(handle_id) = fh {
+                if !self.is_handle_writable(ino, handle_id) {
+                    return Err(libc::EINVAL);
+                }
+            }
 
             let stage_path = self.ensure_staging_populated(&file, new_size == 0)?;
-            let stage_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&stage_path)
-                .map_err(|_| libc::EIO)?;
+            let stage_file = open_existing_stage_file_rw(&stage_path).map_err(|_| libc::EIO)?;
             stage_file.set_len(new_size).map_err(|_| libc::EIO)?;
 
             if let Some(st) = self.staged_files.get_mut(&ino) {
@@ -1930,6 +2054,7 @@ impl GDriveFS {
         if !self.staged_files.contains_key(&ino) && (file.dirty || file.is_pending_upload()) {
             let stage_path = self.staging_file_path(ino);
             if stage_path.exists() {
+                tighten_stage_file_permissions(&stage_path);
                 self.staged_files.insert(
                     ino,
                     StagedFileState {
@@ -4055,6 +4180,85 @@ mod tests {
             .handle_read(pending_attr.ino, 0, 64)
             .unwrap();
         assert_eq!(&after_partial_write[..], b"local NOTES!");
+
+        // 7. Verify staging directory (`0700`) and staging file (`0600`) owner-only permissions on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&staging_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "staging directory must be mode 0700");
+            let file_mode = std::fs::metadata(restarted_fs.staging_file_path(pending_attr.ino))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600, "staging file must be mode 0600");
+        }
+
+        // 8. Size-changing `handle_setattr` (`ftruncate`) with an `O_RDONLY` file handle must fail
+        // with `EINVAL`, while an `O_RDWR` file handle succeeds.
+        let ro_fh = restarted_fs
+            .handle_open_with_fh(pending_attr.ino, libc::O_RDONLY)
+            .unwrap();
+        assert_eq!(
+            restarted_fs.handle_setattr(pending_attr.ino, Some(5), None, Some(ro_fh)),
+            Err(libc::EINVAL),
+            "ftruncate via an O_RDONLY handle must be rejected with EINVAL"
+        );
+        restarted_fs.handle_release(pending_attr.ino, ro_fh).unwrap();
+
+        let rw_fh = restarted_fs
+            .handle_open_with_fh(pending_attr.ino, libc::O_RDWR)
+            .unwrap();
+        let trunc_attr = restarted_fs
+            .handle_setattr(pending_attr.ino, Some(5), None, Some(rw_fh))
+            .expect("ftruncate via an O_RDWR handle must succeed");
+        assert_eq!(trunc_attr.size, 5);
+
+        // 9. Renaming a Google Workspace native document to `Foo.gdoc` (whose stripped effective name is `Foo`)
+        // when a regular sibling named `Foo` exists must NOT delete the regular sibling `Foo` from SQLite.
+        let (foo_reg_attr, _foo_fh) = restarted_fs
+            .handle_create(FUSE_ROOT_ID, "Foo", 0o644, libc::O_CREAT | libc::O_RDWR)
+            .unwrap();
+        let gdoc_ino = restarted_fs
+            .cache
+            .get_by_drive_id("gdoc_plan_1")
+            .unwrap()
+            .unwrap()
+            .inode;
+        let renamed_gdoc_drive = crate::api::DriveFile {
+            id: "gdoc_plan_1".to_string(),
+            name: "Foo".to_string(),
+            mime_type: "application/vnd.google-apps.document".to_string(),
+            size: 0,
+            modified_time: 1_700_000_100,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        restarted_fs
+            .cache
+            .rename_entry(
+                FUSE_ROOT_ID,
+                gdoc_ino,
+                FUSE_ROOT_ID,
+                "Foo",
+                Some(&renamed_gdoc_drive),
+            )
+            .expect("renaming native doc to Foo alongside regular file Foo must succeed");
+        assert_eq!(
+            restarted_fs.handle_lookup(FUSE_ROOT_ID, "Foo").unwrap().ino,
+            foo_reg_attr.ino,
+            "Regular sibling 'Foo' must remain present after native doc is renamed to 'Foo.gdoc'"
+        );
+        assert_eq!(
+            restarted_fs
+                .handle_lookup(FUSE_ROOT_ID, "Foo.gdoc")
+                .unwrap()
+                .ino,
+            gdoc_ino,
+            "Renamed native doc must be addressable as 'Foo.gdoc'"
+        );
 
         let _ = std::fs::remove_dir_all(&staging_dir);
     }

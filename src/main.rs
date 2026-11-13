@@ -163,7 +163,7 @@ fn main() -> Result<()> {
             .staging_dir
             .clone()
             .or_else(|| config.staging_dir_path.clone())
-            .unwrap_or_else(MetadataCache::default_staging_dir);
+            .unwrap_or_else(|| MetadataCache::default_staging_dir_for_db(&db_path));
         let _ = MetadataCache::clear_staging_dir(&stage_dir);
         log::info!("Removed SQLite metadata cache at {}.", db_path.display());
         if args.mount_point.is_none() && !args.install_systemd {
@@ -243,11 +243,18 @@ fn main() -> Result<()> {
         .or(config.change_poll_secs)
         .unwrap_or(DEFAULT_CHANGE_POLL_SECS);
     let read_only = args.read_only || config.read_only.unwrap_or(false);
+    let resolved_db_path = args
+        .cache_db
+        .clone()
+        .or_else(|| config.cache_db_path.clone());
     let staging_dir = args
         .staging_dir
         .clone()
         .or_else(|| config.staging_dir_path.clone())
-        .unwrap_or_else(MetadataCache::default_staging_dir);
+        .unwrap_or_else(|| match resolved_db_path.as_deref() {
+            Some(db_path) => MetadataCache::default_staging_dir_for_db(db_path),
+            None => MetadataCache::default_staging_dir(),
+        });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

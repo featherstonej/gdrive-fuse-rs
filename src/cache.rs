@@ -141,6 +141,7 @@ pub struct MetadataCache {
     conn: Mutex<Connection>,
     ttl_secs: u64,
     evicted_inodes: Mutex<HashSet<u64>>,
+    staging_namespace: Option<String>,
 }
 
 impl MetadataCache {
@@ -154,6 +155,47 @@ impl MetadataCache {
     pub fn default_staging_dir() -> PathBuf {
         let base_dir = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
         base_dir.join(APP_CACHE_DIR_NAME).join("staging")
+    }
+
+    /// Computes a deterministic per-database staging namespace directory name (`db_<64-bit-fnv1a-hex>`)
+    /// when `db_path` differs from `default_db_path()`, preventing staging file collisions across
+    /// concurrent mounts that use separate `--cache-db` files.
+    pub fn staging_namespace_for_db_path(db_path: &Path) -> Option<String> {
+        let canonical = fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+        let default_path = Self::default_db_path();
+        let canonical_default = fs::canonicalize(&default_path).unwrap_or(default_path);
+        if canonical == canonical_default {
+            return None;
+        }
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in canonical.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        Some(format!("db_{:016x}", hash))
+    }
+
+    /// Returns the default temporary staging directory scoped to `db_path`.
+    pub fn default_staging_dir_for_db(db_path: &Path) -> PathBuf {
+        let base = Self::default_staging_dir();
+        match Self::staging_namespace_for_db_path(db_path) {
+            Some(ns) => base.join(ns),
+            None => base,
+        }
+    }
+
+    /// Returns the per-database staging subdirectory namespace, if this cache was opened from a custom `--cache-db`.
+    pub fn staging_namespace(&self) -> Option<&str> {
+        self.staging_namespace.as_deref()
+    }
+
+    /// Returns the default staging directory scoped to this `MetadataCache` instance.
+    pub fn scoped_default_staging_dir(&self) -> PathBuf {
+        let base = Self::default_staging_dir();
+        match self.staging_namespace.as_deref() {
+            Some(ns) => base.join(ns),
+            None => base,
+        }
     }
 
     /// Removes the SQLite database file along with its `-wal` and `-shm` companion files if present.
@@ -204,7 +246,9 @@ impl MetadataCache {
         }
 
         let conn = Connection::open(db_path)?;
-        Self::init_connection(conn, ttl_secs)
+        let mut cache = Self::init_connection(conn, ttl_secs)?;
+        cache.staging_namespace = Self::staging_namespace_for_db_path(db_path);
+        Ok(cache)
     }
 
     /// Opens the SQLite metadata cache at the default XDG cache path (`~/.cache/gdrive-fuse-rs/metadata.db`).
@@ -365,6 +409,7 @@ impl MetadataCache {
             conn: Mutex::new(conn),
             ttl_secs,
             evicted_inodes: Mutex::new(HashSet::new()),
+            staging_namespace: None,
         })
     }
 
@@ -757,17 +802,19 @@ impl MetadataCache {
 
         let mut used_names = Self::used_sibling_effective_names_with_conn(&tx, parent_inode, None)?;
         let effective_name = disambiguate_filename(name, &mut used_names);
-        let next_ino: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(inode), ?1) + 1 FROM files",
-            params![SHARED_WITH_ME_INODE as i64],
-            |r| r.get(0),
-        )?;
-        let temp_drive_id = format!("{}{}", PENDING_DRIVE_ID_PREFIX, next_ino);
 
+        // Allocate the inode through SQLite's `AUTOINCREMENT` sequence (`last_insert_rowid()`)
+        // rather than `MAX(inode) + 1` so unlinked highest inodes are never immediately reused.
         tx.execute(
-            "INSERT INTO files (inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link, dirty)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, 0, NULL, NULL, 1)",
-            params![next_ino, &temp_drive_id, name, mime_type, modified_time],
+            "INSERT INTO files (drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link, dirty)
+             VALUES ('pending:alloc', ?1, ?2, 0, ?3, 0, NULL, NULL, 1)",
+            params![name, mime_type, modified_time],
+        )?;
+        let next_ino = tx.last_insert_rowid();
+        let temp_drive_id = format!("{}{}", PENDING_DRIVE_ID_PREFIX, next_ino);
+        tx.execute(
+            "UPDATE files SET drive_id = ?1 WHERE inode = ?2",
+            params![&temp_drive_id, next_ino],
         )?;
 
         tx.execute(
@@ -1021,34 +1068,40 @@ impl MetadataCache {
         let tx = conn.transaction()?;
 
         let sanitized_new_name = sanitize_posix_filename(new_effective_name);
+        let child_is_native_doc = Self::get_by_inode_with_conn(&tx, child_inode)?
+            .is_some_and(|f| f.is_google_native_doc());
 
         // If another inode was mapped at (new_parent_inode, sanitized_new_name):
-        // - If it is a Google Workspace native doc (whose FUSE display name has a virtual extension
-        //   like `.gdoc` while its `effective_name` in `parent_child` is the bare title), do NOT
-        //   delete the Google Doc; instead disambiguate `parent_child.effective_name`.
+        // - If either the renamed item or the existing target is a Google Workspace native doc
+        //   (whose FUSE display name has a virtual extension like `.gdoc` while its `effective_name`
+        //   in `parent_child` is the bare title), do NOT delete the sibling; instead disambiguate
+        //   `parent_child.effective_name` so both coexist.
         // - Otherwise, remove the overwritten regular file/folder.
-        let overwritten_ino: Option<i64> = tx
-            .query_row(
-                "SELECT child_inode FROM parent_child WHERE parent_inode = ?1 AND effective_name = ?2",
-                params![new_parent_inode as i64, &sanitized_new_name],
-                |r| r.get(0),
-            )
-            .optional()?;
+        if !child_is_native_doc {
+            let overwritten_ino: Option<i64> = tx
+                .query_row(
+                    "SELECT child_inode FROM parent_child WHERE parent_inode = ?1 AND effective_name = ?2",
+                    params![new_parent_inode as i64, &sanitized_new_name],
+                    |r| r.get(0),
+                )
+                .optional()?;
 
-        if let Some(target_ino) = overwritten_ino {
-            if target_ino as u64 != child_inode {
-                let target_is_native_doc = Self::get_by_inode_with_conn(&tx, target_ino as u64)?
-                    .is_some_and(|f| f.is_google_native_doc());
-                if !target_is_native_doc {
-                    tx.execute(
-                        "DELETE FROM parent_child WHERE parent_inode = ?1 AND effective_name = ?2",
-                        params![new_parent_inode as i64, &sanitized_new_name],
-                    )?;
-                    if (target_ino as u64) > SHARED_WITH_ME_INODE {
-                        tx.execute("DELETE FROM files WHERE inode = ?1", params![target_ino])?;
-                    }
-                    if let Ok(mut guard) = self.evicted_inodes.lock() {
-                        guard.insert(target_ino as u64);
+            if let Some(target_ino) = overwritten_ino {
+                if target_ino as u64 != child_inode {
+                    let target_is_native_doc =
+                        Self::get_by_inode_with_conn(&tx, target_ino as u64)?
+                            .is_some_and(|f| f.is_google_native_doc());
+                    if !target_is_native_doc {
+                        tx.execute(
+                            "DELETE FROM parent_child WHERE parent_inode = ?1 AND effective_name = ?2",
+                            params![new_parent_inode as i64, &sanitized_new_name],
+                        )?;
+                        if (target_ino as u64) > SHARED_WITH_ME_INODE {
+                            tx.execute("DELETE FROM files WHERE inode = ?1", params![target_ino])?;
+                        }
+                        if let Ok(mut guard) = self.evicted_inodes.lock() {
+                            guard.insert(target_ino as u64);
+                        }
                     }
                 }
             }
@@ -1953,5 +2006,24 @@ mod tests {
             .expect("Nested dirty file must remain reachable under its parent folder after clear_all()");
         assert_eq!(preserved_nested.inode, nested_dirty.inode);
         assert_eq!(cache.get_parent_inode(nested_dirty.inode).unwrap(), sub_ino);
+
+        // 8. Removing the highest inode (`nested_dirty.inode`) and creating a new pending file
+        // must allocate a strictly higher inode via SQLite AUTOINCREMENT rather than reusing `nested_dirty.inode`.
+        cache.remove_file(nested_dirty.inode).unwrap();
+        let next_pending = cache
+            .create_pending_file(sub_ino, "after_unlink.txt", "text/plain", 1_750_000_040)
+            .unwrap();
+        assert!(
+            next_pending.inode > nested_dirty.inode,
+            "SQLite AUTOINCREMENT must not reuse unlinked highest inode {} (got {})",
+            nested_dirty.inode,
+            next_pending.inode
+        );
+
+        // 9. Distinct `--cache-db` paths must resolve to distinct default staging directories.
+        let stage_a = MetadataCache::default_staging_dir_for_db(Path::new("/tmp/account_a.db"));
+        let stage_b = MetadataCache::default_staging_dir_for_db(Path::new("/tmp/account_b.db"));
+        assert_ne!(stage_a, stage_b);
+        assert_ne!(stage_a, MetadataCache::default_staging_dir());
     }
 }
