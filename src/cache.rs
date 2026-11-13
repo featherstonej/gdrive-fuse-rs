@@ -1299,8 +1299,8 @@ impl MetadataCache {
                 // SHARED_WITH_ME_INODE so its directory listing refreshes on next access.
                 if drive_file.parents.is_empty() || !has_known_local_parent {
                     tx.execute(
-                        "UPDATE files SET last_synced_at = NULL WHERE inode = ?1",
-                        params![SHARED_WITH_ME_INODE as i64],
+                        "UPDATE files SET last_synced_at = NULL WHERE inode IN (?1, ?2)",
+                        params![SHARED_WITH_ME_INODE as i64, ROOT_INODE as i64],
                     )?;
                 }
 
