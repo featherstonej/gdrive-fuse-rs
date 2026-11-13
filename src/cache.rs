@@ -1107,7 +1107,7 @@ impl MetadataCache {
     }
 
     /// Atomically renames and/or moves `child_inode` from `old_parent_inode` to `(new_parent_inode, new_effective_name)`,
-    /// removing any overwritten sibling at the destination and updating `files` metadata.
+    /// updating `files` metadata.
     pub fn rename_entry(
         &self,
         old_parent_inode: u64,
@@ -1120,44 +1120,6 @@ impl MetadataCache {
         let tx = conn.transaction()?;
 
         let sanitized_new_name = sanitize_posix_filename(new_effective_name);
-        let child_is_native_doc = Self::get_by_inode_with_conn(&tx, child_inode)?
-            .is_some_and(|f| f.is_google_native_doc());
-
-        // If another inode was mapped at (new_parent_inode, sanitized_new_name):
-        // - If either the renamed item or the existing target is a Google Workspace native doc
-        //   (whose FUSE display name has a virtual extension like `.gdoc` while its `effective_name`
-        //   in `parent_child` is the bare title), do NOT delete the sibling; instead disambiguate
-        //   `parent_child.effective_name` so both coexist.
-        // - Otherwise, remove the overwritten regular file/folder.
-        if !child_is_native_doc {
-            let overwritten_ino: Option<i64> = tx
-                .query_row(
-                    "SELECT child_inode FROM parent_child WHERE parent_inode = ?1 AND effective_name = ?2",
-                    params![new_parent_inode as i64, &sanitized_new_name],
-                    |r| r.get(0),
-                )
-                .optional()?;
-
-            if let Some(target_ino) = overwritten_ino {
-                if target_ino as u64 != child_inode {
-                    let target_is_native_doc =
-                        Self::get_by_inode_with_conn(&tx, target_ino as u64)?
-                            .is_some_and(|f| f.is_google_native_doc());
-                    if !target_is_native_doc {
-                        tx.execute(
-                            "DELETE FROM parent_child WHERE parent_inode = ?1 AND effective_name = ?2",
-                            params![new_parent_inode as i64, &sanitized_new_name],
-                        )?;
-                        if (target_ino as u64) > SHARED_WITH_ME_INODE {
-                            tx.execute("DELETE FROM files WHERE inode = ?1", params![target_ino])?;
-                        }
-                        if let Ok(mut guard) = self.evicted_inodes.lock() {
-                            guard.insert(target_ino as u64);
-                        }
-                    }
-                }
-            }
-        }
 
         tx.execute(
             "DELETE FROM parent_child WHERE parent_inode = ?1 AND child_inode = ?2",
@@ -1643,6 +1605,57 @@ mod tests {
         assert_eq!(
             second_notes.web_url(),
             "https://docs.google.com/document/d/id_doc_2/edit"
+        );
+    }
+
+    #[test]
+    fn test_rename_does_not_infer_overwrite_from_effective_name() {
+        let cache = Cache::open_in_memory(60).expect("Failed to open cache");
+
+        let native_doc = sample_drive_file(
+            "native_plan",
+            "Plan",
+            "application/vnd.google-apps.document",
+            0,
+        );
+        let regular_file = sample_drive_file("regular_plan", "Plan", "text/plain", 10);
+        let renamed_file = sample_drive_file("renamed", "Other", "text/plain", 20);
+        let entries = cache
+            .sync_directory_children(
+                ROOT_INODE,
+                &[native_doc, regular_file, renamed_file.clone()],
+            )
+            .expect("Directory sync failed");
+        let regular_inode = entries
+            .iter()
+            .find(|entry| entry.file.drive_id == "regular_plan")
+            .expect("Regular Plan file missing")
+            .inode;
+        let renamed_inode = entries
+            .iter()
+            .find(|entry| entry.file.drive_id == "renamed")
+            .expect("Rename source missing")
+            .inode;
+
+        let mut updated_file = renamed_file;
+        updated_file.name = "Plan (1)".to_string();
+        cache
+            .rename_entry(
+                ROOT_INODE,
+                renamed_inode,
+                ROOT_INODE,
+                "Plan (1)",
+                Some(&updated_file),
+            )
+            .expect("Rename failed");
+
+        assert_eq!(
+            cache
+                .get_by_inode(regular_inode)
+                .expect("Regular Plan lookup failed")
+                .expect("Regular Plan should remain cached")
+                .drive_id,
+            "regular_plan"
         );
     }
 
