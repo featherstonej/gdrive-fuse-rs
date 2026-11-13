@@ -156,11 +156,27 @@ pub fn resolve_credentials(
     let cfg_secret = clean_opt(config.client_secret.clone());
 
     if let Some(client_id) = cli_id {
+        let config_secret = if cfg_id.as_deref() == Some(client_id.as_str()) {
+            cfg_secret
+        } else {
+            None
+        };
+        let client_secret = cli_secret.or(config_secret).or_else(|| {
+            load_credentials_from_keyring().and_then(|stored| {
+                if stored.client_id.trim() == client_id {
+                    stored.client_secret
+                } else {
+                    None
+                }
+            })
+        });
         let creds = ClientCredentials {
             client_id,
-            client_secret: cli_secret,
+            client_secret,
         };
-        persist_credentials_to_keyring(&creds);
+        if creds.client_secret.is_some() {
+            persist_credentials_to_keyring(&creds);
+        }
         return Ok(creds);
     }
 
@@ -802,6 +818,15 @@ mod tests {
         assert_eq!(
             resolved_cli.client_secret.as_deref(),
             Some("cli-secret-placeholder")
+        );
+
+        let resolved_cli_id =
+            resolve_credentials(Some("config-id-placeholder".to_string()), None, &cfg)
+                .expect("CLI ID should reuse the matching configured secret");
+        assert_eq!(resolved_cli_id.client_id, "config-id-placeholder");
+        assert_eq!(
+            resolved_cli_id.client_secret.as_deref(),
+            Some("config-secret-placeholder")
         );
 
         // 2. Config fallback when CLI is None
