@@ -164,6 +164,11 @@ fn main() -> Result<()> {
             .clone()
             .or_else(|| config.staging_dir_path.clone())
             .unwrap_or_else(|| MetadataCache::default_staging_dir_for_db(&db_path));
+        let stage_dir = if stage_dir == MetadataCache::default_staging_dir() {
+            MetadataCache::default_staging_dir_for_db(&db_path)
+        } else {
+            stage_dir
+        };
         let _ = MetadataCache::clear_staging_dir(&stage_dir);
         log::info!("Removed SQLite metadata cache at {}.", db_path.display());
         if args.mount_point.is_none() && !args.install_systemd {
