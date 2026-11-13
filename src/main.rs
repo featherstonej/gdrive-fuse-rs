@@ -27,7 +27,7 @@ use crate::filesystem::{
 /// Default polling interval (in seconds) for Google Drive `changes.list` incremental sync.
 pub const DEFAULT_CHANGE_POLL_SECS: u64 = 30;
 
-/// A lightweight, memory-safe, read-only Google Drive FUSE filesystem for Linux and GNOME.
+/// A lightweight, memory-safe Google Drive FUSE filesystem for Linux and GNOME.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "gdrive-fuse-rs", version, about, long_about = None)]
 pub struct CliArgs {
@@ -78,6 +78,14 @@ pub struct CliArgs {
     /// Disable the virtual top-level "Shared with me" directory.
     #[arg(long = "no-shared-with-me", default_value_t = false)]
     pub no_shared_with_me: bool,
+
+    /// Mount the filesystem in strict read-only mode (uses `drive.readonly` OAuth scope and rejects writes with EROFS).
+    #[arg(long = "read-only", default_value_t = false)]
+    pub read_only: bool,
+
+    /// Path to the temporary write-back staging directory (defaults to ~/.cache/gdrive-fuse-rs/staging).
+    #[arg(long = "staging-dir", env = "GDRIVE_STAGING_DIR", value_name = "DIR")]
+    pub staging_dir: Option<PathBuf>,
 
     /// Delete the local SQLite metadata cache database (and WAL/SHM files) before exiting or mounting.
     #[arg(long = "clear-cache", default_value_t = false)]
@@ -151,6 +159,12 @@ fn main() -> Result<()> {
                 db_path.display()
             )
         })?;
+        let stage_dir = args
+            .staging_dir
+            .clone()
+            .or_else(|| config.staging_dir_path.clone())
+            .unwrap_or_else(MetadataCache::default_staging_dir);
+        let _ = MetadataCache::clear_staging_dir(&stage_dir);
         log::info!("Removed SQLite metadata cache at {}.", db_path.display());
         if args.mount_point.is_none() && !args.install_systemd {
             return Ok(());
@@ -228,15 +242,28 @@ fn main() -> Result<()> {
         .change_poll_secs
         .or(config.change_poll_secs)
         .unwrap_or(DEFAULT_CHANGE_POLL_SECS);
+    let read_only = args.read_only || config.read_only.unwrap_or(false);
+    let staging_dir = args
+        .staging_dir
+        .clone()
+        .or_else(|| config.staging_dir_path.clone())
+        .unwrap_or_else(MetadataCache::default_staging_dir);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("Failed to initialize Tokio async runtime")?;
 
-    log::info!("Authenticating with Google Drive...");
+    log::info!(
+        "Authenticating with Google Drive (mode={})...",
+        if read_only { "read-only" } else { "read-write" }
+    );
     let auth_manager = rt
-        .block_on(AuthManager::authenticate(credentials, !args.no_browser))
+        .block_on(AuthManager::authenticate_with_mode(
+            credentials,
+            !args.no_browser,
+            read_only,
+        ))
         .context("Google OAuth2 authentication failed")?;
     let auth_manager = Arc::new(auth_manager);
 
@@ -281,7 +308,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let fs = GDriveFS::with_full_config(
+    let fs = GDriveFS::with_phase3_config(
         api_client,
         cache,
         rt.handle().clone(),
@@ -289,19 +316,25 @@ fn main() -> Result<()> {
         chunk_size_bytes,
         google_docs_mode,
         shared_with_me,
+        read_only,
+        staging_dir,
     );
 
     let mut mount_options = vec![
         MountOption::FSName("gdrive".to_string()),
         MountOption::Subtype("gdrive-fuse-rs".to_string()),
     ];
+    if read_only {
+        mount_options.push(MountOption::RO);
+    }
     if args.allow_other {
         mount_options.push(MountOption::AllowOther);
         mount_options.push(MountOption::AutoUnmount);
     }
 
     log::info!(
-        "Mounting Google Drive (read-only) at {}... (Press Ctrl+C to unmount)",
+        "Mounting Google Drive ({}) at {}... (Press Ctrl+C to unmount)",
+        if read_only { "read-only" } else { "read-write" },
         mount_point.display()
     );
     let mut session = Session::new(fs, &mount_point, &mount_options).with_context(|| {
@@ -506,6 +539,10 @@ fn systemd_mount_args(args: &CliArgs) -> Vec<String> {
             "--change-poll-secs",
             args.change_poll_secs.map(|value| value.to_string()),
         ),
+        (
+            "--staging-dir",
+            args.staging_dir.as_ref().map(|path| path.display().to_string()),
+        ),
     ] {
         if let Some(value) = value {
             unit_args.push(option.to_owned());
@@ -514,6 +551,9 @@ fn systemd_mount_args(args: &CliArgs) -> Vec<String> {
     }
     if args.no_shared_with_me {
         unit_args.push("--no-shared-with-me".to_owned());
+    }
+    if args.read_only {
+        unit_args.push("--read-only".to_owned());
     }
     if args.allow_other {
         unit_args.push("--allow-other".to_owned());
@@ -714,5 +754,26 @@ mod tests {
 
         assert!(extract_url_from_shortcut(r#"{"url": "javascript:alert(1)"}"#).is_err());
         assert!(extract_url_from_shortcut(r#"{"doc_id": "abc"}"#).is_err());
+    }
+
+    #[test]
+    fn test_cli_args_phase3_read_only_and_staging_dir() {
+        let args = CliArgs::try_parse_from([
+            "gdrive-fuse-rs",
+            "--mount-point",
+            "/mnt/drive",
+            "--read-only",
+            "--staging-dir",
+            "/tmp/gdrive-staging",
+        ])
+        .expect("Phase 3 flags must parse");
+
+        assert!(args.read_only);
+        assert_eq!(args.staging_dir, Some(PathBuf::from("/tmp/gdrive-staging")));
+
+        let unit_args = systemd_mount_args(&args);
+        assert!(unit_args.contains(&"--read-only".to_string()));
+        assert!(unit_args.contains(&"--staging-dir".to_string()));
+        assert!(unit_args.contains(&"/tmp/gdrive-staging".to_string()));
     }
 }

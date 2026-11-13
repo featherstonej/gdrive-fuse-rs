@@ -60,22 +60,22 @@ This document tracks the development phases, architectural milestones, and featu
 
 ---
 
-## Phase 3: Read-Write Support (`create`, `write`, `mkdir`, `unlink`, `rename`) (Planned)
+## Phase 3: Read-Write Support (`create`, `write`, `mkdir`, `unlink`, `rename`) (Completed)
 
 **Goal:** Enable full POSIX file creation, editing, folder management, and safe deletion while preserving memory safety and low disk footprint.
 
 ### 3.1 OAuth Scope Upgrade
-- [ ] Support upgrading OAuth2 scope from `drive.readonly` to `https://www.googleapis.com/auth/drive` when mounted without `--read-only` (while retaining `--read-only` flag for strict read-only mounts).
+- [x] Support upgrading OAuth2 scope from `drive.readonly` to `https://www.googleapis.com/auth/drive` when mounted without `--read-only` (while retaining `--read-only` flag for strict read-only mounts).
 
 ### 3.2 Write-Back Staging & Resumable Uploads (`create`, `open`, `write`, `flush`, `release`, `setattr`)
-- [ ] Maintain a bounded temporary staging directory (`~/.cache/gdrive-fuse-rs/staging/`) only for files actively open for writing.
-- [ ] Implement `create` and `write`: write incoming byte buffers to a local sparse/staging file, mark the inode as `dirty`, and update cached `size` and `mtime`.
-- [ ] Implement `flush` / `release`: upload dirty staged files to Google Drive using the **Google Drive Resumable Upload API** (`POST/PATCH https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable`), update SQLite metadata with the returned Drive `id`/`modifiedTime`, and delete the local staging file immediately upon upload completion.
-- [ ] Implement `setattr`: support `size` truncation (`truncate`) and `mtime` updates.
+- [x] Maintain a bounded temporary staging directory (`~/.cache/gdrive-fuse-rs/staging/`) only for files actively open for writing.
+- [x] Implement `create` and `write`: write incoming byte buffers to a local sparse/staging file, mark the inode as `dirty`, and update cached `size` and `mtime`.
+- [x] Implement `flush` / `release`: upload dirty staged files to Google Drive using the **Google Drive Resumable Upload API** (`POST/PATCH https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable`), update SQLite metadata with the returned Drive `id`/`modifiedTime`, and delete the local staging file immediately upon upload completion.
+- [x] Implement `setattr`: support `size` truncation (`truncate`) and `mtime` updates.
 
 ### 3.3 Directory & File Operations (`mkdir`, `rmdir`, `unlink`, `rename`)
-- [ ] **`mkdir`**: Create remote folder (`mimeType = "application/vnd.google-apps.folder"`) via `POST /drive/v3/files` and insert into SQLite cache.
-- [ ] **`unlink` & `rmdir` (Safe Trash by Default)**:
+- [x] **`mkdir`**: Create remote folder (`mimeType = "application/vnd.google-apps.folder"`) via `POST /drive/v3/files` and insert into SQLite cache.
+- [x] **`unlink` & `rmdir` (Safe Trash by Default)**:
   - Move deleted files and folders to Google Drive Trash (`PATCH /drive/v3/files/{fileId}` with `{"trashed": true}`) rather than permanent deletion (`DELETE`), preventing accidental data loss.
-- [ ] **`rename`**:
+- [x] **`rename`**:
   - Support in-directory renames (`PATCH` `name`) and cross-directory moves (`addParents` / `removeParents`) atomically in both Drive API and SQLite `parent_child`.

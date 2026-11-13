@@ -23,6 +23,9 @@ pub const SHARED_WITH_ME_DRIVE_ID: &str = "shared_with_me";
 /// Display name for the virtual "Shared with me" directory.
 pub const SHARED_WITH_ME_NAME: &str = "Shared with me";
 
+/// Prefix for temporary `drive_id` values assigned to newly created local files prior to their first upload.
+pub const PENDING_DRIVE_ID_PREFIX: &str = "pending:";
+
 /// Key in `sync_state` table for storing the `changes.list` page token.
 const CHANGES_PAGE_TOKEN_KEY: &str = "changes_page_token";
 
@@ -44,9 +47,15 @@ pub struct CachedFile {
     pub is_dir: bool,
     pub last_synced_at: Option<i64>,
     pub web_view_link: Option<String>,
+    pub dirty: bool,
 }
 
 impl CachedFile {
+    /// Returns `true` if this file was created locally (`create`) and has not yet completed its initial upload to Google Drive.
+    pub fn is_pending_upload(&self) -> bool {
+        self.drive_id.starts_with(PENDING_DRIVE_ID_PREFIX)
+    }
+
     /// Returns `true` if this file is a Google Workspace native document
     /// (e.g., Google Docs, Sheets, Slides) rather than a folder or regular binary file.
     pub fn is_google_native_doc(&self) -> bool {
@@ -141,6 +150,12 @@ impl MetadataCache {
         base_dir.join(APP_CACHE_DIR_NAME).join(DEFAULT_DB_FILENAME)
     }
 
+    /// Returns the default temporary write-back staging directory path (`~/.cache/gdrive-fuse-rs/staging/`).
+    pub fn default_staging_dir() -> PathBuf {
+        let base_dir = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
+        base_dir.join(APP_CACHE_DIR_NAME).join("staging")
+    }
+
     /// Removes the SQLite database file along with its `-wal` and `-shm` companion files if present.
     pub fn remove_db_files(db_path: &Path) -> Result<(), CacheError> {
         let mut wal_os = db_path.as_os_str().to_os_string();
@@ -156,6 +171,25 @@ impl MetadataCache {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(CacheError::Io(err)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes any leftover `inode_*.stage` staging files in `staging_dir`.
+    pub fn clear_staging_dir(staging_dir: &Path) -> Result<(), CacheError> {
+        if !staging_dir.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(staging_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("inode_") && name.ends_with(".stage") {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
             }
         }
         Ok(())
@@ -212,7 +246,8 @@ impl MetadataCache {
                 modified_time INTEGER NOT NULL DEFAULT 0,
                 is_dir INTEGER NOT NULL DEFAULT 0,
                 last_synced_at INTEGER,
-                web_view_link TEXT
+                web_view_link TEXT,
+                dirty INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS parent_child (
@@ -233,8 +268,12 @@ impl MetadataCache {
             ",
         )?;
 
-        // Gracefully migrate existing Phase 1 databases that lack web_view_link.
+        // Gracefully migrate existing Phase 1 / Phase 2 databases.
         let _ = conn.execute("ALTER TABLE files ADD COLUMN web_view_link TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         let now = Utc::now().timestamp();
         {
@@ -343,6 +382,7 @@ impl MetadataCache {
         let is_dir_int: i64 = row.get(6)?;
         let last_synced_at: Option<i64> = row.get(7)?;
         let web_view_link: Option<String> = row.get(8)?;
+        let dirty_int: i64 = row.get(9).unwrap_or(0);
 
         Ok(CachedFile {
             inode: inode_i64 as u64,
@@ -354,6 +394,7 @@ impl MetadataCache {
             is_dir: is_dir_int != 0,
             last_synced_at,
             web_view_link,
+            dirty: dirty_int != 0,
         })
     }
 
@@ -368,7 +409,7 @@ impl MetadataCache {
         inode: u64,
     ) -> Result<Option<CachedFile>, CacheError> {
         let mut stmt = conn.prepare_cached(
-            "SELECT inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link
+            "SELECT inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link, dirty
              FROM files
              WHERE inode = ?1",
         )?;
@@ -390,7 +431,7 @@ impl MetadataCache {
         drive_id: &str,
     ) -> Result<Option<CachedFile>, CacheError> {
         let mut stmt = conn.prepare_cached(
-            "SELECT inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link
+            "SELECT inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link, dirty
              FROM files
              WHERE drive_id = ?1",
         )?;
@@ -457,7 +498,7 @@ impl MetadataCache {
     ) -> Result<Option<CachedFile>, CacheError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT f.inode, f.drive_id, f.name, f.mime_type, f.size, f.modified_time, f.is_dir, f.last_synced_at, f.web_view_link
+            "SELECT f.inode, f.drive_id, f.name, f.mime_type, f.size, f.modified_time, f.is_dir, f.last_synced_at, f.web_view_link, f.dirty
              FROM parent_child pc
              JOIN files f ON f.inode = pc.child_inode
              WHERE pc.parent_inode = ?1 AND pc.effective_name = ?2",
@@ -483,7 +524,7 @@ impl MetadataCache {
         parent_inode: u64,
     ) -> Result<Vec<DirectoryEntry>, CacheError> {
         let mut stmt = conn.prepare_cached(
-            "SELECT f.inode, f.drive_id, f.name, f.mime_type, f.size, f.modified_time, f.is_dir, f.last_synced_at, f.web_view_link,
+            "SELECT f.inode, f.drive_id, f.name, f.mime_type, f.size, f.modified_time, f.is_dir, f.last_synced_at, f.web_view_link, f.dirty,
                     pc.parent_inode, pc.effective_name
              FROM parent_child pc
              JOIN files f ON f.inode = pc.child_inode
@@ -493,8 +534,8 @@ impl MetadataCache {
 
         let rows = stmt.query_map(params![parent_inode as i64], |row| {
             let file = Self::map_cached_file_row(row)?;
-            let parent_ino_i64: i64 = row.get(9)?;
-            let effective_name: String = row.get(10)?;
+            let parent_ino_i64: i64 = row.get(10)?;
+            let effective_name: String = row.get(11)?;
             Ok(DirectoryEntry {
                 inode: file.inode,
                 parent_inode: parent_ino_i64 as u64,
@@ -511,6 +552,7 @@ impl MetadataCache {
     }
 
     /// Inserts or updates a single `DriveFile` in the `files` table while strictly preserving its existing `inode`.
+    /// If the file is currently marked `dirty` (actively modified locally), its local `size` and `modified_time` are preserved.
     pub fn upsert_file(&self, file: &DriveFile) -> Result<CachedFile, CacheError> {
         let conn = self.lock_conn()?;
         Self::upsert_file_with_conn(&conn, file)
@@ -524,13 +566,13 @@ impl MetadataCache {
         let size_i64 = i64::try_from(file.size).unwrap_or(i64::MAX);
 
         conn.execute(
-            "INSERT INTO files (drive_id, name, mime_type, size, modified_time, is_dir, web_view_link)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO files (drive_id, name, mime_type, size, modified_time, is_dir, web_view_link, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
              ON CONFLICT(drive_id) DO UPDATE SET
-                 name = excluded.name,
+                 name = CASE WHEN files.dirty != 0 THEN files.name ELSE excluded.name END,
                  mime_type = excluded.mime_type,
-                 size = excluded.size,
-                 modified_time = excluded.modified_time,
+                 size = CASE WHEN files.dirty != 0 THEN files.size ELSE excluded.size END,
+                 modified_time = CASE WHEN files.dirty != 0 THEN files.modified_time ELSE excluded.modified_time END,
                  is_dir = excluded.is_dir,
                  web_view_link = COALESCE(excluded.web_view_link, files.web_view_link)",
             params![
@@ -549,7 +591,8 @@ impl MetadataCache {
     }
 
     /// Atomically replaces and deduplicates the child entries of `parent_inode` in a single SQLite transaction,
-    /// preserving existing inodes for known `drive_id`s and updating `last_synced_at` on `parent_inode`.
+    /// preserving existing inodes for known `drive_id`s, retaining any locally dirty/pending children,
+    /// and updating `last_synced_at` on `parent_inode`.
     pub fn sync_directory_children(
         &self,
         parent_inode: u64,
@@ -564,6 +607,12 @@ impl MetadataCache {
             return Err(CacheError::NotADirectory(parent_inode));
         }
 
+        // Preserve any locally created/modified dirty children in this directory that haven't been flushed yet.
+        let existing_dirty: Vec<DirectoryEntry> = Self::list_children_with_conn(&tx, parent_inode)?
+            .into_iter()
+            .filter(|e| e.file.dirty)
+            .collect();
+
         // Clear previous parent_child edges for this directory so deleted/moved remote files are removed.
         tx.execute(
             "DELETE FROM parent_child WHERE parent_inode = ?1",
@@ -577,12 +626,13 @@ impl MetadataCache {
             (children[a].name.as_str(), children[a].id.as_str())
                 .cmp(&(children[b].name.as_str(), children[b].id.as_str()))
         });
-        let mut used_names = HashSet::with_capacity(children.len());
+        let mut used_names = HashSet::with_capacity(children.len() + existing_dirty.len());
         let mut names = vec![String::new(); children.len()];
         for idx in naming_order {
             names[idx] = disambiguate_filename(&children[idx].name, &mut used_names);
         }
-        let mut entries = Vec::with_capacity(children.len());
+        let mut entries = Vec::with_capacity(children.len() + existing_dirty.len());
+        let mut inserted_inodes = HashSet::with_capacity(children.len());
 
         for (idx, drive_file) in children.iter().enumerate() {
             let cached_file = Self::upsert_file_with_conn(&tx, drive_file)?;
@@ -598,12 +648,35 @@ impl MetadataCache {
                 ],
             )?;
 
+            inserted_inodes.insert(cached_file.inode);
             entries.push(DirectoryEntry {
                 inode: cached_file.inode,
                 parent_inode,
                 effective_name,
                 file: cached_file,
             });
+        }
+
+        for dirty_entry in existing_dirty {
+            if !inserted_inodes.contains(&dirty_entry.inode) {
+                let effective_name =
+                    disambiguate_filename(&dirty_entry.effective_name, &mut used_names);
+                tx.execute(
+                    "INSERT INTO parent_child (parent_inode, child_inode, effective_name)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        parent_inode as i64,
+                        dirty_entry.inode as i64,
+                        &effective_name
+                    ],
+                )?;
+                entries.push(DirectoryEntry {
+                    inode: dirty_entry.inode,
+                    parent_inode,
+                    effective_name,
+                    file: dirty_entry.file,
+                });
+            }
         }
 
         let now = Utc::now().timestamp();
@@ -614,6 +687,370 @@ impl MetadataCache {
 
         tx.commit()?;
         Ok(entries)
+    }
+
+    fn used_sibling_effective_names_with_conn(
+        conn: &Connection,
+        parent_inode: u64,
+        exclude_child_inode: Option<u64>,
+    ) -> Result<HashSet<String>, CacheError> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT child_inode, effective_name FROM parent_child WHERE parent_inode = ?1",
+        )?;
+        let rows = stmt.query_map(params![parent_inode as i64], |r| {
+            let ino: i64 = r.get(0)?;
+            let name: String = r.get(1)?;
+            Ok((ino as u64, name))
+        })?;
+        let mut used = HashSet::new();
+        for row in rows {
+            let (child_ino, name) = row?;
+            if exclude_child_inode != Some(child_ino) {
+                used.insert(name);
+            }
+        }
+        Ok(used)
+    }
+
+    /// Allocates a new local dirty file inode under `parent_inode` with a temporary `pending:<inode>` Drive ID
+    /// for FUSE `create`.
+    pub fn create_pending_file(
+        &self,
+        parent_inode: u64,
+        name: &str,
+        mime_type: &str,
+        modified_time: i64,
+    ) -> Result<DirectoryEntry, CacheError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+
+        let parent_file = Self::get_by_inode_with_conn(&tx, parent_inode)?
+            .ok_or_else(|| CacheError::NotFound(format!("parent inode {}", parent_inode)))?;
+        if !parent_file.is_dir {
+            return Err(CacheError::NotADirectory(parent_inode));
+        }
+
+        let mut used_names = Self::used_sibling_effective_names_with_conn(&tx, parent_inode, None)?;
+        let effective_name = disambiguate_filename(name, &mut used_names);
+        let next_ino: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(inode), ?1) + 1 FROM files",
+            params![SHARED_WITH_ME_INODE as i64],
+            |r| r.get(0),
+        )?;
+        let temp_drive_id = format!("{}{}", PENDING_DRIVE_ID_PREFIX, next_ino);
+
+        tx.execute(
+            "INSERT INTO files (inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link, dirty)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, 0, NULL, NULL, 1)",
+            params![next_ino, &temp_drive_id, name, mime_type, modified_time],
+        )?;
+
+        tx.execute(
+            "INSERT INTO parent_child (parent_inode, child_inode, effective_name)
+             VALUES (?1, ?2, ?3)",
+            params![parent_inode as i64, next_ino, &effective_name],
+        )?;
+
+        let cached_file = Self::get_by_inode_with_conn(&tx, next_ino as u64)?
+            .ok_or_else(|| CacheError::NotFound(format!("inode {}", next_ino)))?;
+
+        tx.commit()?;
+        Ok(DirectoryEntry {
+            inode: cached_file.inode,
+            parent_inode,
+            effective_name,
+            file: cached_file,
+        })
+    }
+
+    /// Updates cached `size`, `modified_time`, and `dirty` flag for `inode` after a local `write` or `setattr`.
+    pub fn update_local_write(
+        &self,
+        inode: u64,
+        new_size: u64,
+        modified_time: i64,
+        mark_dirty: bool,
+    ) -> Result<CachedFile, CacheError> {
+        let conn = self.lock_conn()?;
+        let size_i64 = i64::try_from(new_size).unwrap_or(i64::MAX);
+        let updated = if mark_dirty {
+            conn.execute(
+                "UPDATE files SET size = ?1, modified_time = ?2, dirty = 1 WHERE inode = ?3",
+                params![size_i64, modified_time, inode as i64],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE files SET size = ?1, modified_time = ?2 WHERE inode = ?3",
+                params![size_i64, modified_time, inode as i64],
+            )?
+        };
+
+        if updated == 0 {
+            return Err(CacheError::NotFound(format!("inode {}", inode)));
+        }
+
+        Self::get_by_inode_with_conn(&conn, inode)?
+            .ok_or_else(|| CacheError::NotFound(format!("inode {}", inode)))
+    }
+
+    /// Updates an inode's Drive metadata (`drive_id`, `name`, `mime_type`, `size`, `modified_time`, `web_view_link`)
+    /// and clears its `dirty` flag once a Resumable Upload completes.
+    pub fn complete_file_upload(
+        &self,
+        inode: u64,
+        uploaded: &DriveFile,
+    ) -> Result<CachedFile, CacheError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+
+        // If background change sync inserted a separate row for `uploaded.id` before this upload
+        // callback completed, remove that duplicate row so `inode` remains strictly stable.
+        if let Some(other) = Self::get_by_drive_id_with_conn(&tx, &uploaded.id)? {
+            if other.inode != inode && other.inode > SHARED_WITH_ME_INODE {
+                let has_own_parent_edge: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM parent_child WHERE child_inode = ?1 LIMIT 1",
+                        params![inode as i64],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+
+                tx.execute(
+                    "DELETE FROM parent_child WHERE child_inode = ?1",
+                    params![other.inode as i64],
+                )?;
+                tx.execute(
+                    "DELETE FROM files WHERE inode = ?1",
+                    params![other.inode as i64],
+                )?;
+
+                if has_own_parent_edge {
+                    // Re-evaluate `inode`'s effective_name in case it had been disambiguated against `other.inode`
+                    let parent_opt: Option<i64> = tx
+                        .query_row(
+                            "SELECT parent_inode FROM parent_child WHERE child_inode = ?1 LIMIT 1",
+                            params![inode as i64],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if let Some(p_ino) = parent_opt {
+                        let mut used = Self::used_sibling_effective_names_with_conn(
+                            &tx,
+                            p_ino as u64,
+                            Some(inode),
+                        )?;
+                        let clean_name = disambiguate_filename(&uploaded.name, &mut used);
+                        tx.execute(
+                            "UPDATE parent_child SET effective_name = ?1 WHERE parent_inode = ?2 AND child_inode = ?3",
+                            params![&clean_name, p_ino, inode as i64],
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let size_i64 = i64::try_from(uploaded.size).unwrap_or(i64::MAX);
+        let updated = tx.execute(
+            "UPDATE files
+             SET drive_id = ?1,
+                 name = ?2,
+                 mime_type = ?3,
+                 size = ?4,
+                 modified_time = ?5,
+                 web_view_link = COALESCE(?6, web_view_link),
+                 dirty = 0
+             WHERE inode = ?7",
+            params![
+                uploaded.id,
+                uploaded.name,
+                uploaded.mime_type,
+                size_i64,
+                uploaded.modified_time,
+                uploaded.web_view_link,
+                inode as i64,
+            ],
+        )?;
+
+        if updated == 0 {
+            return Err(CacheError::NotFound(format!("inode {}", inode)));
+        }
+
+        let cached = Self::get_by_inode_with_conn(&tx, inode)?
+            .ok_or_else(|| CacheError::NotFound(format!("inode {}", inode)))?;
+        tx.commit()?;
+        Ok(cached)
+    }
+
+    /// Inserts a newly created remote child (`mkdir` or uploaded file) under `parent_inode`.
+    pub fn insert_child_file(
+        &self,
+        parent_inode: u64,
+        effective_name: &str,
+        file: &DriveFile,
+    ) -> Result<DirectoryEntry, CacheError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+
+        let parent_file = Self::get_by_inode_with_conn(&tx, parent_inode)?
+            .ok_or_else(|| CacheError::NotFound(format!("parent inode {}", parent_inode)))?;
+        if !parent_file.is_dir {
+            return Err(CacheError::NotADirectory(parent_inode));
+        }
+
+        let cached_file = Self::upsert_file_with_conn(&tx, file)?;
+        tx.execute(
+            "DELETE FROM parent_child WHERE parent_inode = ?1 AND child_inode = ?2",
+            params![parent_inode as i64, cached_file.inode as i64],
+        )?;
+        let mut used_names =
+            Self::used_sibling_effective_names_with_conn(&tx, parent_inode, Some(cached_file.inode))?;
+        let disambiguated = disambiguate_filename(effective_name, &mut used_names);
+
+        tx.execute(
+            "INSERT INTO parent_child (parent_inode, child_inode, effective_name)
+             VALUES (?1, ?2, ?3)",
+            params![
+                parent_inode as i64,
+                cached_file.inode as i64,
+                &disambiguated
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(DirectoryEntry {
+            inode: cached_file.inode,
+            parent_inode,
+            effective_name: disambiguated,
+            file: cached_file,
+        })
+    }
+
+    /// Removes a file or folder and its `parent_child` edges from the SQLite cache (`unlink` / `rmdir`).
+    pub fn remove_file(&self, inode: u64) -> Result<(), CacheError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "DELETE FROM parent_child WHERE child_inode = ?1 OR parent_inode = ?1",
+            params![inode as i64],
+        )?;
+
+        if inode > SHARED_WITH_ME_INODE {
+            tx.execute(
+                "DELETE FROM files WHERE inode = ?1",
+                params![inode as i64],
+            )?;
+        }
+
+        tx.commit()?;
+        if let Ok(mut guard) = self.evicted_inodes.lock() {
+            guard.insert(inode);
+        }
+        Ok(())
+    }
+
+    /// Atomically renames and/or moves `child_inode` from `old_parent_inode` to `(new_parent_inode, new_effective_name)`,
+    /// removing any overwritten sibling at the destination and updating `files` metadata.
+    pub fn rename_entry(
+        &self,
+        old_parent_inode: u64,
+        child_inode: u64,
+        new_parent_inode: u64,
+        new_effective_name: &str,
+        updated_file: Option<&DriveFile>,
+    ) -> Result<CachedFile, CacheError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+
+        let sanitized_new_name = sanitize_posix_filename(new_effective_name);
+
+        // If another inode was mapped at (new_parent_inode, sanitized_new_name):
+        // - If it is a Google Workspace native doc (whose FUSE display name has a virtual extension
+        //   like `.gdoc` while its `effective_name` in `parent_child` is the bare title), do NOT
+        //   delete the Google Doc; instead disambiguate `parent_child.effective_name`.
+        // - Otherwise, remove the overwritten regular file/folder.
+        let overwritten_ino: Option<i64> = tx
+            .query_row(
+                "SELECT child_inode FROM parent_child WHERE parent_inode = ?1 AND effective_name = ?2",
+                params![new_parent_inode as i64, &sanitized_new_name],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        if let Some(target_ino) = overwritten_ino {
+            if target_ino as u64 != child_inode {
+                let target_is_native_doc = Self::get_by_inode_with_conn(&tx, target_ino as u64)?
+                    .is_some_and(|f| f.is_google_native_doc());
+                if !target_is_native_doc {
+                    tx.execute(
+                        "DELETE FROM parent_child WHERE parent_inode = ?1 AND effective_name = ?2",
+                        params![new_parent_inode as i64, &sanitized_new_name],
+                    )?;
+                    if (target_ino as u64) > SHARED_WITH_ME_INODE {
+                        tx.execute("DELETE FROM files WHERE inode = ?1", params![target_ino])?;
+                    }
+                    if let Ok(mut guard) = self.evicted_inodes.lock() {
+                        guard.insert(target_ino as u64);
+                    }
+                }
+            }
+        }
+
+        tx.execute(
+            "DELETE FROM parent_child WHERE parent_inode = ?1 AND child_inode = ?2",
+            params![old_parent_inode as i64, child_inode as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM parent_child WHERE parent_inode = ?1 AND child_inode = ?2",
+            params![new_parent_inode as i64, child_inode as i64],
+        )?;
+
+        let mut used_names =
+            Self::used_sibling_effective_names_with_conn(&tx, new_parent_inode, Some(child_inode))?;
+        let final_effective_name = disambiguate_filename(&sanitized_new_name, &mut used_names);
+
+        tx.execute(
+            "INSERT INTO parent_child (parent_inode, child_inode, effective_name)
+             VALUES (?1, ?2, ?3)",
+            params![
+                new_parent_inode as i64,
+                child_inode as i64,
+                &final_effective_name
+            ],
+        )?;
+
+        if let Some(drive_file) = updated_file {
+            let size_i64 = i64::try_from(drive_file.size).unwrap_or(i64::MAX);
+            tx.execute(
+                "UPDATE files
+                 SET name = ?1,
+                     mime_type = ?2,
+                     size = CASE WHEN dirty != 0 THEN size ELSE ?3 END,
+                     modified_time = CASE WHEN dirty != 0 THEN modified_time ELSE ?4 END,
+                     web_view_link = COALESCE(?5, web_view_link)
+                 WHERE inode = ?6",
+                params![
+                    drive_file.name,
+                    drive_file.mime_type,
+                    size_i64,
+                    drive_file.modified_time,
+                    drive_file.web_view_link,
+                    child_inode as i64,
+                ],
+            )?;
+        } else {
+            let guessed_mime = crate::api::guess_mime_type(&sanitized_new_name);
+            tx.execute(
+                "UPDATE files SET name = ?1, mime_type = CASE WHEN drive_id LIKE 'pending:%' THEN ?2 ELSE mime_type END WHERE inode = ?3",
+                params![&sanitized_new_name, guessed_mime, child_inode as i64],
+            )?;
+        }
+
+        let updated = Self::get_by_inode_with_conn(&tx, child_inode)?
+            .ok_or_else(|| CacheError::NotFound(format!("inode {}", child_inode)))?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     /// Retrieves the saved Google Drive `changes.list` page token from `sync_state`, if any.
@@ -658,24 +1095,26 @@ impl MetadataCache {
 
             if is_removed_or_trashed {
                 if let Some(existing) = Self::get_by_drive_id_with_conn(&tx, &change.file_id)? {
-                    let child_inode_i64 = existing.inode as i64;
-                    tx.execute(
-                        "UPDATE files SET last_synced_at = NULL
-                         WHERE inode IN (SELECT parent_inode FROM parent_child WHERE child_inode = ?1)",
-                        params![child_inode_i64],
-                    )?;
-                    tx.execute(
-                        "DELETE FROM parent_child WHERE child_inode = ?1",
-                        params![child_inode_i64],
-                    )?;
-                    if existing.inode > SHARED_WITH_ME_INODE {
+                    if !existing.dirty {
+                        let child_inode_i64 = existing.inode as i64;
                         tx.execute(
-                            "DELETE FROM files WHERE inode = ?1",
+                            "UPDATE files SET last_synced_at = NULL
+                             WHERE inode IN (SELECT parent_inode FROM parent_child WHERE child_inode = ?1)",
                             params![child_inode_i64],
                         )?;
+                        tx.execute(
+                            "DELETE FROM parent_child WHERE child_inode = ?1",
+                            params![child_inode_i64],
+                        )?;
+                        if existing.inode > SHARED_WITH_ME_INODE {
+                            tx.execute(
+                                "DELETE FROM files WHERE inode = ?1",
+                                params![child_inode_i64],
+                            )?;
+                        }
+                        newly_evicted.push(existing.inode);
+                        affected_count += 1;
                     }
-                    newly_evicted.push(existing.inode);
-                    affected_count += 1;
                 }
                 // Also invalidate the virtual "Shared with me" directory in case a shared item was removed
                 tx.execute(
@@ -685,7 +1124,9 @@ impl MetadataCache {
             } else if let Some(ref drive_file) = change.file {
                 let upserted = Self::upsert_file_with_conn(&tx, drive_file)?;
                 let child_inode_i64 = upserted.inode as i64;
-                newly_evicted.push(upserted.inode);
+                if !upserted.dirty {
+                    newly_evicted.push(upserted.inode);
+                }
 
                 // Invalidate any previously recorded parent directories for this inode
                 tx.execute(
@@ -755,15 +1196,17 @@ impl MetadataCache {
         }
     }
 
-    /// Clears all cached files, directory edges, and sync state while preserving reserved root (`1`)
-    /// and "Shared with me" (`2`) inodes.
+    /// Clears all clean cached files, directory edges, and sync state while preserving reserved root (`1`),
+    /// "Shared with me" (`2`), and any locally dirty/pending inodes that have not yet been uploaded.
     pub fn clear_all(&self) -> Result<(), CacheError> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
 
         let mut all_inodes = Vec::new();
         {
-            let mut stmt = tx.prepare("SELECT inode FROM files WHERE inode > ?1")?;
+            let mut stmt = tx.prepare(
+                "SELECT inode FROM files WHERE inode > ?1 AND dirty = 0 AND drive_id NOT LIKE 'pending:%'",
+            )?;
             let rows = stmt.query_map(params![SHARED_WITH_ME_INODE as i64], |r| {
                 let ino: i64 = r.get(0)?;
                 Ok(ino as u64)
@@ -773,10 +1216,15 @@ impl MetadataCache {
             }
         }
 
-        tx.execute("DELETE FROM parent_child", [])?;
+        tx.execute(
+            "DELETE FROM parent_child WHERE child_inode IN (
+                SELECT inode FROM files WHERE inode > ?1 AND dirty = 0 AND drive_id NOT LIKE 'pending:%'
+            )",
+            params![SHARED_WITH_ME_INODE as i64],
+        )?;
         tx.execute("DELETE FROM sync_state", [])?;
         tx.execute(
-            "DELETE FROM files WHERE inode > ?1",
+            "DELETE FROM files WHERE inode > ?1 AND dirty = 0 AND drive_id NOT LIKE 'pending:%'",
             params![SHARED_WITH_ME_INODE as i64],
         )?;
         tx.execute(
@@ -1327,5 +1775,93 @@ mod tests {
             .inode;
         assert!(evicted.contains(&new_shared_ino));
         assert!(cache.take_evicted_inodes().is_empty());
+    }
+
+    #[test]
+    fn test_phase3_pending_file_upload_completion_rename_and_remove() {
+        let cache = Cache::open_in_memory(60).expect("Failed to open cache");
+
+        // 1. Create a pending local file under root
+        let pending_entry = cache
+            .create_pending_file(ROOT_INODE, "draft.txt", "text/plain", 1_750_000_000)
+            .expect("create_pending_file failed");
+        let draft_ino = pending_entry.inode;
+        assert!(draft_ino > SHARED_WITH_ME_INODE);
+        assert!(pending_entry.file.is_pending_upload());
+        assert!(pending_entry.file.dirty);
+        assert_eq!(pending_entry.file.size, 0);
+
+        // 2. Update local write size and mtime
+        let written = cache
+            .update_local_write(draft_ino, 4096, 1_750_000_010, true)
+            .expect("update_local_write failed");
+        assert_eq!(written.size, 4096);
+        assert_eq!(written.modified_time, 1_750_000_010);
+        assert!(written.dirty);
+
+        // 3. Re-syncing root directory while draft.txt is still dirty preserves draft.txt in root
+        let remote_sibling = sample_drive_file("remote_1", "existing.txt", "text/plain", 100);
+        let synced = cache
+            .sync_directory_children(ROOT_INODE, &[remote_sibling])
+            .expect("sync_directory_children with dirty file failed");
+        assert_eq!(synced.len(), 2);
+        assert!(cache.lookup_child(ROOT_INODE, "draft.txt").unwrap().is_some());
+
+        // 4. Complete upload and verify inode stability + dirty cleared
+        let uploaded_drive_file = DriveFile {
+            id: "drive_real_999".to_string(),
+            name: "draft.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 4096,
+            modified_time: 1_750_000_020,
+            parents: vec![ROOT_DRIVE_ID.to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let completed = cache
+            .complete_file_upload(draft_ino, &uploaded_drive_file)
+            .expect("complete_file_upload failed");
+        assert_eq!(completed.inode, draft_ino);
+        assert_eq!(completed.drive_id, "drive_real_999");
+        assert!(!completed.dirty);
+        assert!(!completed.is_pending_upload());
+
+        // 5. Insert a subfolder (`mkdir`) and move draft.txt into it (`rename_entry`)
+        let subfolder = sample_drive_file("folder_sub", "Archive", FOLDER_MIME_TYPE, 0);
+        let sub_entry = cache
+            .insert_child_file(ROOT_INODE, "Archive", &subfolder)
+            .expect("insert_child_file failed");
+        let sub_ino = sub_entry.inode;
+
+        let mut renamed_drive_file = uploaded_drive_file.clone();
+        renamed_drive_file.name = "final.txt".to_string();
+        renamed_drive_file.parents = vec!["folder_sub".to_string()];
+
+        let renamed = cache
+            .rename_entry(
+                ROOT_INODE,
+                draft_ino,
+                sub_ino,
+                "final.txt",
+                Some(&renamed_drive_file),
+            )
+            .expect("rename_entry failed");
+        assert_eq!(renamed.inode, draft_ino);
+        assert_eq!(renamed.name, "final.txt");
+        assert!(cache.lookup_child(ROOT_INODE, "draft.txt").unwrap().is_none());
+        assert_eq!(
+            cache
+                .lookup_child(sub_ino, "final.txt")
+                .unwrap()
+                .unwrap()
+                .inode,
+            draft_ino
+        );
+        assert_eq!(cache.get_parent_inode(draft_ino).unwrap(), sub_ino);
+
+        // 6. Remove file (`unlink`)
+        cache.remove_file(draft_ino).expect("remove_file failed");
+        assert!(cache.get_by_inode(draft_ino).unwrap().is_none());
+        assert!(cache.lookup_child(sub_ino, "final.txt").unwrap().is_none());
     }
 }
