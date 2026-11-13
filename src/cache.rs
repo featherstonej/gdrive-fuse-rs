@@ -178,6 +178,9 @@ impl MetadataCache {
             match comp {
                 std::path::Component::CurDir => {}
                 std::path::Component::ParentDir => {
+                    if let Ok(canonical) = fs::canonicalize(&normalized) {
+                        normalized = canonical;
+                    }
                     let _ = normalized.pop();
                 }
                 other => normalized.push(other.as_os_str()),
@@ -1502,6 +1505,34 @@ mod tests {
                 .expect("get_parent_inode for shared_with_me failed"),
             ROOT_INODE
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_staging_namespace_resolves_symlink_before_parent_component() {
+        use std::os::unix::fs::symlink;
+
+        let test_dir = std::env::temp_dir().join(format!(
+            "gdrive-fuse-rs-symlink-path-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let target_child = test_dir.join("target/child");
+        fs::create_dir_all(&target_child).unwrap();
+        symlink("target/child", test_dir.join("link")).unwrap();
+
+        let db_path = test_dir.join("link/../metadata.db");
+        let stage_before_open = MetadataCache::default_staging_dir_for_db(&db_path);
+        let cache = MetadataCache::open(&db_path, 60).unwrap();
+        let stage_after_open = MetadataCache::default_staging_dir_for_db(&db_path);
+
+        assert_eq!(
+            stage_before_open, stage_after_open,
+            "A symlink followed by `..` must resolve to the same staging namespace before and after database creation"
+        );
+        assert!(test_dir.join("target/metadata.db").exists());
+        drop(cache);
+        fs::remove_dir_all(test_dir).unwrap();
     }
 
     #[test]
