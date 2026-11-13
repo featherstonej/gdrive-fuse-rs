@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -141,8 +141,43 @@ pub struct MetadataCache {
     conn: Mutex<Connection>,
     ttl_secs: u64,
     evicted_inodes: Mutex<HashSet<u64>>,
-    removed_inodes: Mutex<HashSet<u64>>,
+    removal_tracker: Mutex<RemovalTracker>,
     staging_namespace: Option<String>,
+}
+
+#[derive(Default)]
+struct RemovalTracker {
+    generations: HashMap<u64, u64>,
+    pending: HashMap<u64, u64>,
+}
+
+impl RemovalTracker {
+    fn advance_generation(&mut self, inode: u64) -> u64 {
+        let generation = self.generations.entry(inode).or_default();
+        *generation = generation.wrapping_add(1);
+        *generation
+    }
+
+    fn queue_removal(&mut self, inode: u64) -> u64 {
+        let generation = self.advance_generation(inode);
+        self.pending.insert(inode, generation);
+        generation
+    }
+
+    fn cancel_removal(&mut self, inode: u64) {
+        self.advance_generation(inode);
+        self.pending.remove(&inode);
+    }
+
+    fn is_current(&self, inode: u64, generation: u64) -> bool {
+        self.generations.get(&inode) == Some(&generation)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedInode {
+    pub inode: u64,
+    pub generation: u64,
 }
 
 impl MetadataCache {
@@ -465,7 +500,7 @@ impl MetadataCache {
             conn: Mutex::new(conn),
             ttl_secs,
             evicted_inodes: Mutex::new(HashSet::new()),
-            removed_inodes: Mutex::new(HashSet::new()),
+            removal_tracker: Mutex::new(RemovalTracker::default()),
             staging_namespace: None,
         })
     }
@@ -657,7 +692,11 @@ impl MetadataCache {
     /// If the file is currently marked `dirty` (actively modified locally), its local `size` and `modified_time` are preserved.
     pub fn upsert_file(&self, file: &DriveFile) -> Result<CachedFile, CacheError> {
         let conn = self.lock_conn()?;
-        Self::upsert_file_with_conn(&conn, file)
+        let cached_file = Self::upsert_file_with_conn(&conn, file)?;
+        if let Ok(mut tracker) = self.removal_tracker.lock() {
+            tracker.cancel_removal(cached_file.inode);
+        }
+        Ok(cached_file)
     }
 
     fn upsert_file_with_conn(
@@ -813,6 +852,13 @@ impl MetadataCache {
         )?;
 
         tx.commit()?;
+
+        if let Ok(mut tracker) = self.removal_tracker.lock() {
+            for inode in inserted_inodes {
+                tracker.cancel_removal(inode);
+            }
+        }
+
         Ok(entries)
     }
 
@@ -1217,7 +1263,7 @@ impl MetadataCache {
         let tx = conn.transaction()?;
         let mut affected_count = 0usize;
         let mut newly_evicted = Vec::new();
-        let mut newly_removed = Vec::new();
+        let mut removal_events = Vec::new();
 
         for change in changes {
             let is_removed_or_trashed =
@@ -1253,7 +1299,7 @@ impl MetadataCache {
                             params![child_inode_i64],
                         )?;
                         if existing.inode > SHARED_WITH_ME_INODE {
-                            newly_removed.push(existing.inode);
+                            removal_events.push((existing.inode, true));
                         }
                         newly_evicted.push(existing.inode);
                         affected_count += 1;
@@ -1266,6 +1312,7 @@ impl MetadataCache {
                 )?;
             } else if let Some(ref drive_file) = change.file {
                 let upserted = Self::upsert_file_with_conn(&tx, drive_file)?;
+                removal_events.push((upserted.inode, false));
                 let child_inode_i64 = upserted.inode as i64;
                 if !upserted.dirty {
                     newly_evicted.push(upserted.inode);
@@ -1326,9 +1373,13 @@ impl MetadataCache {
                 guard.extend(newly_evicted);
             }
         }
-        if !newly_removed.is_empty() {
-            if let Ok(mut guard) = self.removed_inodes.lock() {
-                guard.extend(newly_removed);
+        if let Ok(mut tracker) = self.removal_tracker.lock() {
+            for (inode, removed) in removal_events {
+                if removed {
+                    tracker.queue_removal(inode);
+                } else {
+                    tracker.cancel_removal(inode);
+                }
             }
         }
 
@@ -1345,11 +1396,54 @@ impl MetadataCache {
     }
 
     /// Drains the inodes removed remotely so the FUSE layer can defer deleting open file records.
-    pub fn take_removed_inodes(&self) -> Vec<u64> {
-        match self.removed_inodes.lock() {
-            Ok(mut guard) => guard.drain().collect(),
+    pub fn take_removed_inodes(&self) -> Vec<RemovedInode> {
+        match self.removal_tracker.lock() {
+            Ok(mut tracker) => tracker
+                .pending
+                .drain()
+                .map(|(inode, generation)| RemovedInode { inode, generation })
+                .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    pub fn is_current_removal(&self, inode: u64, generation: u64) -> bool {
+        self.removal_tracker
+            .lock()
+            .map(|tracker| tracker.is_current(inode, generation))
+            .unwrap_or(false)
+    }
+
+    pub fn remove_file_if_current_removal(
+        &self,
+        inode: u64,
+        generation: u64,
+    ) -> Result<bool, CacheError> {
+        let mut conn = self.lock_conn()?;
+        let tracker = self
+            .removal_tracker
+            .lock()
+            .map_err(|_| CacheError::LockPoisoned)?;
+        if !tracker.is_current(inode, generation) {
+            return Ok(false);
+        }
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM parent_child WHERE child_inode = ?1 OR parent_inode = ?1",
+            params![inode as i64],
+        )?;
+
+        if inode > SHARED_WITH_ME_INODE {
+            tx.execute("DELETE FROM files WHERE inode = ?1", params![inode as i64])?;
+        }
+
+        tx.commit()?;
+        drop(tracker);
+        if let Ok(mut guard) = self.evicted_inodes.lock() {
+            guard.insert(inode);
+        }
+        Ok(true)
     }
 
     /// Clears all clean cached files, directory edges, and sync state while preserving reserved root (`1`),
@@ -1858,8 +1952,48 @@ mod tests {
 
         // file_b should be removed from parent_child and queued for FUSE-layer cleanup
         let removed_b = cache.get_by_drive_id("file_b").unwrap().unwrap();
-        assert!(cache.take_removed_inodes().contains(&removed_b.inode));
+        assert!(cache
+            .take_removed_inodes()
+            .iter()
+            .any(|removed| removed.inode == removed_b.inode));
         assert!(cache.lookup_child(ROOT_INODE, "beta.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_restored_file_cancels_pending_removal() {
+        let cache = MetadataCache::open_in_memory(300).expect("Failed to open cache");
+        let file = sample_drive_file("restored_file", "restored.txt", "text/plain", 100);
+        let entry = cache
+            .sync_directory_children(ROOT_INODE, &[file.clone()])
+            .unwrap()
+            .remove(0);
+
+        cache
+            .apply_changes(
+                &[ChangeItem {
+                    file_id: file.id.clone(),
+                    removed: true,
+                    file: None,
+                }],
+                Some("tok_removed"),
+            )
+            .unwrap();
+        cache
+            .apply_changes(
+                &[ChangeItem {
+                    file_id: file.id.clone(),
+                    removed: false,
+                    file: Some(file),
+                }],
+                Some("tok_restored"),
+            )
+            .unwrap();
+
+        assert!(cache.take_removed_inodes().is_empty());
+        assert_eq!(
+            cache.get_by_inode(entry.inode).unwrap().unwrap().drive_id,
+            "restored_file"
+        );
     }
 
     #[test]

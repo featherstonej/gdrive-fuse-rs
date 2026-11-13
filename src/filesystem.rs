@@ -485,6 +485,7 @@ pub struct GDriveFS {
     pending_upload_sessions: HashMap<u64, PendingUploadSession>,
     open_handles: HashMap<u64, HashMap<u64, i32>>,
     unlinked_inodes: HashSet<u64>,
+    remote_unlinked_generations: HashMap<u64, u64>,
     next_fh: u64,
 }
 
@@ -586,6 +587,7 @@ impl GDriveFS {
             pending_upload_sessions: HashMap::new(),
             open_handles: HashMap::new(),
             unlinked_inodes: HashSet::new(),
+            remote_unlinked_generations: HashMap::new(),
             next_fh: 1,
         };
         if !read_only {
@@ -819,13 +821,24 @@ impl GDriveFS {
     /// Evicts any cached read-ahead or exported document chunks for inodes that were
     /// modified or removed in SQLite by background incremental sync.
     fn drain_cache_evictions(&mut self) {
-        for ino in self.cache.take_removed_inodes() {
-            if self.has_open_handles(ino) {
-                self.unlinked_inodes.insert(ino);
-            } else if let Err(e) = self.cache.remove_file(ino) {
+        for removal in self.cache.take_removed_inodes() {
+            if !self
+                .cache
+                .is_current_removal(removal.inode, removal.generation)
+            {
+                continue;
+            }
+            if self.has_open_handles(removal.inode) {
+                self.unlinked_inodes.insert(removal.inode);
+                self.remote_unlinked_generations
+                    .insert(removal.inode, removal.generation);
+            } else if let Err(e) = self
+                .cache
+                .remove_file_if_current_removal(removal.inode, removal.generation)
+            {
                 log::error!(
                     "Failed to remove remotely deleted inode {} from cache: {}",
-                    ino,
+                    removal.inode,
                     e
                 );
             }
@@ -833,6 +846,21 @@ impl GDriveFS {
         for ino in self.cache.take_evicted_inodes() {
             self.chunk_buffer.evict(ino);
         }
+    }
+
+    fn is_unlinked(&mut self, ino: u64) -> bool {
+        if let Some(generation) = self.remote_unlinked_generations.get(&ino).copied() {
+            if !self.cache.is_current_removal(ino, generation) {
+                self.remote_unlinked_generations.remove(&ino);
+                self.unlinked_inodes.remove(&ino);
+            }
+        }
+        self.unlinked_inodes.contains(&ino)
+    }
+
+    fn mark_locally_unlinked(&mut self, ino: u64) {
+        self.remote_unlinked_generations.remove(&ino);
+        self.unlinked_inodes.insert(ino);
     }
 
     fn ensure_google_doc_exported(&mut self, file: &CachedFile) -> Result<Bytes, libc::c_int> {
@@ -1725,7 +1753,8 @@ impl GDriveFS {
 
     /// Flushes any dirty staged writes for `ino` to Google Drive via Resumable Upload.
     pub fn handle_flush(&mut self, ino: u64, fh: u64) -> Result<(), libc::c_int> {
-        if self.unlinked_inodes.contains(&ino) {
+        self.drain_cache_evictions();
+        if self.is_unlinked(ino) {
             return Ok(());
         }
         if let Some(flags) = self.open_handles.get(&ino).and_then(|h| h.get(&fh)) {
@@ -1742,14 +1771,26 @@ impl GDriveFS {
         self.drain_cache_evictions();
         let was_writable = self.untrack_open_handle(ino, fh);
         let still_open = self.has_open_handles(ino);
-        if self.unlinked_inodes.contains(&ino) {
+        if self.is_unlinked(ino) {
             if !still_open {
+                let remote_generation = self.remote_unlinked_generations.remove(&ino);
                 self.unlinked_inodes.remove(&ino);
-                self.discard_staged_file(ino);
-                self.chunk_buffer.evict(ino);
-                let _ = self.cache.remove_file(ino);
+                let removed = if let Some(generation) = remote_generation {
+                    self.cache
+                        .remove_file_if_current_removal(ino, generation)
+                        .map_err(|e| e.to_errno())?
+                } else {
+                    let _ = self.cache.remove_file(ino);
+                    true
+                };
+                if removed {
+                    self.discard_staged_file(ino);
+                    self.chunk_buffer.evict(ino);
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
             }
-            return Ok(());
         }
         if !still_open {
             let res = self.upload_staged_if_dirty(ino, true);
@@ -1817,7 +1858,7 @@ impl GDriveFS {
                 .map_err(|e| e.to_errno())?;
 
             let has_open_handles = self.has_open_handles(ino);
-            if fh.is_none() && !has_open_handles && !self.unlinked_inodes.contains(&ino) {
+            if fh.is_none() && !has_open_handles && !self.is_unlinked(ino) {
                 self.upload_staged_if_dirty(ino, true)?;
             }
         } else if mtime.is_some() {
@@ -1949,7 +1990,7 @@ impl GDriveFS {
 
         self.quota_cache = None;
         if self.has_open_handles(child.inode) {
-            self.unlinked_inodes.insert(child.inode);
+            self.mark_locally_unlinked(child.inode);
             self.cache
                 .unlink_child_entry(parent, child.inode)
                 .map_err(|e| e.to_errno())?;
@@ -2198,7 +2239,7 @@ impl GDriveFS {
             }
 
             if self.has_open_handles(dst_file.inode) {
-                self.unlinked_inodes.insert(dst_file.inode);
+                self.mark_locally_unlinked(dst_file.inode);
                 self.cache
                     .unlink_child_entry(newparent, dst_file.inode)
                     .map_err(|e| e.to_errno())?;
@@ -3652,6 +3693,59 @@ mod tests {
 
         fs.handle_release(open_ino, fh).unwrap();
         assert!(fs.cache.get_by_inode(open_ino).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_restore_cancels_deferred_open_inode_cleanup() {
+        let rt = Runtime::new().unwrap();
+        let mut fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+        let file = crate::api::DriveFile {
+            id: "restored_open_file".to_string(),
+            name: "restored.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let entry = fs
+            .cache
+            .sync_directory_children(ROOT_INODE, &[file.clone()])
+            .unwrap()
+            .remove(0);
+        let fh = fs.handle_open_with_fh(entry.inode, libc::O_RDONLY).unwrap();
+
+        fs.cache
+            .apply_changes(
+                &[crate::api::ChangeItem {
+                    file_id: file.id.clone(),
+                    removed: true,
+                    file: None,
+                }],
+                Some("tok_removed"),
+            )
+            .unwrap();
+        fs.handle_getattr(entry.inode)
+            .expect("open inode should remain available after removal");
+
+        fs.cache
+            .apply_changes(
+                &[crate::api::ChangeItem {
+                    file_id: file.id.clone(),
+                    removed: false,
+                    file: Some(file),
+                }],
+                Some("tok_restored"),
+            )
+            .unwrap();
+        fs.handle_release(entry.inode, fh).unwrap();
+
+        assert!(fs.cache.get_by_inode(entry.inode).unwrap().is_some());
     }
 
     #[test]
