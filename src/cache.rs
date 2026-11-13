@@ -141,6 +141,7 @@ pub struct MetadataCache {
     conn: Mutex<Connection>,
     ttl_secs: u64,
     evicted_inodes: Mutex<HashSet<u64>>,
+    removed_inodes: Mutex<HashSet<u64>>,
     staging_namespace: Option<String>,
 }
 
@@ -464,6 +465,7 @@ impl MetadataCache {
             conn: Mutex::new(conn),
             ttl_secs,
             evicted_inodes: Mutex::new(HashSet::new()),
+            removed_inodes: Mutex::new(HashSet::new()),
             staging_namespace: None,
         })
     }
@@ -1215,6 +1217,7 @@ impl MetadataCache {
         let tx = conn.transaction()?;
         let mut affected_count = 0usize;
         let mut newly_evicted = Vec::new();
+        let mut newly_removed = Vec::new();
 
         for change in changes {
             let is_removed_or_trashed =
@@ -1250,10 +1253,7 @@ impl MetadataCache {
                             params![child_inode_i64],
                         )?;
                         if existing.inode > SHARED_WITH_ME_INODE {
-                            tx.execute(
-                                "DELETE FROM files WHERE inode = ?1",
-                                params![child_inode_i64],
-                            )?;
+                            newly_removed.push(existing.inode);
                         }
                         newly_evicted.push(existing.inode);
                         affected_count += 1;
@@ -1326,6 +1326,11 @@ impl MetadataCache {
                 guard.extend(newly_evicted);
             }
         }
+        if !newly_removed.is_empty() {
+            if let Ok(mut guard) = self.removed_inodes.lock() {
+                guard.extend(newly_removed);
+            }
+        }
 
         Ok(affected_count)
     }
@@ -1334,6 +1339,14 @@ impl MetadataCache {
     /// by incremental sync so the FUSE layer can evict any stale read-ahead / exported buffers.
     pub fn take_evicted_inodes(&self) -> Vec<u64> {
         match self.evicted_inodes.lock() {
+            Ok(mut guard) => guard.drain().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Drains the inodes removed remotely so the FUSE layer can defer deleting open file records.
+    pub fn take_removed_inodes(&self) -> Vec<u64> {
+        match self.removed_inodes.lock() {
             Ok(mut guard) => guard.drain().collect(),
             Err(_) => Vec::new(),
         }
@@ -1843,8 +1856,9 @@ mod tests {
         assert_eq!(updated_a.name, "alpha_v2.txt");
         assert_eq!(updated_a.size, 555);
 
-        // file_b should be completely removed from files and parent_child
-        assert!(cache.get_by_drive_id("file_b").unwrap().is_none());
+        // file_b should be removed from parent_child and queued for FUSE-layer cleanup
+        let removed_b = cache.get_by_drive_id("file_b").unwrap().unwrap();
+        assert!(cache.take_removed_inodes().contains(&removed_b.inode));
         assert!(cache.lookup_child(ROOT_INODE, "beta.txt").unwrap().is_none());
     }
 

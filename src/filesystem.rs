@@ -738,6 +738,17 @@ impl GDriveFS {
     /// Evicts any cached read-ahead or exported document chunks for inodes that were
     /// modified or removed in SQLite by background incremental sync.
     fn drain_cache_evictions(&mut self) {
+        for ino in self.cache.take_removed_inodes() {
+            if self.has_open_handles(ino) {
+                self.unlinked_inodes.insert(ino);
+            } else if let Err(e) = self.cache.remove_file(ino) {
+                log::error!(
+                    "Failed to remove remotely deleted inode {} from cache: {}",
+                    ino,
+                    e
+                );
+            }
+        }
         for ino in self.cache.take_evicted_inodes() {
             self.chunk_buffer.evict(ino);
         }
@@ -1573,6 +1584,7 @@ impl GDriveFS {
     /// Releases an open file handle `fh` on `ino`, uploading any remaining dirty staged data
     /// and cleaning up the local staging file and read-ahead buffer.
     pub fn handle_release(&mut self, ino: u64, fh: u64) -> Result<(), libc::c_int> {
+        self.drain_cache_evictions();
         let was_writable = self.untrack_open_handle(ino, fh);
         let still_open = self.has_open_handles(ino);
         if self.unlinked_inodes.contains(&ino) {
@@ -3398,6 +3410,65 @@ mod tests {
         assert_eq!(export_calls.load(Ordering::SeqCst), 2);
 
         rt.block_on(server_handle).unwrap();
+    }
+
+    #[test]
+    fn test_remote_removal_defers_open_inode_cleanup_until_release() {
+        let rt = Runtime::new().unwrap();
+        let mut fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+        let open_file = crate::api::DriveFile {
+            id: "removed_open_file".to_string(),
+            name: "open.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let closed_file = crate::api::DriveFile {
+            id: "removed_closed_file".to_string(),
+            name: "closed.txt".to_string(),
+            ..open_file.clone()
+        };
+        let entries = fs
+            .cache
+            .sync_directory_children(ROOT_INODE, &[open_file, closed_file])
+            .unwrap();
+        let open_ino = entries[0].inode;
+        let closed_ino = entries[1].inode;
+        let fh = fs.handle_open_with_fh(open_ino, libc::O_RDONLY).unwrap();
+
+        fs.cache
+            .apply_changes(
+                &[
+                    crate::api::ChangeItem {
+                        file_id: "removed_open_file".to_string(),
+                        removed: true,
+                        file: None,
+                    },
+                    crate::api::ChangeItem {
+                        file_id: "removed_closed_file".to_string(),
+                        removed: true,
+                        file: None,
+                    },
+                ],
+                Some("tok_removed"),
+            )
+            .unwrap();
+
+        assert!(fs.cache.get_by_inode(open_ino).unwrap().is_some());
+        assert_eq!(fs.handle_read(open_ino, 0, 10).unwrap(), Bytes::new());
+        assert!(fs.cache.get_by_inode(open_ino).unwrap().is_some());
+        assert!(fs.cache.get_by_inode(closed_ino).unwrap().is_none());
+        assert_eq!(fs.handle_getattr(closed_ino), Err(libc::ENOENT));
+
+        fs.handle_release(open_ino, fh).unwrap();
+        assert!(fs.cache.get_by_inode(open_ino).unwrap().is_none());
     }
 
     #[test]
