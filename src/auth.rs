@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use oauth2::basic::BasicClient;
 use oauth2::reqwest::async_http_client;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
-    RefreshToken, Scope, TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17,10 +17,12 @@ use url::Url;
 pub const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 pub const GOOGLE_DRIVE_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
+pub const GOOGLE_DRIVE_FULL_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 
 pub const KEYRING_SERVICE: &str = "gdrive-fuse-rs";
 pub const KEYRING_CLIENT_CONFIG_USER: &str = "oauth_client_config";
 pub const KEYRING_REFRESH_TOKEN_USER: &str = "oauth_refresh_token";
+pub const KEYRING_TOKEN_SCOPE_USER: &str = "oauth_token_scope";
 
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
@@ -70,6 +72,21 @@ impl AuthError {
     }
 }
 
+/// Controls how Google Workspace native documents (Docs, Sheets, Slides) are presented in FUSE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GoogleDocsMode {
+    /// Present as clickable `.gdoc`/`.gsheet`/`.gslides` browser shortcut files (default; opens in default web browser).
+    #[default]
+    Browser,
+    /// Present as FreeDesktop `.desktop` launcher files.
+    Desktop,
+    /// Export on-the-fly as `.pdf` documents via the Drive Export API.
+    Pdf,
+    /// Export on-the-fly as Office documents (`.docx`, `.xlsx`, `.pptx`) via the Drive Export API.
+    Office,
+}
+
 /// User configuration loaded from `~/.config/gdrive-fuse-rs/config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -78,6 +95,11 @@ pub struct AppConfig {
     pub cache_ttl_secs: Option<u64>,
     pub cache_db_path: Option<PathBuf>,
     pub chunk_size_bytes: Option<usize>,
+    pub google_docs_mode: Option<GoogleDocsMode>,
+    pub change_poll_secs: Option<u64>,
+    pub shared_with_me: Option<bool>,
+    pub read_only: Option<bool>,
+    pub staging_dir_path: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -134,11 +156,27 @@ pub fn resolve_credentials(
     let cfg_secret = clean_opt(config.client_secret.clone());
 
     if let Some(client_id) = cli_id {
+        let config_secret = if cfg_id.as_deref() == Some(client_id.as_str()) {
+            cfg_secret
+        } else {
+            None
+        };
+        let client_secret = cli_secret.or(config_secret).or_else(|| {
+            load_credentials_from_keyring().and_then(|stored| {
+                if stored.client_id.trim() == client_id {
+                    stored.client_secret
+                } else {
+                    None
+                }
+            })
+        });
         let creds = ClientCredentials {
             client_id,
-            client_secret: cli_secret,
+            client_secret,
         };
-        persist_credentials_to_keyring(&creds);
+        if creds.client_secret.is_some() {
+            persist_credentials_to_keyring(&creds);
+        }
         return Ok(creds);
     }
 
@@ -211,6 +249,25 @@ fn persist_refresh_token_to_keyring(refresh_token: &str) {
     }
 }
 
+fn persist_token_scope_to_keyring(scope: &str) {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_SCOPE_USER) {
+        if let Err(e) = entry.set_password(scope) {
+            log::debug!("Unable to store OAuth2 token scope in system keyring: {}", e);
+        }
+    }
+}
+
+fn load_token_scope_from_keyring() -> Option<String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_SCOPE_USER).ok()?;
+    let scope = entry.get_password().ok()?;
+    let trimmed = scope.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn load_refresh_token_from_keyring() -> Option<String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_REFRESH_TOKEN_USER).ok()?;
     let token = entry.get_password().ok()?;
@@ -220,6 +277,56 @@ fn load_refresh_token_from_keyring() -> Option<String> {
     } else {
         Some(trimmed)
     }
+}
+
+/// Returns the required Google Drive OAuth2 scope for the requested mount mode:
+/// - `read_only = true` -> `https://www.googleapis.com/auth/drive.readonly`
+/// - `read_only = false` -> `https://www.googleapis.com/auth/drive`
+pub fn required_oauth_scope(read_only: bool) -> &'static str {
+    if read_only {
+        GOOGLE_DRIVE_READONLY_SCOPE
+    } else {
+        GOOGLE_DRIVE_FULL_SCOPE
+    }
+}
+
+/// Checks whether a space-delimited OAuth2 `granted_scope` string satisfies the requested mount mode.
+/// Full `drive` scope satisfies both read-write and read-only mounts; `drive.readonly` only satisfies read-only mounts.
+pub fn scope_satisfies_mode(granted_scope: &str, read_only: bool) -> bool {
+    let scopes: Vec<&str> = granted_scope.split_whitespace().collect();
+    if scopes.contains(&GOOGLE_DRIVE_FULL_SCOPE) {
+        return true;
+    }
+    if read_only && scopes.contains(&GOOGLE_DRIVE_READONLY_SCOPE) {
+        return true;
+    }
+    false
+}
+
+/// Removes stored OAuth2 refresh tokens and cached client credentials from the system keyring.
+pub fn clear_keyring_credentials() -> Result<(), AuthError> {
+    for user in [
+        KEYRING_REFRESH_TOKEN_USER,
+        KEYRING_TOKEN_SCOPE_USER,
+        KEYRING_CLIENT_CONFIG_USER,
+    ] {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| {
+            AuthError::KeyringError(format!(
+                "Failed to access keyring entry for '{}': {}",
+                user, e
+            ))
+        })?;
+        match entry.delete_password() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => {
+                return Err(AuthError::KeyringError(format!(
+                    "Failed to delete keyring entry for '{}': {}",
+                    user, e
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Represents an in-memory cached OAuth2 access token with its expiration timestamp.
@@ -265,42 +372,86 @@ impl AuthManager {
         }
     }
 
-    /// Authenticates the user with Google Drive.
-    ///
-    /// 1. Checks the system keyring for an existing refresh token and attempts to exchange it for an access token.
-    /// 2. If no refresh token exists or refreshing fails, runs an interactive OAuth2 PKCE browser flow
-    ///    using a local loopback listener (`127.0.0.1:0`) and stores the resulting refresh token in the keyring.
+    /// Authenticates the user with Google Drive in default read-write mode (`https://www.googleapis.com/auth/drive`).
     pub async fn authenticate(
         creds: ClientCredentials,
         open_browser: bool,
     ) -> Result<Self, AuthError> {
+        Self::authenticate_with_mode(creds, open_browser, false).await
+    }
+
+    /// Authenticates the user with Google Drive using the OAuth2 scope appropriate for `read_only`:
+    /// - When `read_only` is `false`, requests `https://www.googleapis.com/auth/drive` (upgrading from
+    ///   an existing `drive.readonly` refresh token via interactive login if needed).
+    /// - When `read_only` is `true`, requests `https://www.googleapis.com/auth/drive.readonly` (or reuses
+    ///   an existing `drive` / `drive.readonly` refresh token).
+    pub async fn authenticate_with_mode(
+        creds: ClientCredentials,
+        open_browser: bool,
+        read_only: bool,
+    ) -> Result<Self, AuthError> {
+        let target_scope = required_oauth_scope(read_only);
+
         if let Some(saved_refresh) = load_refresh_token_from_keyring() {
-            log::info!("Found existing refresh token in system keyring; refreshing access token...");
-            match Self::exchange_refresh_token(&creds, &saved_refresh).await {
-                Ok((cached_token, new_refresh)) => {
-                    let effective_refresh = new_refresh.unwrap_or(saved_refresh);
-                    persist_refresh_token_to_keyring(&effective_refresh);
-                    return Ok(Self {
-                        creds,
-                        refresh_token: Arc::new(RwLock::new(Some(effective_refresh))),
-                        cached_token: Arc::new(RwLock::new(cached_token)),
-                        static_mode: false,
-                    });
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Stored refresh token could not be exchanged ({}); falling back to interactive browser login.",
-                        e
-                    );
+            let stored_scope = load_token_scope_from_keyring();
+            let needs_scope_upgrade = match stored_scope.as_deref() {
+                Some(scope_str) => !scope_satisfies_mode(scope_str, read_only),
+                None => false,
+            };
+
+            if needs_scope_upgrade {
+                log::info!(
+                    "Stored OAuth2 refresh token has scope '{}' which does not satisfy required scope '{}'; initiating OAuth2 scope upgrade...",
+                    stored_scope.unwrap_or_default(),
+                    target_scope
+                );
+            } else {
+                log::info!(
+                    "Found existing refresh token in system keyring; refreshing access token..."
+                );
+                match Self::exchange_refresh_token_with_scopes(&creds, &saved_refresh).await {
+                    Ok((cached_token, new_refresh, granted_scopes)) => {
+                        let response_scope_ok = match granted_scopes.as_deref() {
+                            Some(scope_str) => scope_satisfies_mode(scope_str, read_only),
+                            None => stored_scope.is_some() || read_only,
+                        };
+                        if response_scope_ok {
+                            let effective_refresh = new_refresh.unwrap_or(saved_refresh);
+                            persist_refresh_token_to_keyring(&effective_refresh);
+                            let scope_to_save = granted_scopes
+                                .as_deref()
+                                .or(stored_scope.as_deref())
+                                .unwrap_or(target_scope);
+                            persist_token_scope_to_keyring(scope_to_save);
+                            return Ok(Self {
+                                creds,
+                                refresh_token: Arc::new(RwLock::new(Some(effective_refresh))),
+                                cached_token: Arc::new(RwLock::new(cached_token)),
+                                static_mode: false,
+                            });
+                        }
+                        log::info!(
+                            "Refreshed token only has read-only or unverified legacy scope ('{}'); upgrading OAuth2 scope to '{}'...",
+                            granted_scopes.unwrap_or_default(),
+                            target_scope
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Stored refresh token could not be exchanged ({}); falling back to interactive browser login.",
+                            e
+                        );
+                    }
                 }
             }
         }
 
         let (cached_token, refresh_token) =
-            Self::run_interactive_pkce_flow(&creds, open_browser).await?;
+            Self::run_interactive_pkce_flow_with_scope(&creds, open_browser, target_scope).await?;
 
         if let Some(ref rt) = refresh_token {
             persist_refresh_token_to_keyring(rt);
+            persist_token_scope_to_keyring(target_scope);
         }
 
         Ok(Self {
@@ -340,8 +491,8 @@ impl AuthManager {
             rt_guard.clone().ok_or(AuthError::TokenExpired)?
         };
 
-        let (new_cached, maybe_new_refresh) =
-            Self::exchange_refresh_token(&self.creds, &refresh_tok).await?;
+        let (new_cached, maybe_new_refresh, _) =
+            Self::exchange_refresh_token_with_scopes(&self.creds, &refresh_tok).await?;
         let access_token = new_cached.access_token.clone();
         *token_guard = new_cached;
 
@@ -375,10 +526,30 @@ impl AuthManager {
         Ok(client)
     }
 
-    async fn exchange_refresh_token(
+    /// Constructs the Google OAuth2 PKCE authorization URL for the given `scope`.
+    pub fn build_authorization_url_for_scope(
+        creds: &ClientCredentials,
+        redirect_uri: &str,
+        scope: &str,
+    ) -> Result<(Url, CsrfToken, PkceCodeVerifier), AuthError> {
+        let redirect_url = RedirectUrl::new(redirect_uri.to_string())
+            .map_err(|e| AuthError::OAuthError(format!("Invalid redirect URL: {}", e)))?;
+        let client = Self::build_oauth_client(creds, Some(redirect_url))?;
+        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        let (auth_url, csrf_token) = client
+            .authorize_url(CsrfToken::new_random)
+            .add_scope(Scope::new(scope.to_string()))
+            .add_extra_param("access_type", "offline")
+            .add_extra_param("prompt", "consent")
+            .set_pkce_challenge(pkce_challenge)
+            .url();
+        Ok((auth_url, csrf_token, pkce_verifier))
+    }
+
+    async fn exchange_refresh_token_with_scopes(
         creds: &ClientCredentials,
         refresh_token: &str,
-    ) -> Result<(CachedToken, Option<String>), AuthError> {
+    ) -> Result<(CachedToken, Option<String>, Option<String>), AuthError> {
         let client = Self::build_oauth_client(creds, None)?;
         let rt = RefreshToken::new(refresh_token.to_string());
 
@@ -394,35 +565,40 @@ impl AuthManager {
             expires_at: Some(Instant::now() + lifetime),
         };
         let new_refresh = token_res.refresh_token().map(|r| r.secret().clone());
-        Ok((cached, new_refresh))
+        let granted_scopes = token_res.scopes().map(|scopes| {
+            scopes
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        Ok((cached, new_refresh, granted_scopes))
     }
 
-    async fn run_interactive_pkce_flow(
+    async fn run_interactive_pkce_flow_with_scope(
         creds: &ClientCredentials,
         open_browser: bool,
+        scope: &str,
     ) -> Result<(CachedToken, Option<String>), AuthError> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let local_addr = listener.local_addr()?;
         let redirect_uri_str = format!("http://127.0.0.1:{}", local_addr.port());
-        let redirect_url = RedirectUrl::new(redirect_uri_str)
+        let redirect_url = RedirectUrl::new(redirect_uri_str.clone())
             .map_err(|e| AuthError::OAuthError(format!("Invalid redirect URL: {}", e)))?;
 
         let client = Self::build_oauth_client(creds, Some(redirect_url))?;
-        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-
-        let (auth_url, csrf_token) = client
-            .authorize_url(CsrfToken::new_random)
-            .add_scope(Scope::new(GOOGLE_DRIVE_READONLY_SCOPE.to_string()))
-            .add_extra_param("access_type", "offline")
-            .add_extra_param("prompt", "consent")
-            .set_pkce_challenge(pkce_challenge)
-            .url();
+        let (auth_url, csrf_token, pkce_verifier) =
+            Self::build_authorization_url_for_scope(creds, &redirect_uri_str, scope)?;
 
         println!(
             "\nPlease authenticate with Google Drive by visiting the following URL:\n{}\n",
             auth_url
         );
-        log::info!("Initiating OAuth2 PKCE login at {}", auth_url);
+        log::info!(
+            "Initiating OAuth2 PKCE login (scope={}) at {}",
+            scope,
+            auth_url
+        );
 
         if open_browser {
             if let Err(e) = open::that(auth_url.as_str()) {
@@ -461,7 +637,14 @@ pub async fn wait_for_oauth_callback(
     listener: &TcpListener,
     expected_state: &str,
 ) -> Result<String, AuthError> {
-    let (mut stream, _) = listener.accept().await?;
+    let accept_res = tokio::time::timeout(Duration::from_secs(300), listener.accept())
+        .await
+        .map_err(|_| {
+            AuthError::OAuthError(
+                "Timed out waiting 300s for OAuth2 browser callback on loopback listener".to_string(),
+            )
+        })?;
+    let (mut stream, _) = accept_res?;
     let mut reader = BufReader::new(&mut stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
@@ -586,6 +769,34 @@ mod tests {
         let missing = Path::new("/tmp/non_existent_gdrive_fuse_rs_config_12345.toml");
         let default_cfg = AppConfig::load_from_path(missing).expect("missing file returns default");
         assert_eq!(default_cfg, AppConfig::default());
+        assert_eq!(default_cfg.google_docs_mode, None);
+        assert_eq!(default_cfg.change_poll_secs, None);
+        assert_eq!(default_cfg.shared_with_me, None);
+        assert_eq!(GoogleDocsMode::default(), GoogleDocsMode::Browser);
+    }
+
+    #[test]
+    fn test_app_config_phase2_fields_toml_deserialization() {
+        let raw_toml = r#"
+            google_docs_mode = "pdf"
+            change_poll_secs = 45
+            shared_with_me = false
+        "#;
+        let parsed: AppConfig = toml::from_str(raw_toml).expect("Phase 2 TOML should parse");
+        assert_eq!(parsed.google_docs_mode, Some(GoogleDocsMode::Pdf));
+        assert_eq!(parsed.change_poll_secs, Some(45));
+        assert_eq!(parsed.shared_with_me, Some(false));
+
+        for (raw_mode, expected) in [
+            ("browser", GoogleDocsMode::Browser),
+            ("desktop", GoogleDocsMode::Desktop),
+            ("pdf", GoogleDocsMode::Pdf),
+            ("office", GoogleDocsMode::Office),
+        ] {
+            let mode_toml = format!("google_docs_mode = \"{}\"", raw_mode);
+            let cfg: AppConfig = toml::from_str(&mode_toml).expect("mode should parse");
+            assert_eq!(cfg.google_docs_mode, Some(expected));
+        }
     }
 
     #[test]
@@ -607,6 +818,15 @@ mod tests {
         assert_eq!(
             resolved_cli.client_secret.as_deref(),
             Some("cli-secret-placeholder")
+        );
+
+        let resolved_cli_id =
+            resolve_credentials(Some("config-id-placeholder".to_string()), None, &cfg)
+                .expect("CLI ID should reuse the matching configured secret");
+        assert_eq!(resolved_cli_id.client_id, "config-id-placeholder");
+        assert_eq!(
+            resolved_cli_id.client_secret.as_deref(),
+            Some("config-secret-placeholder")
         );
 
         // 2. Config fallback when CLI is None
@@ -712,6 +932,61 @@ mod tests {
         assert_eq!(
             AuthError::BrowserLaunchError("no display".into()).to_errno(),
             libc::EIO
+        );
+    }
+
+    #[test]
+    fn test_phase3_oauth_scope_selection_and_upgrade_checks() {
+        assert_eq!(required_oauth_scope(false), GOOGLE_DRIVE_FULL_SCOPE);
+        assert_eq!(required_oauth_scope(true), GOOGLE_DRIVE_READONLY_SCOPE);
+
+        // Full drive scope satisfies both read-write and read-only modes
+        assert!(scope_satisfies_mode(GOOGLE_DRIVE_FULL_SCOPE, false));
+        assert!(scope_satisfies_mode(GOOGLE_DRIVE_FULL_SCOPE, true));
+        assert!(scope_satisfies_mode(
+            "https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive",
+            false
+        ));
+
+        // Read-only scope satisfies read-only mode, but triggers upgrade when read-write is requested
+        assert!(scope_satisfies_mode(GOOGLE_DRIVE_READONLY_SCOPE, true));
+        assert!(!scope_satisfies_mode(GOOGLE_DRIVE_READONLY_SCOPE, false));
+
+        // Verify authorization URL embeds the requested scope
+        let creds = ClientCredentials {
+            client_id: "test-client-id.apps.googleusercontent.com".to_string(),
+            client_secret: Some("test-secret".to_string()),
+        };
+        let (rw_url, _, _) = AuthManager::build_authorization_url_for_scope(
+            &creds,
+            "http://127.0.0.1:8080",
+            required_oauth_scope(false),
+        )
+        .expect("RW auth URL should build");
+        assert!(rw_url
+            .query_pairs()
+            .any(|(k, v)| k == "scope" && v == GOOGLE_DRIVE_FULL_SCOPE));
+
+        let (ro_url, _, _) = AuthManager::build_authorization_url_for_scope(
+            &creds,
+            "http://127.0.0.1:8080",
+            required_oauth_scope(true),
+        )
+        .expect("RO auth URL should build");
+        assert!(ro_url
+            .query_pairs()
+            .any(|(k, v)| k == "scope" && v == GOOGLE_DRIVE_READONLY_SCOPE));
+
+        // Verify Phase 3 AppConfig fields parse cleanly
+        let raw_toml = r#"
+            read_only = true
+            staging_dir_path = "/tmp/gdrive-staging"
+        "#;
+        let parsed: AppConfig = toml::from_str(raw_toml).expect("Phase 3 TOML should parse");
+        assert_eq!(parsed.read_only, Some(true));
+        assert_eq!(
+            parsed.staging_dir_path,
+            Some(PathBuf::from("/tmp/gdrive-staging"))
         );
     }
 }
