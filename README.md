@@ -1,6 +1,6 @@
 # gdrive-fuse-rs
 
-A lightweight, memory-safe, read-only Google Drive FUSE filesystem written in Rust for Linux and GNOME. Designed as a modern, secure alternative to legacy integrations like `libgdata` and GVFS.
+A lightweight, memory-safe Google Drive FUSE filesystem written in Rust for Linux and GNOME. Designed as a modern, secure alternative to legacy integrations like `libgdata` and GVFS.
 
 ## Tech Stack
 
@@ -122,6 +122,8 @@ Options:
       --google-docs-mode <MODE>    How Google Docs/Sheets/Slides are presented: browser, desktop, pdf, office (default: browser)
       --change-poll-secs <SECONDS> Background changes.list poll interval in seconds (default: 30; 0 to disable)
       --no-shared-with-me          Disable the top-level "Shared with me" virtual directory
+      --read-only                  Mount in strict read-only mode (uses `drive.readonly` OAuth scope and rejects writes with EROFS)
+      --staging-dir <DIR>          Path to temporary write-back staging directory [env: GDRIVE_STAGING_DIR=] (default: ~/.cache/gdrive-fuse-rs/staging)
       --clear-cache                Wipe the local SQLite metadata cache before mounting (or exit if no mount point)
       --logout                     Remove saved OAuth2 tokens from the system keyring
       --install-systemd            Install a systemd user service at ~/.config/systemd/user/gdrive-fuse-rs.service
@@ -148,6 +150,11 @@ Options:
 - Background incremental change polling (`/drive/v3/changes`) for automatic SQLite cache invalidation and updates.
 - Virtual `"Shared with me"` folder (`inode = 2`) and Shared Drive item request compatibility (`supportsAllDrives=true` / `includeItemsFromAllDrives=true`).
 - Lifecycle CLI utilities (`--clear-cache`, `--logout`, `--install-systemd`).
+
+**Phase 3: Read-Write Support (Complete)**
+- Automatic OAuth2 scope upgrade to `https://www.googleapis.com/auth/drive` when mounted in read-write mode (with `--read-only` flag preserved for strict read-only mounts).
+- Bounded write-back staging directory (`~/.cache/gdrive-fuse-rs/staging/`) for active writes (`create`, `open`, `write`, `setattr` truncation/mtime), uploaded via the **Google Drive Resumable Upload API** (`uploadType=resumable`) on `flush`/`fsync`/`release` and deleted immediately upon upload completion.
+- Full directory and file management (`mkdir`, `rmdir`, `unlink` to Google Drive Trash `{"trashed": true}` by default, and atomic in-directory/cross-directory `rename` via `addParents`/`removeParents`).
 
 ## License
 

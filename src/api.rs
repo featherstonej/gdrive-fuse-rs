@@ -1,16 +1,23 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use reqwest::header::{AUTHORIZATION, RANGE};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE};
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::auth::{AuthError, AuthManager};
 
 pub const DRIVE_API_BASE_URL: &str = "https://www.googleapis.com/drive/v3";
+pub const DRIVE_UPLOAD_BASE_URL: &str = "https://www.googleapis.com/upload/drive/v3";
 pub const FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 pub const GOOGLE_APPS_MIME_PREFIX: &str = "application/vnd.google-apps.";
+
+/// Default chunk size (8 MB = 32 * 256 KB) for Google Drive Resumable Uploads.
+/// Google Drive requires intermediate resumable upload chunks to be multiples of 256 KB (262,144 bytes).
+pub const RESUMABLE_UPLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 const LIST_PAGE_SIZE: &str = "1000";
 const LIST_FIELDS: &str =
@@ -44,6 +51,9 @@ pub enum ApiError {
 
     #[error("JSON serialization/deserialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("I/O error during local file upload: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl ApiError {
@@ -62,7 +72,9 @@ impl ApiError {
                     libc::EIO
                 }
             }
-            ApiError::UnexpectedStatus { .. } | ApiError::Serialization(_) => libc::EIO,
+            ApiError::UnexpectedStatus { .. }
+            | ApiError::Serialization(_)
+            | ApiError::Io(_) => libc::EIO,
         }
     }
 
@@ -270,16 +282,70 @@ pub fn escape_drive_query_literal(value: &str) -> String {
     escaped
 }
 
+/// Formats a Unix timestamp (seconds) as an RFC 3339 UTC timestamp string (e.g. `"2025-05-01T12:00:00Z"`).
+pub fn unix_secs_to_rfc3339(timestamp_secs: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp_secs, 0)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Infers a standard MIME type from a filename's extension, defaulting to `"application/octet-stream"`.
+pub fn guess_mime_type(filename: &str) -> &'static str {
+    let ext = filename
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("txt" | "log") => "text/plain",
+        Some("md" | "markdown") => "text/markdown",
+        Some("csv") => "text/csv",
+        Some("html" | "htm") => "text/html",
+        Some("css") => "text/css",
+        Some("js" | "mjs") => "application/javascript",
+        Some("ts" | "tsx") => "application/typescript",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("toml") => "application/toml",
+        Some("yaml" | "yml") => "application/x-yaml",
+        Some("rs") => "text/x-rust",
+        Some("py") => "text/x-python",
+        Some("sh" | "bash") => "application/x-sh",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("zip") => "application/zip",
+        Some("gz" | "tgz") => "application/gzip",
+        Some("tar") => "application/x-tar",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        }
+        _ => "application/octet-stream",
+    }
+}
+
 /// Google Drive REST API v3 client.
 #[derive(Clone)]
 pub struct DriveClient {
     http: reqwest::Client,
     auth: Arc<AuthManager>,
     base_url: String,
+    upload_base_url: String,
+    upload_chunk_size: usize,
 }
 
 impl DriveClient {
-    /// Creates a new `DriveClient` pointed at `DRIVE_API_BASE_URL`.
+    /// Creates a new `DriveClient` pointed at `DRIVE_API_BASE_URL` and `DRIVE_UPLOAD_BASE_URL`.
     pub fn new(auth: Arc<AuthManager>) -> Result<Self, ApiError> {
         Self::with_base_url(auth, DRIVE_API_BASE_URL)
     }
@@ -289,17 +355,46 @@ impl DriveClient {
         auth: Arc<AuthManager>,
         base_url: impl Into<String>,
     ) -> Result<Self, ApiError> {
+        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+            // Preserve HTTP 308 Resume Incomplete responses during Google Drive Resumable Uploads
+            if attempt.status() == StatusCode::PERMANENT_REDIRECT {
+                attempt.stop()
+            } else {
+                reqwest::redirect::Policy::default().redirect(attempt)
+            }
+        });
+
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(10))
+            .redirect(redirect_policy)
             .build()?;
 
         let normalized_base = base_url.into().trim_end_matches('/').to_string();
+        let upload_base_url = if let Some(prefix) = normalized_base.strip_suffix("/drive/v3") {
+            format!("{}/upload/drive/v3", prefix)
+        } else {
+            format!("{}/upload", normalized_base)
+        };
+
         Ok(Self {
             http,
             auth,
             base_url: normalized_base,
+            upload_base_url,
+            upload_chunk_size: RESUMABLE_UPLOAD_CHUNK_SIZE,
         })
+    }
+
+    /// Overrides the resumable upload chunk size (useful for testing multi-chunk `308 Resume Incomplete` uploads).
+    pub fn with_upload_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.upload_chunk_size = chunk_size.max(1);
+        self
+    }
+
+    /// Returns the configured upload base URL (`https://www.googleapis.com/upload/drive/v3` by default).
+    pub fn upload_base_url(&self) -> &str {
+        &self.upload_base_url
     }
 
     /// Lists all non-trashed children inside `parent_drive_id` (use `"root"` for the root folder).
@@ -567,6 +662,378 @@ impl DriveClient {
         Ok((all_changes, final_new_start_token))
     }
 
+    /// Creates a new remote folder (`mimeType = "application/vnd.google-apps.folder"`) inside `parent_drive_id`.
+    pub async fn create_folder(
+        &self,
+        parent_drive_id: &str,
+        name: &str,
+    ) -> Result<DriveFile, ApiError> {
+        let token = self.auth.get_access_token().await?;
+        let url = format!("{}/files", self.base_url);
+        let payload = serde_json::json!({
+            "name": name,
+            "mimeType": FOLDER_MIME_TYPE,
+            "parents": [parent_drive_id],
+        });
+
+        let response = self
+            .http
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .query(&[("fields", FILE_FIELDS), ("supportsAllDrives", "true")])
+            .json(&payload)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::map_status_error(status, body));
+        }
+
+        let body_bytes = response.bytes().await?;
+        let folder: DriveFile = serde_json::from_slice(&body_bytes)?;
+        Ok(folder)
+    }
+
+    /// Safely moves a remote file or folder to Google Drive Trash (`PATCH /drive/v3/files/{fileId}` with `{"trashed": true}`)
+    /// rather than permanently deleting it (`DELETE`).
+    pub async fn trash_file(&self, file_id: &str) -> Result<DriveFile, ApiError> {
+        let token = self.auth.get_access_token().await?;
+        let url = format!("{}/files/{}", self.base_url, file_id);
+        let payload = serde_json::json!({
+            "trashed": true,
+        });
+
+        let response = self
+            .http
+            .patch(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .query(&[("fields", FILE_FIELDS), ("supportsAllDrives", "true")])
+            .json(&payload)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::map_status_error(status, body));
+        }
+
+        let body_bytes = response.bytes().await?;
+        let trashed: DriveFile = serde_json::from_slice(&body_bytes)?;
+        Ok(trashed)
+    }
+
+    /// Updates a file or folder's metadata (`name`, `modifiedTime`, and/or parent directories via `addParents`/`removeParents`).
+    pub async fn update_file_metadata(
+        &self,
+        file_id: &str,
+        new_name: Option<&str>,
+        modified_time: Option<i64>,
+        add_parents: Option<&str>,
+        remove_parents: Option<&str>,
+    ) -> Result<DriveFile, ApiError> {
+        let token = self.auth.get_access_token().await?;
+        let url = format!("{}/files/{}", self.base_url, file_id);
+
+        let mut query_params: Vec<(&str, &str)> =
+            vec![("fields", FILE_FIELDS), ("supportsAllDrives", "true")];
+        if let Some(add_p) = add_parents {
+            if !add_p.is_empty() {
+                query_params.push(("addParents", add_p));
+            }
+        }
+        if let Some(rem_p) = remove_parents {
+            if !rem_p.is_empty() {
+                query_params.push(("removeParents", rem_p));
+            }
+        }
+
+        let mut body_map = serde_json::Map::new();
+        if let Some(name) = new_name {
+            body_map.insert(
+                "name".to_string(),
+                serde_json::Value::String(name.to_string()),
+            );
+        }
+        if let Some(mtime) = modified_time {
+            body_map.insert(
+                "modifiedTime".to_string(),
+                serde_json::Value::String(unix_secs_to_rfc3339(mtime)),
+            );
+        }
+
+        let response = self
+            .http
+            .patch(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .query(&query_params)
+            .json(&serde_json::Value::Object(body_map))
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::map_status_error(status, body));
+        }
+
+        let body_bytes = response.bytes().await?;
+        let updated: DriveFile = serde_json::from_slice(&body_bytes)?;
+        Ok(updated)
+    }
+
+    /// Uploads a newly created file from `staging_path` using the Google Drive Resumable Upload API
+    /// (`POST /upload/drive/v3/files?uploadType=resumable` followed by chunked `PUT` to the session `Location`).
+    pub async fn resumable_upload_new_file(
+        &self,
+        parent_drive_id: &str,
+        name: &str,
+        mime_type: &str,
+        modified_time: Option<i64>,
+        staging_path: &Path,
+    ) -> Result<DriveFile, ApiError> {
+        let mut file = tokio::fs::File::open(staging_path).await?;
+        let total_size = file.metadata().await?.len();
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "name".to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+        metadata.insert(
+            "mimeType".to_string(),
+            serde_json::Value::String(mime_type.to_string()),
+        );
+        metadata.insert(
+            "parents".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(
+                parent_drive_id.to_string(),
+            )]),
+        );
+        if let Some(mtime) = modified_time {
+            metadata.insert(
+                "modifiedTime".to_string(),
+                serde_json::Value::String(unix_secs_to_rfc3339(mtime)),
+            );
+        }
+
+        let session_uri = self
+            .initiate_resumable_session(
+                None,
+                mime_type,
+                total_size,
+                &serde_json::Value::Object(metadata),
+            )
+            .await?;
+
+        self.upload_file_to_session_uri(&session_uri, &mut file, total_size, mime_type)
+            .await
+    }
+
+    /// Uploads modified content for an existing Drive file `file_id` from `staging_path` using the
+    /// Google Drive Resumable Upload API (`PATCH /upload/drive/v3/files/{fileId}?uploadType=resumable`).
+    pub async fn resumable_upload_existing_file(
+        &self,
+        file_id: &str,
+        mime_type: &str,
+        modified_time: Option<i64>,
+        staging_path: &Path,
+    ) -> Result<DriveFile, ApiError> {
+        let mut file = tokio::fs::File::open(staging_path).await?;
+        let total_size = file.metadata().await?.len();
+
+        let mut metadata = serde_json::Map::new();
+        if let Some(mtime) = modified_time {
+            metadata.insert(
+                "modifiedTime".to_string(),
+                serde_json::Value::String(unix_secs_to_rfc3339(mtime)),
+            );
+        }
+
+        let session_uri = self
+            .initiate_resumable_session(
+                Some(file_id),
+                mime_type,
+                total_size,
+                &serde_json::Value::Object(metadata),
+            )
+            .await?;
+
+        self.upload_file_to_session_uri(&session_uri, &mut file, total_size, mime_type)
+            .await
+    }
+
+    /// Initiates a Google Drive Resumable Upload session (`POST` if `file_id` is `None`, `PATCH` if `Some`)
+    /// and returns the resolved session upload URI from the `Location` response header.
+    async fn initiate_resumable_session(
+        &self,
+        file_id: Option<&str>,
+        mime_type: &str,
+        total_size: u64,
+        metadata_json: &serde_json::Value,
+    ) -> Result<String, ApiError> {
+        let token = self.auth.get_access_token().await?;
+        let url = match file_id {
+            Some(id) => format!("{}/files/{}", self.upload_base_url, id),
+            None => format!("{}/files", self.upload_base_url),
+        };
+
+        let builder = match file_id {
+            Some(_) => self.http.patch(&url),
+            None => self.http.post(&url),
+        };
+
+        let response = builder
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header("X-Upload-Content-Type", mime_type)
+            .header("X-Upload-Content-Length", total_size.to_string())
+            .query(&[
+                ("uploadType", "resumable"),
+                ("fields", FILE_FIELDS),
+                ("supportsAllDrives", "true"),
+            ])
+            .json(metadata_json)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::map_status_error(status, body));
+        }
+
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::UnexpectedStatus {
+                status: status.as_u16(),
+                body: "Missing Location header in resumable upload initiation response".to_string(),
+            })?;
+
+        Ok(self.resolve_session_uri(location))
+    }
+
+    fn resolve_session_uri(&self, location: &str) -> String {
+        if location.starts_with("http://") || location.starts_with("https://") {
+            location.to_string()
+        } else if let Ok(base) = url::Url::parse(&self.upload_base_url) {
+            base.join(location)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| location.to_string())
+        } else {
+            location.to_string()
+        }
+    }
+
+    async fn upload_file_to_session_uri(
+        &self,
+        session_uri: &str,
+        file: &mut tokio::fs::File,
+        total_size: u64,
+        mime_type: &str,
+    ) -> Result<DriveFile, ApiError> {
+        if total_size == 0 {
+            let token = self.auth.get_access_token().await?;
+            let response = self
+                .http
+                .put(session_uri)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .header(CONTENT_TYPE, mime_type)
+                .header(CONTENT_LENGTH, "0")
+                .body(Vec::<u8>::new())
+                .send()
+                .await?;
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(Self::map_status_error(status, body));
+            }
+            let body_bytes = response.bytes().await?;
+            let uploaded: DriveFile = serde_json::from_slice(&body_bytes)?;
+            return Ok(uploaded);
+        }
+
+        let mut offset: u64 = 0;
+        let chunk_cap = self.upload_chunk_size.max(1);
+        let mut stalled_308_retries: u8 = 0;
+        const MAX_STALLED_308_RETRIES: u8 = 3;
+
+        while offset < total_size {
+            let remaining = (total_size - offset) as usize;
+            let to_read = remaining.min(chunk_cap);
+
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            let mut buf = vec![0u8; to_read];
+            file.read_exact(&mut buf).await?;
+
+            let chunk_end = offset + (to_read as u64) - 1;
+            let content_range = format!("bytes {}-{}/{}", offset, chunk_end, total_size);
+            let token = self.auth.get_access_token().await?;
+
+            let response = self
+                .http
+                .put(session_uri)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .header(CONTENT_TYPE, mime_type)
+                .header(CONTENT_LENGTH, to_read.to_string())
+                .header(CONTENT_RANGE, content_range)
+                .body(buf)
+                .send()
+                .await?;
+
+            let status = response.status();
+            if status == StatusCode::PERMANENT_REDIRECT {
+                // HTTP 308 Resume Incomplete: only advance offset from an acknowledged Range upper bound.
+                // When Range is absent, the server accepted 0 bytes, so retry from the current offset.
+                let acknowledged_next = response
+                    .headers()
+                    .get(RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_resumable_range_upper)
+                    .map(|upper| upper.saturating_add(1))
+                    .filter(|&next| next <= total_size);
+
+                if let Some(next_offset) = acknowledged_next {
+                    if next_offset > offset {
+                        offset = next_offset;
+                        stalled_308_retries = 0;
+                        continue;
+                    }
+                    offset = next_offset;
+                }
+
+                stalled_308_retries += 1;
+                if stalled_308_retries > MAX_STALLED_308_RETRIES {
+                    return Err(ApiError::UnexpectedStatus {
+                        status: status.as_u16(),
+                        body: "Resumable upload stalled: 308 Resume Incomplete did not advance acknowledged byte Range".to_string(),
+                    });
+                }
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(Self::map_status_error(status, body));
+            }
+
+            let body_bytes = response.bytes().await?;
+            let uploaded: DriveFile = serde_json::from_slice(&body_bytes)?;
+            return Ok(uploaded);
+        }
+
+        Err(ApiError::UnexpectedStatus {
+            status: 500,
+            body: "Resumable upload loop ended without final DriveFile response".to_string(),
+        })
+    }
+
     fn map_status_error(status: StatusCode, body: String) -> ApiError {
         match status {
             StatusCode::FORBIDDEN if body.to_ascii_lowercase().contains("ratelimitexceeded") => {
@@ -583,6 +1050,15 @@ impl DriveClient {
             },
         }
     }
+}
+
+/// Parses the upper inclusive byte offset from a Google Drive `308 Resume Incomplete` `Range` header
+/// (e.g. `"bytes=0-262143"` -> `Some(262143)`).
+fn parse_resumable_range_upper(range_header: &str) -> Option<u64> {
+    let trimmed = range_header.trim();
+    let without_prefix = trimmed.strip_prefix("bytes=").unwrap_or(trimmed);
+    let (_, upper_str) = without_prefix.split_once('-')?;
+    upper_str.trim().parse::<u64>().ok()
 }
 
 #[cfg(test)]
@@ -1124,6 +1600,273 @@ mod tests {
             .await
             .expect("export_file failed");
         assert_eq!(&exported[..], b"%PDF-1.7 mock exported content");
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_phase3_create_folder_trash_rename_and_resumable_upload_mock_server() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            // Request 1: create_folder (POST /drive/v3/files)
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.starts_with("POST /drive/v3/files?"));
+                assert!(req_str.contains("application/vnd.google-apps.folder"));
+                assert!(req_str.contains("\"NewDocs\""));
+
+                let body = r#"{
+                    "id": "folder_new_1",
+                    "name": "NewDocs",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "modifiedTime": "2025-06-01T00:00:00Z",
+                    "parents": ["root"]
+                }"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+
+            // Request 2: resumable_upload_new_file initiation (POST /upload/drive/v3/files?uploadType=resumable)
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.starts_with("POST /upload/drive/v3/files?uploadType=resumable"));
+                assert!(req_str.to_ascii_lowercase().contains("x-upload-content-length: 12"));
+
+                let session_url = format!(
+                    "http://{}/upload/drive/v3/files?uploadType=resumable&upload_id=sess_1",
+                    addr
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    session_url
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+
+            // Request 3a: resumable_upload_new_file chunk 1 attempt 1 (PUT bytes 0-7/12 -> 308 without Range header)
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.starts_with("PUT /upload/drive/v3/files?uploadType=resumable&upload_id=sess_1"));
+                assert!(req_str.to_ascii_lowercase().contains("content-range: bytes 0-7/12"));
+                assert!(req_str.ends_with("Hello, G"));
+
+                let resp = "HTTP/1.1 308 Permanent Redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+
+            // Request 3b: resumable_upload_new_file chunk 1 retry (PUT bytes 0-7/12 -> 308 with Range: bytes=0-7)
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.starts_with("PUT /upload/drive/v3/files?uploadType=resumable&upload_id=sess_1"));
+                assert!(req_str.to_ascii_lowercase().contains("content-range: bytes 0-7/12"));
+                assert!(req_str.ends_with("Hello, G"));
+
+                let resp = "HTTP/1.1 308 Permanent Redirect\r\nRange: bytes=0-7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+
+            // Request 4: resumable_upload_new_file chunk 2 (PUT bytes 8-11/12 -> 200 OK with DriveFile)
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.to_ascii_lowercase().contains("content-range: bytes 8-11/12"));
+                assert!(req_str.ends_with("oogl"));
+
+                let body = r#"{
+                    "id": "uploaded_file_1",
+                    "name": "hello.txt",
+                    "mimeType": "text/plain",
+                    "size": "12",
+                    "modifiedTime": "2025-06-01T12:00:00Z",
+                    "parents": ["folder_new_1"]
+                }"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+
+            // Request 5: update_file_metadata (PATCH /drive/v3/files/uploaded_file_1 with addParents/removeParents)
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.starts_with("PATCH /drive/v3/files/uploaded_file_1?"));
+                assert!(req_str.contains("addParents=root"));
+                assert!(req_str.contains("removeParents=folder_new_1"));
+                assert!(req_str.contains("\"hello_moved.txt\""));
+
+                let body = r#"{
+                    "id": "uploaded_file_1",
+                    "name": "hello_moved.txt",
+                    "mimeType": "text/plain",
+                    "size": "12",
+                    "modifiedTime": "2025-06-01T12:05:00Z",
+                    "parents": ["root"]
+                }"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+
+            // Request 6: trash_file (PATCH /drive/v3/files/uploaded_file_1 with {"trashed": true})
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.starts_with("PATCH /drive/v3/files/uploaded_file_1?"));
+                assert!(req_str.contains("\"trashed\":true"));
+
+                let body = r#"{
+                    "id": "uploaded_file_1",
+                    "name": "hello_moved.txt",
+                    "mimeType": "text/plain",
+                    "size": "12",
+                    "modifiedTime": "2025-06-01T12:10:00Z",
+                    "parents": ["root"],
+                    "trashed": true
+                }"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+
+            // Request 7 & 8: 0-byte resumable upload initiation + PUT finalization
+            for empty_step in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    if empty_step == 0 {
+                        assert!(req_str.starts_with("POST /upload/drive/v3/files?"));
+                        assert!(
+                            req_str.contains("X-Upload-Content-Length: 0")
+                                || req_str.contains("x-upload-content-length: 0")
+                        );
+                        let session_url = format!("http://{}/upload/drive/v3/session/empty_1", addr);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            session_url
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        assert!(req_str.starts_with("PUT /upload/drive/v3/session/empty_1"));
+                        assert!(
+                            req_str.contains("Content-Length: 0")
+                                || req_str.contains("content-length: 0")
+                        );
+                        let body = r#"{
+                            "id": "uploaded_empty_1",
+                            "name": "empty.txt",
+                            "mimeType": "text/plain",
+                            "size": "0",
+                            "modifiedTime": "2025-06-01T12:15:00Z",
+                            "parents": ["root"],
+                            "trashed": false
+                        }"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    }
+                }
+            }
+        });
+
+        let auth = Arc::new(AuthManager::new_static_for_test("test-access-token"));
+        let base_url = format!("http://{}/drive/v3", addr);
+        let client = DriveClient::with_base_url(auth, base_url)
+            .expect("Client init failed")
+            .with_upload_chunk_size(8);
+
+        let folder = client
+            .create_folder("root", "NewDocs")
+            .await
+            .expect("create_folder failed");
+        assert_eq!(folder.id, "folder_new_1");
+        assert!(folder.is_dir());
+
+        let stage_path = std::env::temp_dir().join(format!(
+            "gdrive_fuse_api_test_{}.stage",
+            std::process::id()
+        ));
+        std::fs::write(&stage_path, b"Hello, Googl").unwrap();
+
+        let uploaded = client
+            .resumable_upload_new_file(
+                "folder_new_1",
+                "hello.txt",
+                guess_mime_type("hello.txt"),
+                Some(1_748_779_200),
+                &stage_path,
+            )
+            .await
+            .expect("resumable_upload_new_file failed");
+        let _ = std::fs::remove_file(&stage_path);
+        assert_eq!(uploaded.id, "uploaded_file_1");
+        assert_eq!(uploaded.size, 12);
+
+        let moved = client
+            .update_file_metadata(
+                "uploaded_file_1",
+                Some("hello_moved.txt"),
+                None,
+                Some("root"),
+                Some("folder_new_1"),
+            )
+            .await
+            .expect("update_file_metadata failed");
+        assert_eq!(moved.name, "hello_moved.txt");
+        assert_eq!(moved.parents, vec!["root".to_string()]);
+
+        let trashed = client
+            .trash_file("uploaded_file_1")
+            .await
+            .expect("trash_file failed");
+        assert!(trashed.trashed);
+
+        // Verify 0-byte resumable upload
+        std::fs::write(&stage_path, b"").unwrap();
+        let empty_uploaded = client
+            .resumable_upload_new_file(
+                "root",
+                "empty.txt",
+                guess_mime_type("empty.txt"),
+                None,
+                &stage_path,
+            )
+            .await
+            .expect("0-byte resumable upload failed");
+        let _ = std::fs::remove_file(&stage_path);
+        assert_eq!(empty_uploaded.id, "uploaded_empty_1");
+        assert_eq!(empty_uploaded.size, 0);
 
         server_handle.await.unwrap();
     }
