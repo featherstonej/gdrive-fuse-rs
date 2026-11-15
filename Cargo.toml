@@ -3,7 +3,7 @@ name = "gdrive-fuse-rs"
 version = "0.1.0"
 edition = "2021"
 authors = ["Your Name <you@example.com>"]
-description = "A lightweight, read-only Google Drive FUSE filesystem written in Rust for Linux and GNOME."
+description = "A lightweight, memory-safe Google Drive FUSE filesystem written in Rust for Linux and GNOME."
 license = "GPL-3.0-only"
 
 [dependencies]

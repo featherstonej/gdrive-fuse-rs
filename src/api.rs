@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE};
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -75,9 +77,9 @@ impl ApiError {
                     libc::EIO
                 }
             }
-            ApiError::UnexpectedStatus { .. }
-            | ApiError::Serialization(_)
-            | ApiError::Io(_) => libc::EIO,
+            ApiError::UnexpectedStatus { .. } | ApiError::Serialization(_) | ApiError::Io(_) => {
+                libc::EIO
+            }
         }
     }
 
@@ -330,9 +332,7 @@ pub fn guess_mime_type(filename: &str) -> &'static str {
         Some("xls") => "application/vnd.ms-excel",
         Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         Some("ppt") => "application/vnd.ms-powerpoint",
-        Some("pptx") => {
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        }
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         _ => "application/octet-stream",
     }
 }
@@ -791,6 +791,10 @@ impl DriveClient {
 
     /// Uploads a newly created file from `staging_path` using the Google Drive Resumable Upload API
     /// (`POST /upload/drive/v3/files?uploadType=resumable` followed by chunked `PUT` to the session `Location`).
+    ///
+    /// If `session_uri` is `Some`, queries the existing upload session progress (`Content-Range: bytes */size`)
+    /// and resumes from the last committed byte offset. If the session has expired (`404`/`410`), reconciles
+    /// against any already-created file matching `appProperties.gdrive_fuse_upload_id` before starting a fresh session.
     pub async fn resumable_upload_new_file(
         &self,
         parent_drive_id: &str,
@@ -822,9 +826,7 @@ impl DriveClient {
         );
         metadata.insert(
             "parents".to_string(),
-            serde_json::Value::Array(vec![serde_json::Value::String(
-                parent_drive_id.to_string(),
-            )]),
+            serde_json::Value::Array(vec![serde_json::Value::String(parent_drive_id.to_string())]),
         );
         if let Some(mtime) = modified_time {
             metadata.insert(
@@ -844,12 +846,7 @@ impl DriveClient {
             Some(uri) => uri.clone(),
             None => {
                 let uri = self
-                    .initiate_resumable_session(
-                        None,
-                        mime_type,
-                        total_size,
-                        &metadata_json,
-                    )
+                    .initiate_resumable_session(None, mime_type, total_size, &metadata_json)
                     .await?;
                 *session_uri = Some(uri.clone());
                 if let Some(upload_id) = upload_id.as_ref() {
@@ -870,7 +867,7 @@ impl DriveClient {
                     if let Ok(mut session_ids) = self.upload_session_ids.lock() {
                         session_ids.remove(&uri);
                     }
-                    return Ok(uploaded);
+                    Ok(uploaded)
                 }
                 Err(error) if is_expired_upload_session(&error) => {
                     if let Some(upload_id) = upload_id.as_deref() {
@@ -1430,10 +1427,7 @@ mod tests {
         assert_eq!(resp.changes.len(), 2);
         assert_eq!(resp.changes[0].file_id, "file_abc");
         assert!(!resp.changes[0].removed);
-        assert_eq!(
-            resp.changes[0].file.as_ref().unwrap().name,
-            "updated.txt"
-        );
+        assert_eq!(resp.changes[0].file.as_ref().unwrap().name, "updated.txt");
         assert_eq!(resp.changes[1].file_id, "file_deleted");
         assert!(resp.changes[1].removed);
         assert!(resp.changes[1].file.is_none());
@@ -1839,7 +1833,9 @@ mod tests {
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req_str = String::from_utf8_lossy(&buf[..n]);
                 assert!(req_str.starts_with("POST /upload/drive/v3/files?uploadType=resumable"));
-                assert!(req_str.to_ascii_lowercase().contains("x-upload-content-length: 12"));
+                assert!(req_str
+                    .to_ascii_lowercase()
+                    .contains("x-upload-content-length: 12"));
 
                 let session_url = format!(
                     "http://{}/upload/drive/v3/files?uploadType=resumable&upload_id=sess_1",
@@ -1857,8 +1853,12 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req_str = String::from_utf8_lossy(&buf[..n]);
-                assert!(req_str.starts_with("PUT /upload/drive/v3/files?uploadType=resumable&upload_id=sess_1"));
-                assert!(req_str.to_ascii_lowercase().contains("content-range: bytes 0-7/12"));
+                assert!(req_str.starts_with(
+                    "PUT /upload/drive/v3/files?uploadType=resumable&upload_id=sess_1"
+                ));
+                assert!(req_str
+                    .to_ascii_lowercase()
+                    .contains("content-range: bytes 0-7/12"));
                 assert!(req_str.ends_with("Hello, G"));
 
                 let resp = "HTTP/1.1 308 Permanent Redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -1870,8 +1870,12 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req_str = String::from_utf8_lossy(&buf[..n]);
-                assert!(req_str.starts_with("PUT /upload/drive/v3/files?uploadType=resumable&upload_id=sess_1"));
-                assert!(req_str.to_ascii_lowercase().contains("content-range: bytes 0-7/12"));
+                assert!(req_str.starts_with(
+                    "PUT /upload/drive/v3/files?uploadType=resumable&upload_id=sess_1"
+                ));
+                assert!(req_str
+                    .to_ascii_lowercase()
+                    .contains("content-range: bytes 0-7/12"));
                 assert!(req_str.ends_with("Hello, G"));
 
                 let resp = "HTTP/1.1 308 Permanent Redirect\r\nRange: bytes=0-7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -1883,7 +1887,9 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req_str = String::from_utf8_lossy(&buf[..n]);
-                assert!(req_str.to_ascii_lowercase().contains("content-range: bytes 8-11/12"));
+                assert!(req_str
+                    .to_ascii_lowercase()
+                    .contains("content-range: bytes 8-11/12"));
                 assert!(req_str.ends_with("oogl"));
 
                 let body = r#"{
@@ -1965,7 +1971,8 @@ mod tests {
                             req_str.contains("X-Upload-Content-Length: 0")
                                 || req_str.contains("x-upload-content-length: 0")
                         );
-                        let session_url = format!("http://{}/upload/drive/v3/session/empty_1", addr);
+                        let session_url =
+                            format!("http://{}/upload/drive/v3/session/empty_1", addr);
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                             session_url
@@ -2010,10 +2017,8 @@ mod tests {
         assert_eq!(folder.id, "folder_new_1");
         assert!(folder.is_dir());
 
-        let stage_path = std::env::temp_dir().join(format!(
-            "gdrive_fuse_api_test_{}.stage",
-            std::process::id()
-        ));
+        let stage_path =
+            std::env::temp_dir().join(format!("gdrive_fuse_api_test_{}.stage", std::process::id()));
         std::fs::write(&stage_path, b"Hello, Googl").unwrap();
 
         let mut session_uri = None;

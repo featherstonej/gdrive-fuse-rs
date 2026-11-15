@@ -179,10 +179,13 @@ fn main() -> Result<()> {
     if args.install_systemd {
         let exe_path = std::env::current_exe()
             .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/gdrive-fuse-rs"));
-        let cwd = std::env::current_dir()
-            .context("Failed to resolve paths for systemd unit")?;
+        let cwd = std::env::current_dir().context("Failed to resolve paths for systemd unit")?;
         let absolute_path = |path: PathBuf| {
-            if path.is_absolute() { path } else { cwd.join(path) }
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
         };
         let unit_mount_point = absolute_path(args.mount_point.clone().unwrap_or_else(|| {
             dirs::home_dir()
@@ -324,7 +327,10 @@ fn main() -> Result<()> {
     if google_docs_mode == GoogleDocsMode::Browser {
         if let Ok(exe_path) = std::env::current_exe() {
             if let Err(e) = install_gdrive_mime_handlers(&exe_path) {
-                log::debug!("Could not register user XDG MIME handler for .gdoc/.gsheet/.gslides: {}", e);
+                log::debug!(
+                    "Could not register user XDG MIME handler for .gdoc/.gsheet/.gslides: {}",
+                    e
+                );
             }
         }
     }
@@ -365,12 +371,9 @@ fn main() -> Result<()> {
         }
     });
 
-    session.run().with_context(|| {
-        format!(
-            "Error running FUSE session at {}",
-            mount_point.display()
-        )
-    })?;
+    session
+        .run()
+        .with_context(|| format!("Error running FUSE session at {}", mount_point.display()))?;
 
     log::info!("Unmounted {} cleanly.", mount_point.display());
     Ok(())
@@ -472,7 +475,8 @@ fn install_gdrive_mime_handlers(exe_path: &Path) -> Result<()> {
          MimeType=application/x-gdrive-doc;application/x-gdrive-sheet;application/x-gdrive-slides;application/x-gdrive-link;\n"
     );
 
-    let needs_mime_update = std::fs::read_to_string(&mime_xml_path).ok().as_deref() != Some(mime_xml);
+    let needs_mime_update =
+        std::fs::read_to_string(&mime_xml_path).ok().as_deref() != Some(mime_xml);
     let needs_desktop_update =
         std::fs::read_to_string(&desktop_path).ok().as_deref() != Some(desktop_entry.as_str());
 
@@ -567,19 +571,33 @@ pub fn generate_systemd_unit(exe_path: &Path, mount_point: &Path, args: &[String
 fn systemd_mount_args(args: &CliArgs) -> Vec<String> {
     let mut unit_args = Vec::new();
     for (option, value) in [
-        ("--config", args.config.as_ref().map(|path| path.display().to_string())),
+        (
+            "--config",
+            args.config.as_ref().map(|path| path.display().to_string()),
+        ),
         ("--client-id", args.client_id.clone()),
-        ("--cache-db", args.cache_db.as_ref().map(|path| path.display().to_string())),
+        (
+            "--cache-db",
+            args.cache_db
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        ),
         ("--cache-ttl", args.cache_ttl.map(|value| value.to_string())),
-        ("--chunk-size", args.chunk_size.map(|value| value.to_string())),
+        (
+            "--chunk-size",
+            args.chunk_size.map(|value| value.to_string()),
+        ),
         (
             "--google-docs-mode",
-            args.google_docs_mode.map(|mode| match mode {
-                GoogleDocsMode::Browser => "browser",
-                GoogleDocsMode::Desktop => "desktop",
-                GoogleDocsMode::Pdf => "pdf",
-                GoogleDocsMode::Office => "office",
-            }.to_owned()),
+            args.google_docs_mode.map(|mode| {
+                match mode {
+                    GoogleDocsMode::Browser => "browser",
+                    GoogleDocsMode::Desktop => "desktop",
+                    GoogleDocsMode::Pdf => "pdf",
+                    GoogleDocsMode::Office => "office",
+                }
+                .to_owned()
+            }),
         ),
         (
             "--change-poll-secs",
@@ -587,7 +605,9 @@ fn systemd_mount_args(args: &CliArgs) -> Vec<String> {
         ),
         (
             "--staging-dir",
-            args.staging_dir.as_ref().map(|path| path.display().to_string()),
+            args.staging_dir
+                .as_ref()
+                .map(|path| path.display().to_string()),
         ),
     ] {
         if let Some(value) = value {

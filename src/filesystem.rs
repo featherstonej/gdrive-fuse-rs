@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
-    TimeOrNow, FUSE_ROOT_ID,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    FUSE_ROOT_ID,
 };
 use tokio::runtime::Handle;
 
@@ -100,12 +100,9 @@ fn create_truncated_stage_file(path: &Path) -> std::io::Result<File> {
 }
 
 fn create_upload_snapshot(ino: u64, staging_path: &Path) -> std::io::Result<PathBuf> {
-    let parent = staging_path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "staging path has no parent directory",
-        )
-    })?;
+    let parent = staging_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("staging path has no parent directory"))?;
     ensure_private_staging_dir(parent)?;
 
     for attempt in 0u64.. {
@@ -636,16 +633,16 @@ impl GDriveFS {
             let stage_path = self.staging_file_path(file.inode);
             if stage_path.exists() {
                 tighten_stage_file_permissions(&stage_path);
-                let entry = self
-                    .staged_files
-                    .entry(file.inode)
-                    .or_insert_with(|| StagedFileState {
-                        ino: file.inode,
-                        path: stage_path.clone(),
-                        dirty: true,
-                        populated_from_remote: true,
-                        open_handles: HashSet::new(),
-                    });
+                let entry =
+                    self.staged_files
+                        .entry(file.inode)
+                        .or_insert_with(|| StagedFileState {
+                            ino: file.inode,
+                            path: stage_path.clone(),
+                            dirty: true,
+                            populated_from_remote: true,
+                            open_handles: HashSet::new(),
+                        });
                 entry.path = stage_path;
                 entry.dirty = true;
                 entry.populated_from_remote = true;
@@ -768,9 +765,9 @@ impl GDriveFS {
             GoogleDocsMode::Browser | GoogleDocsMode::Desktop => None,
             GoogleDocsMode::Pdf => Some("application/pdf"),
             GoogleDocsMode::Office => match mime_type {
-                "application/vnd.google-apps.document" => Some(
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                ),
+                "application/vnd.google-apps.document" => {
+                    Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                }
                 "application/vnd.google-apps.spreadsheet" => {
                     Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 }
@@ -895,12 +892,8 @@ impl GDriveFS {
                 api_err.to_errno()
             })?;
 
-        self.chunk_buffer.insert_with_mtime(
-            file.inode,
-            0,
-            file.modified_time,
-            exported.clone(),
-        );
+        self.chunk_buffer
+            .insert_with_mtime(file.inode, 0, file.modified_time, exported.clone());
         Ok(exported)
     }
 
@@ -956,7 +949,11 @@ impl GDriveFS {
             Ok(Some(file)) => file,
             Ok(None) => return Err(libc::ENOENT),
             Err(e) => {
-                log::error!("Cache error looking up directory inode {}: {}", dir_inode, e);
+                log::error!(
+                    "Cache error looking up directory inode {}: {}",
+                    dir_inode,
+                    e
+                );
                 return Err(e.to_errno());
             }
         };
@@ -983,14 +980,14 @@ impl GDriveFS {
                 dir_inode,
                 dir_file.drive_id
             );
-            let children_res =
-                if dir_inode == SHARED_WITH_ME_INODE || dir_file.drive_id == SHARED_WITH_ME_DRIVE_ID
-                {
-                    self.rt_handle.block_on(self.api.list_shared_with_me())
-                } else {
-                    self.rt_handle
-                        .block_on(self.api.list_children(&dir_file.drive_id))
-                };
+            let children_res = if dir_inode == SHARED_WITH_ME_INODE
+                || dir_file.drive_id == SHARED_WITH_ME_DRIVE_ID
+            {
+                self.rt_handle.block_on(self.api.list_shared_with_me())
+            } else {
+                self.rt_handle
+                    .block_on(self.api.list_children(&dir_file.drive_id))
+            };
 
             let children = children_res.map_err(|api_err| {
                 log::error!(
@@ -1062,7 +1059,11 @@ impl GDriveFS {
         dir_inode: u64,
     ) -> Result<Vec<(String, CachedFile)>, libc::c_int> {
         let children = self.cache.list_children(dir_inode).map_err(|e| {
-            log::error!("Cache error listing children for inode {}: {}", dir_inode, e);
+            log::error!(
+                "Cache error listing children for inode {}: {}",
+                dir_inode,
+                e
+            );
             e.to_errno()
         })?;
 
@@ -1071,11 +1072,7 @@ impl GDriveFS {
         let raw_display_names: Vec<String> = children
             .iter()
             .map(|entry| {
-                Self::display_name_for_file(
-                    &entry.file.name,
-                    &entry.file,
-                    self.google_docs_mode,
-                )
+                Self::display_name_for_file(&entry.file.name, &entry.file, self.google_docs_mode)
             })
             .collect();
 
@@ -1409,7 +1406,11 @@ impl GDriveFS {
         {
             return Err(libc::EACCES);
         }
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0')
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\0')
         {
             return Err(libc::EINVAL);
         }
@@ -1522,7 +1523,8 @@ impl GDriveFS {
             return Err(libc::EBADF);
         }
 
-        let overwrite_all = offset == 0 && (data.len() as u64) >= file.size && (flags & libc::O_APPEND) == 0;
+        let overwrite_all =
+            offset == 0 && (data.len() as u64) >= file.size && (flags & libc::O_APPEND) == 0;
         let stage_path = self.ensure_staging_populated(&file, overwrite_all)?;
 
         let mut stage_file = open_existing_stage_file_rw(&stage_path).map_err(|e| {
@@ -1621,7 +1623,9 @@ impl GDriveFS {
                     .map_err(|e| e.to_errno())?
                     .ok_or(libc::ENOENT)?;
 
-                if !self.pending_upload_sessions.contains_key(&ino) {
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.pending_upload_sessions.entry(ino)
+                {
                     let snapshot_path =
                         create_upload_snapshot(ino, &stage_path).map_err(|error| {
                             log::error!(
@@ -1631,13 +1635,10 @@ impl GDriveFS {
                             );
                             libc::EIO
                         })?;
-                    self.pending_upload_sessions.insert(
-                        ino,
-                        PendingUploadSession {
-                            uri: String::new(),
-                            snapshot_path,
-                        },
-                    );
+                    e.insert(PendingUploadSession {
+                        uri: String::new(),
+                        snapshot_path,
+                    });
                 }
 
                 let session = self.pending_upload_sessions.get(&ino).unwrap().clone();
@@ -1919,7 +1920,11 @@ impl GDriveFS {
         {
             return Err(libc::EACCES);
         }
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0')
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\0')
         {
             return Err(libc::EINVAL);
         }
@@ -2351,12 +2356,10 @@ impl GDriveFS {
         let remaining = file.size - offset;
         let expected_len = std::cmp::min(size as u64, remaining) as usize;
 
-        if let Some(cached_slice) = self.chunk_buffer.get_slice_for_mtime(
-            ino,
-            offset,
-            expected_len,
-            file.modified_time,
-        ) {
+        if let Some(cached_slice) =
+            self.chunk_buffer
+                .get_slice_for_mtime(ino, offset, expected_len, file.modified_time)
+        {
             log::trace!(
                 "Read-ahead buffer HIT for inode {} at offset {} (len={})",
                 ino,
@@ -2478,11 +2481,7 @@ fn time_or_now_to_system_time(time_or_now: TimeOrNow) -> SystemTime {
 }
 
 impl Filesystem for GDriveFS {
-    fn init(
-        &mut self,
-        _req: &Request<'_>,
-        _config: &mut KernelConfig,
-    ) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), libc::c_int> {
         log::info!(
             "Initializing gdrive-fuse-rs FUSE filesystem (uid={}, gid={}, chunk_size={} bytes, google_docs_mode={:?}, shared_with_me={}, read_only={}, staging_dir={})",
             self.uid,
@@ -2498,7 +2497,10 @@ impl Filesystem for GDriveFS {
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let Some(name_str) = name.to_str() else {
-            log::warn!("Rejecting non-UTF8 filename in lookup under parent {}", parent);
+            log::warn!(
+                "Rejecting non-UTF8 filename in lookup under parent {}",
+                parent
+            );
             reply.error(libc::ENOENT);
             return;
         };
@@ -2588,14 +2590,7 @@ impl Filesystem for GDriveFS {
         }
     }
 
-    fn fsync(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         match self.handle_flush(ino, fh) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
@@ -2930,8 +2925,11 @@ mod tests {
     #[test]
     fn test_getattr_root_inode_and_file_to_attr() {
         let rt = Runtime::new().unwrap();
-        let mut fs =
-            make_test_fs("http://127.0.0.1:9", rt.handle().clone(), DEFAULT_READ_CHUNK_SIZE);
+        let mut fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
 
         let root_attr = fs
             .handle_getattr(FUSE_ROOT_ID)
@@ -2960,10 +2958,7 @@ mod tests {
         assert_eq!(attr.kind, FileType::RegularFile);
         assert_eq!(attr.perm, 0o644);
         assert_eq!(attr.nlink, 1);
-        assert_eq!(
-            attr.mtime,
-            UNIX_EPOCH + Duration::from_secs(1_700_000_100)
-        );
+        assert_eq!(attr.mtime, UNIX_EPOCH + Duration::from_secs(1_700_000_100));
     }
 
     #[test]
@@ -3033,8 +3028,14 @@ mod tests {
             .handle_readdir(FUSE_ROOT_ID)
             .expect("readdir on root must succeed");
         assert_eq!(entries.len(), 7); // ".", "..", "Shared with me", plus 4 Drive items
-        assert_eq!(entries[0], (FUSE_ROOT_ID, FileType::Directory, ".".to_string()));
-        assert_eq!(entries[1], (FUSE_ROOT_ID, FileType::Directory, "..".to_string()));
+        assert_eq!(
+            entries[0],
+            (FUSE_ROOT_ID, FileType::Directory, ".".to_string())
+        );
+        assert_eq!(
+            entries[1],
+            (FUSE_ROOT_ID, FileType::Directory, "..".to_string())
+        );
         assert_eq!(
             entries[2],
             (
@@ -3449,7 +3450,10 @@ mod tests {
             let chunk = fs
                 .handle_read(attr.ino, offset, 1024)
                 .expect("sequential read must succeed");
-            assert_eq!(&chunk[..], &payload[offset as usize..(offset as usize + 1024)]);
+            assert_eq!(
+                &chunk[..],
+                &payload[offset as usize..(offset as usize + 1024)]
+            );
         }
 
         // Only 1 HTTP download request must have been made because the 4 MB read-ahead buffer served reads 2..=4
@@ -3492,10 +3496,16 @@ mod tests {
 
         // 2. Reading a directory -> EISDIR
         assert_eq!(fs.handle_read(FUSE_ROOT_ID, 0, 1024), Err(libc::EISDIR));
-        assert_eq!(fs.handle_open(FUSE_ROOT_ID, libc::O_RDONLY), Err(libc::EISDIR));
+        assert_eq!(
+            fs.handle_open(FUSE_ROOT_ID, libc::O_RDONLY),
+            Err(libc::EISDIR)
+        );
 
         // 3. Opening with write flags -> EROFS
-        assert_eq!(fs.handle_open(FUSE_ROOT_ID, libc::O_WRONLY), Err(libc::EROFS));
+        assert_eq!(
+            fs.handle_open(FUSE_ROOT_ID, libc::O_WRONLY),
+            Err(libc::EROFS)
+        );
         assert_eq!(fs.handle_open(FUSE_ROOT_ID, libc::O_RDWR), Err(libc::EROFS));
 
         // 4. Lookup inside a regular file -> ENOTDIR
@@ -3609,7 +3619,9 @@ mod tests {
             GoogleDocsMode::Pdf,
             false,
         );
-        let snap = fs_pdf.handle_statfs().expect("statfs for unlimited account must succeed");
+        let snap = fs_pdf
+            .handle_statfs()
+            .expect("statfs for unlimited account must succeed");
         assert_eq!(snap.blocks, 0);
         assert_eq!(snap.bfree, 0);
         assert_eq!(snap.bavail, 0);
@@ -3732,7 +3744,7 @@ mod tests {
         };
         let entry = fs
             .cache
-            .sync_directory_children(ROOT_INODE, &[file.clone()])
+            .sync_directory_children(ROOT_INODE, std::slice::from_ref(&file))
             .unwrap()
             .remove(0);
         let fh = fs.handle_open_with_fh(entry.inode, libc::O_RDONLY).unwrap();
@@ -4162,7 +4174,12 @@ mod tests {
 
         // 1. Create a new file under root
         let (created_attr, fh) = fs
-            .handle_create(FUSE_ROOT_ID, "hello.txt", 0o644, libc::O_CREAT | libc::O_RDWR)
+            .handle_create(
+                FUSE_ROOT_ID,
+                "hello.txt",
+                0o644,
+                libc::O_CREAT | libc::O_RDWR,
+            )
             .expect("handle_create must succeed in read-write mode");
         assert_eq!(created_attr.size, 0);
         let ino = created_attr.ino;
@@ -4198,7 +4215,8 @@ mod tests {
         assert_eq!(uploaded_meta.size, 14);
 
         // Release handle
-        fs.handle_release(ino, fh).expect("handle_release must succeed");
+        fs.handle_release(ino, fh)
+            .expect("handle_release must succeed");
 
         // 5. Re-open existing file with O_RDWR | O_TRUNC AND a concurrent O_RDONLY handle, write new content,
         // release the writable handle while the O_RDONLY handle remains open (must upload immediately on last writer close),
@@ -4534,10 +4552,7 @@ mod tests {
             fs.handle_lookup(FUSE_ROOT_ID, "Plan.gdoc").is_ok(),
             "Plan.gdoc must still exist in root alongside Plan"
         );
-        assert_eq!(
-            fs.handle_lookup(FUSE_ROOT_ID, "Plan").unwrap().size,
-            5
-        );
+        assert_eq!(fs.handle_lookup(FUSE_ROOT_ID, "Plan").unwrap().size, 5);
 
         // 2. Calling handle_create on existing "Plan" WITHOUT O_TRUNC or O_EXCL must preserve its 5-byte content
         let (reopened_attr, _fh2) = fs
@@ -4731,18 +4746,33 @@ mod tests {
         // 1. `handle_create` with `O_CREAT | O_RDONLY` on an existing Google Workspace document
         // must succeed for read-only access while rejecting write/truncate flags with EACCES.
         let (gdoc_attr, gdoc_fh) = fs
-            .handle_create(FUSE_ROOT_ID, "Plan.gdoc", 0o644, libc::O_CREAT | libc::O_RDONLY)
+            .handle_create(
+                FUSE_ROOT_ID,
+                "Plan.gdoc",
+                0o644,
+                libc::O_CREAT | libc::O_RDONLY,
+            )
             .expect("open(O_CREAT | O_RDONLY) on existing Google Doc must succeed");
         fs.handle_release(gdoc_attr.ino, gdoc_fh).unwrap();
         assert_eq!(
-            fs.handle_create(FUSE_ROOT_ID, "Plan.gdoc", 0o644, libc::O_CREAT | libc::O_WRONLY),
+            fs.handle_create(
+                FUSE_ROOT_ID,
+                "Plan.gdoc",
+                0o644,
+                libc::O_CREAT | libc::O_WRONLY
+            ),
             Err(libc::EACCES)
         );
 
         // 2. Renaming a pending regular file to `Plan.gdoc` when native Google Doc `Plan` exists
         // must NOT trash or remove the native Google Doc; both must coexist via disambiguation.
         let (pending_attr, pending_fh) = fs
-            .handle_create(FUSE_ROOT_ID, "notes.txt", 0o644, libc::O_CREAT | libc::O_RDWR)
+            .handle_create(
+                FUSE_ROOT_ID,
+                "notes.txt",
+                0o644,
+                libc::O_CREAT | libc::O_RDWR,
+            )
             .unwrap();
         fs.handle_write(pending_attr.ino, pending_fh, 0, b"local notes", 0)
             .unwrap();
@@ -4771,7 +4801,12 @@ mod tests {
         // 4. `handle_unlink` on a file with an open handle must remove the directory entry immediately
         // (`lookup` -> ENOENT) while preserving the inode and staged data until the final `handle_release`.
         let (temp_attr, temp_fh) = fs
-            .handle_create(FUSE_ROOT_ID, "temp_open.txt", 0o644, libc::O_CREAT | libc::O_RDWR)
+            .handle_create(
+                FUSE_ROOT_ID,
+                "temp_open.txt",
+                0o644,
+                libc::O_CREAT | libc::O_RDWR,
+            )
             .unwrap();
         fs.handle_write(temp_attr.ino, temp_fh, 0, b"open-unlink", 0)
             .unwrap();
@@ -4812,9 +4847,8 @@ mod tests {
         // 6. Restart / 410-recovery staging preservation: simulate a new GDriveFS instance attached to
         // the same cache and staging_dir while `pending_attr.ino` is dirty on disk.
         let auth = Arc::new(AuthManager::new_static_for_test("test-token"));
-        let api = Arc::new(
-            DriveClient::with_base_url(auth, "http://127.0.0.1:9".to_string()).unwrap(),
-        );
+        let api =
+            Arc::new(DriveClient::with_base_url(auth, "http://127.0.0.1:9".to_string()).unwrap());
         let mut restarted_fs = GDriveFS::with_phase3_config(
             api,
             fs.cache.clone(),
@@ -4837,16 +4871,18 @@ mod tests {
         restarted_fs
             .handle_write(pending_attr.ino, rw_fh, 6, b"NOTES!", 0)
             .expect("partial write on recovered dirty file must succeed");
-        let after_partial_write = restarted_fs
-            .handle_read(pending_attr.ino, 0, 64)
-            .unwrap();
+        let after_partial_write = restarted_fs.handle_read(pending_attr.ino, 0, 64).unwrap();
         assert_eq!(&after_partial_write[..], b"local NOTES!");
 
         // 7. Verify staging directory (`0700`) and staging file (`0600`) owner-only permissions on Unix.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let dir_mode = std::fs::metadata(&staging_dir).unwrap().permissions().mode() & 0o777;
+            let dir_mode = std::fs::metadata(&staging_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(dir_mode, 0o700, "staging directory must be mode 0700");
             let file_mode = std::fs::metadata(restarted_fs.staging_file_path(pending_attr.ino))
                 .unwrap()
@@ -4872,7 +4908,9 @@ mod tests {
             Err(libc::EINVAL),
             "ftruncate via an O_RDONLY handle must be rejected with EINVAL"
         );
-        restarted_fs.handle_release(pending_attr.ino, ro_fh).unwrap();
+        restarted_fs
+            .handle_release(pending_attr.ino, ro_fh)
+            .unwrap();
 
         let trunc_attr = restarted_fs
             .handle_setattr(pending_attr.ino, Some(5), None, Some(rw_fh))

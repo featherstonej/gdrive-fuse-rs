@@ -114,7 +114,11 @@ impl AppConfig {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(path).map_err(|e| {
-            AuthError::ConfigError(format!("Failed to read config file {}: {}", path.display(), e))
+            AuthError::ConfigError(format!(
+                "Failed to read config file {}: {}",
+                path.display(),
+                e
+            ))
         })?;
         toml::from_str(&content).map_err(|e| {
             AuthError::ConfigError(format!("Failed to parse TOML in {}: {}", path.display(), e))
@@ -138,7 +142,9 @@ pub struct ClientCredentials {
 }
 
 /// Resolves OAuth2 client credentials using a layered approach:
-/// 1. CLI flags / Environment variables (`cli_id`, `cli_secret`)
+/// 1. CLI flags / Environment variables (`cli_id`, `cli_secret`). If `cli_id` is supplied without
+///    `cli_secret`, a matching `client_secret` for that same `client_id` from `config.toml` or the
+///    system keyring is reused.
 /// 2. User configuration file (`config.toml`)
 /// 3. System keyring fallback (`service = "gdrive-fuse-rs"`, `user = "oauth_client_config"`)
 pub fn resolve_credentials(
@@ -214,12 +220,18 @@ fn persist_credentials_to_keyring(creds: &ClientCredentials) {
         Ok(entry) => {
             if let Ok(json) = serde_json::to_string(creds) {
                 if let Err(e) = entry.set_password(&json) {
-                    log::debug!("Unable to store client credentials in system keyring: {}", e);
+                    log::debug!(
+                        "Unable to store client credentials in system keyring: {}",
+                        e
+                    );
                 }
             }
         }
         Err(e) => {
-            log::debug!("Unable to initialize keyring entry for client config: {}", e);
+            log::debug!(
+                "Unable to initialize keyring entry for client config: {}",
+                e
+            );
         }
     }
 }
@@ -238,7 +250,10 @@ fn persist_refresh_token_to_keyring(refresh_token: &str) {
     match keyring::Entry::new(KEYRING_SERVICE, KEYRING_REFRESH_TOKEN_USER) {
         Ok(entry) => {
             if let Err(e) = entry.set_password(refresh_token) {
-                log::warn!("Failed to store OAuth2 refresh token in system keyring: {}", e);
+                log::warn!(
+                    "Failed to store OAuth2 refresh token in system keyring: {}",
+                    e
+                );
             } else {
                 log::info!("Saved OAuth2 refresh token to system keyring.");
             }
@@ -252,7 +267,10 @@ fn persist_refresh_token_to_keyring(refresh_token: &str) {
 fn persist_token_scope_to_keyring(scope: &str) {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_SCOPE_USER) {
         if let Err(e) = entry.set_password(scope) {
-            log::debug!("Unable to store OAuth2 token scope in system keyring: {}", e);
+            log::debug!(
+                "Unable to store OAuth2 token scope in system keyring: {}",
+                e
+            );
         }
     }
 }
@@ -641,7 +659,8 @@ pub async fn wait_for_oauth_callback(
         .await
         .map_err(|_| {
             AuthError::OAuthError(
-                "Timed out waiting 300s for OAuth2 browser callback on loopback listener".to_string(),
+                "Timed out waiting 300s for OAuth2 browser callback on loopback listener"
+                    .to_string(),
             )
         })?;
     let (mut stream, _) = accept_res?;
@@ -697,7 +716,10 @@ pub fn parse_oauth_callback_request_line(
     let path_and_query = parts[1];
     let full_url = format!("http://127.0.0.1{}", path_and_query);
     let parsed_url = Url::parse(&full_url).map_err(|e| {
-        AuthError::InvalidCallback(format!("Failed to parse callback URL '{}': {}", full_url, e))
+        AuthError::InvalidCallback(format!(
+            "Failed to parse callback URL '{}': {}",
+            full_url, e
+        ))
     })?;
 
     let mut code: Option<String> = None;

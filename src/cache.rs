@@ -310,7 +310,7 @@ impl MetadataCache {
         Ok(())
     }
 
-    /// Removes any leftover `inode_*.stage` staging files in `staging_dir`.
+    /// Removes any leftover `inode_*.stage` or `.inode_*.stage` upload snapshot files in `staging_dir`.
     pub fn clear_staging_dir(staging_dir: &Path) -> Result<(), CacheError> {
         if !staging_dir.exists() {
             return Ok(());
@@ -320,7 +320,9 @@ impl MetadataCache {
             let path = entry.path();
             if path.is_file() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-if name.ends_with(".stage") && name.trim_start_matches('.').starts_with("inode_") {
+                    if name.ends_with(".stage")
+                        && name.trim_start_matches('.').starts_with("inode_")
+                    {
                         let _ = fs::remove_file(&path);
                     }
                 }
@@ -439,9 +441,10 @@ if name.ends_with(".stage") && name.trim_start_matches('.').starts_with("inode_"
                              FROM parent_child
                              WHERE parent_inode = ?1 OR child_inode = ?1",
                         )?;
-                        let rows = edge_stmt.query_map(params![SHARED_WITH_ME_INODE as i64], |r| {
-                            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                        })?;
+                        let rows = edge_stmt
+                            .query_map(params![SHARED_WITH_ME_INODE as i64], |r| {
+                                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                            })?;
                         for row in rows {
                             saved_edges.push(row?);
                         }
@@ -592,7 +595,9 @@ if name.ends_with(".stage") && name.trim_start_matches('.').starts_with("inode_"
         let mut stmt = conn.prepare_cached(
             "SELECT parent_inode FROM parent_child WHERE child_inode = ?1 ORDER BY rowid DESC LIMIT 1",
         )?;
-        let parent: Option<i64> = stmt.query_row(params![inode as i64], |r| r.get(0)).optional()?;
+        let parent: Option<i64> = stmt
+            .query_row(params![inode as i64], |r| r.get(0))
+            .optional()?;
         Ok(parent.map(|p| p as u64).unwrap_or(ROOT_INODE))
     }
 
@@ -1080,8 +1085,11 @@ if name.ends_with(".stage") && name.trim_start_matches('.').starts_with("inode_"
             "DELETE FROM parent_child WHERE parent_inode = ?1 AND child_inode = ?2",
             params![parent_inode as i64, cached_file.inode as i64],
         )?;
-        let mut used_names =
-            Self::used_sibling_effective_names_with_conn(&tx, parent_inode, Some(cached_file.inode))?;
+        let mut used_names = Self::used_sibling_effective_names_with_conn(
+            &tx,
+            parent_inode,
+            Some(cached_file.inode),
+        )?;
         let disambiguated = disambiguate_filename(effective_name, &mut used_names);
 
         tx.execute(
@@ -1146,10 +1154,7 @@ if name.ends_with(".stage") && name.trim_start_matches('.').starts_with("inode_"
         )?;
 
         if inode > SHARED_WITH_ME_INODE {
-            tx.execute(
-                "DELETE FROM files WHERE inode = ?1",
-                params![inode as i64],
-            )?;
+            tx.execute("DELETE FROM files WHERE inode = ?1", params![inode as i64])?;
         }
 
         tx.commit()?;
@@ -1233,8 +1238,7 @@ if name.ends_with(".stage") && name.trim_start_matches('.').starts_with("inode_"
     /// Retrieves the saved Google Drive `changes.list` page token from `sync_state`, if any.
     pub fn get_change_page_token(&self) -> Result<Option<String>, CacheError> {
         let conn = self.lock_conn()?;
-        let mut stmt =
-            conn.prepare_cached("SELECT value FROM sync_state WHERE key = ?1")?;
+        let mut stmt = conn.prepare_cached("SELECT value FROM sync_state WHERE key = ?1")?;
         let token: Option<String> = stmt
             .query_row(params![CHANGES_PAGE_TOKEN_KEY], |r| r.get(0))
             .optional()?;
@@ -1254,6 +1258,10 @@ if name.ends_with(".stage") && name.trim_start_matches('.').starts_with("inode_"
 
     /// Atomically applies a batch of incremental Drive changes (`changes.list`) and optionally updates
     /// the stored change page token inside a single SQLite transaction.
+    ///
+    /// Subtrees containing local dirty or pending-upload files are preserved. Remotely removed/trashed
+    /// inodes have their directory edges detached immediately and are queued in `RemovalTracker`
+    /// (`take_removed_inodes`) so the FUSE layer can defer deleting `files` rows while handles remain open.
     ///
     /// Returns the number of changes that affected local cached state.
     pub fn apply_changes(
@@ -1483,8 +1491,7 @@ if name.ends_with(".stage") && name.trim_start_matches('.').starts_with("inode_"
         } else {
             format!(
                 " OR inode IN ({})",
-                std::iter::repeat("?")
-                    .take(open_inodes.len())
+                std::iter::repeat_n("?", open_inodes.len())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -1542,7 +1549,10 @@ if name.ends_with(".stage") && name.trim_start_matches('.').starts_with("inode_"
             params_from_iter(preserved_params.iter().copied()),
         )?;
 
-        tx.execute("UPDATE files SET last_synced_at = NULL WHERE is_dir != 0", [])?;
+        tx.execute(
+            "UPDATE files SET last_synced_at = NULL WHERE is_dir != 0",
+            [],
+        )?;
 
         tx.commit()?;
 
@@ -1900,7 +1910,9 @@ mod tests {
             .lookup_child(folder_ino, "remove_me.txt")
             .expect("lookup failed")
             .is_none());
-        let listed = cache.list_children(folder_ino).expect("list_children failed");
+        let listed = cache
+            .list_children(folder_ino)
+            .expect("list_children failed");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].effective_name, "keep.txt");
     }
@@ -2004,7 +2016,10 @@ mod tests {
             .take_removed_inodes()
             .iter()
             .any(|removed| removed.inode == removed_b.inode));
-        assert!(cache.lookup_child(ROOT_INODE, "beta.txt").unwrap().is_none());
+        assert!(cache
+            .lookup_child(ROOT_INODE, "beta.txt")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2012,7 +2027,7 @@ mod tests {
         let cache = MetadataCache::open_in_memory(300).expect("Failed to open cache");
         let file = sample_drive_file("restored_file", "restored.txt", "text/plain", 100);
         let entry = cache
-            .sync_directory_children(ROOT_INODE, &[file.clone()])
+            .sync_directory_children(ROOT_INODE, std::slice::from_ref(&file))
             .unwrap()
             .remove(0);
 
@@ -2262,7 +2277,10 @@ mod tests {
             .sync_directory_children(ROOT_INODE, &[remote_sibling])
             .expect("sync_directory_children with dirty file failed");
         assert_eq!(synced.len(), 2);
-        assert!(cache.lookup_child(ROOT_INODE, "draft.txt").unwrap().is_some());
+        assert!(cache
+            .lookup_child(ROOT_INODE, "draft.txt")
+            .unwrap()
+            .is_some());
 
         // 4. Complete upload and verify inode stability + dirty cleared
         let uploaded_drive_file = DriveFile {
@@ -2305,7 +2323,10 @@ mod tests {
             .expect("rename_entry failed");
         assert_eq!(renamed.inode, draft_ino);
         assert_eq!(renamed.name, "final.txt");
-        assert!(cache.lookup_child(ROOT_INODE, "draft.txt").unwrap().is_none());
+        assert!(cache
+            .lookup_child(ROOT_INODE, "draft.txt")
+            .unwrap()
+            .is_none());
         assert_eq!(
             cache
                 .lookup_child(sub_ino, "final.txt")
@@ -2336,7 +2357,9 @@ mod tests {
         let preserved_nested = cache
             .lookup_child(sub_ino, "nested_dirty.txt")
             .unwrap()
-            .expect("Nested dirty file must remain reachable under its parent folder after clear_all()");
+            .expect(
+                "Nested dirty file must remain reachable under its parent folder after clear_all()",
+            );
         assert_eq!(preserved_nested.inode, nested_dirty.inode);
         assert_eq!(cache.get_parent_inode(nested_dirty.inode).unwrap(), sub_ino);
 
@@ -2376,7 +2399,10 @@ mod tests {
             stage_before_open, stage_after_open,
             "Relative cache DB path must produce identical staging directory before and after DB file creation"
         );
-        assert_eq!(opened_rel_cache.scoped_default_staging_dir(), stage_after_open);
+        assert_eq!(
+            opened_rel_cache.scoped_default_staging_dir(),
+            stage_after_open
+        );
         drop(opened_rel_cache);
         let _ = MetadataCache::remove_db_files(&rel_db_path);
     }
