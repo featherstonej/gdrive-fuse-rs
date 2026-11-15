@@ -819,6 +819,7 @@ impl DriveClient {
                 serde_json::Value::String(unix_secs_to_rfc3339(mtime)),
             );
         }
+        let metadata_json = serde_json::Value::Object(metadata);
 
         let resume_session = session_uri.is_some();
         let uri = match session_uri.as_ref() {
@@ -829,7 +830,7 @@ impl DriveClient {
                         None,
                         mime_type,
                         total_size,
-                        &serde_json::Value::Object(metadata),
+                        &metadata_json,
                     )
                     .await?;
                 *session_uri = Some(uri.clone());
@@ -837,8 +838,65 @@ impl DriveClient {
             }
         };
 
-        self.upload_file_to_session_uri(&uri, &mut file, total_size, mime_type, resume_session)
-            .await
+        if resume_session {
+            match self
+                .upload_file_to_session_uri(&uri, &mut file, total_size, mime_type, true)
+                .await
+            {
+                Ok(uploaded) => return Ok(uploaded),
+                Err(error) if is_expired_upload_session(&error) => {
+                    if let Some(uploaded) = self
+                        .find_uploaded_file(
+                            parent_drive_id,
+                            name,
+                            mime_type,
+                            total_size,
+                            modified_time,
+                        )
+                        .await?
+                    {
+                        *session_uri = None;
+                        return Ok(uploaded);
+                    }
+
+                    *session_uri = None;
+                    let uri = self
+                        .initiate_resumable_session(None, mime_type, total_size, &metadata_json)
+                        .await?;
+                    *session_uri = Some(uri.clone());
+                    self.upload_file_to_session_uri(&uri, &mut file, total_size, mime_type, false)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            self.upload_file_to_session_uri(&uri, &mut file, total_size, mime_type, false)
+                .await
+        }
+    }
+
+    async fn find_uploaded_file(
+        &self,
+        parent_drive_id: &str,
+        name: &str,
+        mime_type: &str,
+        total_size: u64,
+        modified_time: Option<i64>,
+    ) -> Result<Option<DriveFile>, ApiError> {
+        let files = self.list_children(parent_drive_id).await?;
+        let mut matches = files.into_iter().filter(|file| {
+            file.name == name
+                && file.mime_type == mime_type
+                && file.size == total_size
+                && modified_time.map_or(true, |mtime| file.modified_time == mtime)
+        });
+        let Some(file) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        Ok(Some(file))
     }
 
     /// Uploads modified content for an existing Drive file `file_id` from `staging_path` using the
@@ -1102,6 +1160,13 @@ fn parse_resumable_range_upper(range_header: &str) -> Option<u64> {
     let without_prefix = trimmed.strip_prefix("bytes=").unwrap_or(trimmed);
     let (_, upper_str) = without_prefix.split_once('-')?;
     upper_str.trim().parse::<u64>().ok()
+}
+
+fn is_expired_upload_session(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::NotFound(_) | ApiError::UnexpectedStatus { status: 410, .. }
+    )
 }
 
 #[cfg(test)]
@@ -2038,6 +2103,205 @@ mod tests {
             .expect("retry must query and reuse the existing session");
         assert_eq!(uploaded.id, "uploaded_once");
         assert!(session_uri.is_some());
+
+        let _ = std::fs::remove_file(&stage_path);
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_expired_creation_session_reconciles_uploaded_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+            assert!(request.starts_with("POST /upload/drive/v3/files?uploadType=resumable"));
+            let session_url = format!("http://{}/upload/drive/v3/session/expired", addr);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                session_url
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+            assert!(request.starts_with("PUT /upload/drive/v3/session/expired"));
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+            assert!(request.starts_with("PUT /upload/drive/v3/session/expired"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("content-range: bytes */11"));
+            stream
+                .write_all(b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+            assert!(request.starts_with("GET /drive/v3/files?"));
+            let body = r#"{"files":[{"id":"already_created","name":"retry.txt","mimeType":"text/plain","size":"11","parents":["root"]}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = DriveClient::with_base_url(
+            Arc::new(AuthManager::new_static_for_test("test-access-token")),
+            format!("http://{}/drive/v3", addr),
+        )
+        .unwrap();
+        let stage_path = std::env::temp_dir().join(format!(
+            "gdrive_fuse_api_expired_reconcile_{}.stage",
+            std::process::id()
+        ));
+        std::fs::write(&stage_path, b"create once").unwrap();
+
+        let mut session_uri = None;
+        assert!(client
+            .resumable_upload_new_file(
+                "root",
+                "retry.txt",
+                "text/plain",
+                None,
+                &stage_path,
+                &mut session_uri,
+            )
+            .await
+            .is_err());
+        let uploaded = client
+            .resumable_upload_new_file(
+                "root",
+                "retry.txt",
+                "text/plain",
+                None,
+                &stage_path,
+                &mut session_uri,
+            )
+            .await
+            .expect("expired session should reconcile the already-created file");
+        assert_eq!(uploaded.id, "already_created");
+        assert!(session_uri.is_none());
+
+        let _ = std::fs::remove_file(&stage_path);
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_expired_creation_session_is_replaced_when_file_is_missing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+            assert!(request.starts_with("POST /upload/drive/v3/files?uploadType=resumable"));
+            let old_session = format!("http://{}/upload/drive/v3/session/old", addr);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                old_session
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_full_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+            assert!(request.starts_with("PUT /upload/drive/v3/session/old"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+            assert!(request.starts_with("GET /drive/v3/files?"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"files\":[]}")
+                .await
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+            assert!(request.starts_with("POST /upload/drive/v3/files?uploadType=resumable"));
+            let new_session = format!("http://{}/upload/drive/v3/session/new", addr);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                new_session
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
+            assert!(request.starts_with("PUT /upload/drive/v3/session/new"));
+            let body = r#"{"id":"created_after_expiry","name":"retry.txt","mimeType":"text/plain","size":"11","parents":["root"]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = DriveClient::with_base_url(
+            Arc::new(AuthManager::new_static_for_test("test-access-token")),
+            format!("http://{}/drive/v3", addr),
+        )
+        .unwrap();
+        let stage_path = std::env::temp_dir().join(format!(
+            "gdrive_fuse_api_expired_replace_{}.stage",
+            std::process::id()
+        ));
+        std::fs::write(&stage_path, b"create once").unwrap();
+
+        let mut session_uri = None;
+        assert!(client
+            .resumable_upload_new_file(
+                "root",
+                "retry.txt",
+                "text/plain",
+                None,
+                &stage_path,
+                &mut session_uri,
+            )
+            .await
+            .is_err());
+        let uploaded = client
+            .resumable_upload_new_file(
+                "root",
+                "retry.txt",
+                "text/plain",
+                None,
+                &stage_path,
+                &mut session_uri,
+            )
+            .await
+            .expect("a missing creation should start a fresh upload session");
+        assert_eq!(uploaded.id, "created_after_expiry");
+        assert!(session_uri.is_some_and(|uri| uri.ends_with("/new")));
 
         let _ = std::fs::remove_file(&stage_path);
         server_handle.await.unwrap();
