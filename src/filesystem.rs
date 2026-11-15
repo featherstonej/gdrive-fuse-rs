@@ -2623,11 +2623,19 @@ impl Filesystem for GDriveFS {
             reply.error(libc::EROFS);
             return;
         }
+        self.cache.retain_open_inode(ino);
         match self.cache.get_by_inode(ino) {
             Ok(Some(file)) if file.is_dir => reply.opened(0, 0),
-            Ok(Some(_)) => reply.error(libc::ENOTDIR),
-            Ok(None) => reply.error(libc::ENOENT),
+            Ok(Some(_)) => {
+                self.cache.release_open_inode(ino);
+                reply.error(libc::ENOTDIR);
+            }
+            Ok(None) => {
+                self.cache.release_open_inode(ino);
+                reply.error(libc::ENOENT);
+            }
             Err(e) => {
+                self.cache.release_open_inode(ino);
                 log::error!("Cache error in opendir for inode {}: {}", ino, e);
                 reply.error(e.to_errno());
             }
@@ -2637,11 +2645,12 @@ impl Filesystem for GDriveFS {
     fn releasedir(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _flags: i32,
         reply: ReplyEmpty,
     ) {
+        self.cache.release_open_inode(ino);
         reply.ok();
     }
 

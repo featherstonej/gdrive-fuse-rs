@@ -2064,6 +2064,31 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_all_preserves_open_directory_inode() {
+        let cache = Cache::open_in_memory(60).expect("Failed to open cache");
+        let folder = sample_drive_file("folder_1", "folder", FOLDER_MIME_TYPE, 0);
+        let folder_ino = cache
+            .sync_directory_children(ROOT_INODE, &[folder])
+            .expect("Sync failed")[0]
+            .inode;
+        cache.retain_open_inode(folder_ino);
+
+        cache.clear_all().expect("clear_all failed");
+
+        assert!(cache.get_by_inode(folder_ino).unwrap().is_some());
+        assert!(cache
+            .list_children(ROOT_INODE)
+            .unwrap()
+            .iter()
+            .any(|child| child.inode == folder_ino));
+
+        cache.release_open_inode(folder_ino);
+        cache.clear_all().expect("clear_all failed");
+
+        assert!(cache.get_by_inode(folder_ino).unwrap().is_none());
+    }
+
+    #[test]
     fn test_error_mapping_to_posix_errno() {
         assert_eq!(
             CacheError::NotFound("missing".into()).to_errno(),
