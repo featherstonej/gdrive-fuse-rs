@@ -320,7 +320,7 @@ impl MetadataCache {
             let path = entry.path();
             if path.is_file() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("inode_") && name.ends_with(".stage") {
+if name.ends_with(".stage") && name.trim_start_matches('.').starts_with("inode_") {
                         let _ = fs::remove_file(&path);
                     }
                 }
