@@ -5,7 +5,7 @@
 Please read these Terms of Service ("Terms") carefully before using the `gdrive-fuse-rs` software. By downloading, cloning, building, or running `gdrive-fuse-rs`, you agree to be bound by these Terms.
 
 ### 1. Open Source License
-`gdrive-fuse-rs` is free, open-source software provided under the **MIT License**. You are permitted to use, modify, and distribute the software in accordance with the terms of the MIT License accompanying the source code repository.
+`gdrive-fuse-rs` is free, open-source software provided under the **GNU General Public License v3.0 (GPL-3.0)**. You are permitted to use, modify, and distribute the software in accordance with the terms of the GPL-3.0 License accompanying the source code repository.
 
 ### 2. Disclaimer of Warranties
 The software is provided **"AS IS"**, without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and noninfringement. In no event shall the authors or copyright holders be liable for any claim, damages, or other liability arising from, out of, or in connection with the software or the use or other dealings in the software.

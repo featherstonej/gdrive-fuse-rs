@@ -6,7 +6,7 @@
 
 ### 1. Information We Collect
 `gdrive-fuse-rs` operates entirely locally on your machine. When you authenticate:
-- The application requests read-only access to your Google Drive files solely to display them locally via your file manager.
+- The application requests access to your Google Drive files (`drive` scope by default, or `drive.readonly` when mounted with `--read-only`) solely to display and manage them locally via your file manager.
 - OAuth2 authentication tokens (refresh and access tokens) are handled securely through your system's native credential manager (e.g., GNOME Keyring / Secret Service API) and are **never** transmitted to any third-party servers.
 
 ### 2. Data Storage and Security
