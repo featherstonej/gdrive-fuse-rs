@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE};
@@ -24,6 +26,7 @@ const LIST_FIELDS: &str =
     "nextPageToken,files(id,name,mimeType,size,modifiedTime,parents,trashed,webViewLink)";
 const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,parents,trashed,webViewLink";
 const CHANGES_FIELDS: &str = "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,parents,trashed,webViewLink))";
+const UPLOAD_ID_PROPERTY: &str = "gdrive_fuse_upload_id";
 
 /// Errors returned by the Google Drive REST API v3 client.
 #[derive(Debug, thiserror::Error)]
@@ -342,6 +345,7 @@ pub struct DriveClient {
     base_url: String,
     upload_base_url: String,
     upload_chunk_size: usize,
+    upload_session_ids: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl DriveClient {
@@ -383,6 +387,7 @@ impl DriveClient {
             base_url: normalized_base,
             upload_base_url,
             upload_chunk_size: RESUMABLE_UPLOAD_CHUNK_SIZE,
+            upload_session_ids: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -798,6 +803,14 @@ impl DriveClient {
         let mut file = tokio::fs::File::open(staging_path).await?;
         let total_size = file.metadata().await?.len();
 
+        let resume_session = session_uri.is_some();
+        let mut upload_id = session_uri
+            .as_ref()
+            .and_then(|uri| self.upload_session_ids.lock().ok()?.get(uri).cloned());
+        if !resume_session {
+            upload_id = Some(new_upload_id());
+        }
+
         let mut metadata = serde_json::Map::new();
         metadata.insert(
             "name".to_string(),
@@ -819,9 +832,14 @@ impl DriveClient {
                 serde_json::Value::String(unix_secs_to_rfc3339(mtime)),
             );
         }
-        let metadata_json = serde_json::Value::Object(metadata);
+        if let Some(upload_id) = &upload_id {
+            metadata.insert(
+                "appProperties".to_string(),
+                serde_json::json!({ UPLOAD_ID_PROPERTY: upload_id }),
+            );
+        }
+        let mut metadata_json = serde_json::Value::Object(metadata);
 
-        let resume_session = session_uri.is_some();
         let uri = match session_uri.as_ref() {
             Some(uri) => uri.clone(),
             None => {
@@ -834,6 +852,11 @@ impl DriveClient {
                     )
                     .await?;
                 *session_uri = Some(uri.clone());
+                if let Some(upload_id) = upload_id.as_ref() {
+                    if let Ok(mut session_ids) = self.upload_session_ids.lock() {
+                        session_ids.insert(uri.clone(), upload_id.clone());
+                    }
+                }
                 uri
             }
         };
@@ -843,53 +866,77 @@ impl DriveClient {
                 .upload_file_to_session_uri(&uri, &mut file, total_size, mime_type, true)
                 .await
             {
-                Ok(uploaded) => return Ok(uploaded),
+                Ok(uploaded) => {
+                    if let Ok(mut session_ids) = self.upload_session_ids.lock() {
+                        session_ids.remove(&uri);
+                    }
+                    return Ok(uploaded);
+                }
                 Err(error) if is_expired_upload_session(&error) => {
-                    if let Some(uploaded) = self
-                        .find_uploaded_file(
-                            parent_drive_id,
-                            name,
-                            mime_type,
-                            total_size,
-                            modified_time,
-                        )
-                        .await?
-                    {
-                        *session_uri = None;
-                        return Ok(uploaded);
+                    if let Some(upload_id) = upload_id.as_deref() {
+                        if let Some(uploaded) =
+                            self.find_uploaded_file(parent_drive_id, upload_id).await?
+                        {
+                            *session_uri = None;
+                            if let Ok(mut session_ids) = self.upload_session_ids.lock() {
+                                session_ids.remove(&uri);
+                            }
+                            return Ok(uploaded);
+                        }
                     }
 
                     *session_uri = None;
+                    if let Ok(mut session_ids) = self.upload_session_ids.lock() {
+                        session_ids.remove(&uri);
+                    }
+                    let upload_id = new_upload_id();
+                    metadata_json["appProperties"] =
+                        serde_json::json!({ UPLOAD_ID_PROPERTY: upload_id });
                     let uri = self
                         .initiate_resumable_session(None, mime_type, total_size, &metadata_json)
                         .await?;
                     *session_uri = Some(uri.clone());
-                    self.upload_file_to_session_uri(&uri, &mut file, total_size, mime_type, false)
-                        .await
+                    if let Ok(mut session_ids) = self.upload_session_ids.lock() {
+                        session_ids.insert(uri.clone(), upload_id);
+                    }
+                    let result = self
+                        .upload_file_to_session_uri(&uri, &mut file, total_size, mime_type, false)
+                        .await;
+                    if result.is_ok() {
+                        if let Ok(mut session_ids) = self.upload_session_ids.lock() {
+                            session_ids.remove(&uri);
+                        }
+                    }
+                    result
                 }
                 Err(error) => Err(error),
             }
         } else {
-            self.upload_file_to_session_uri(&uri, &mut file, total_size, mime_type, false)
-                .await
+            let result = self
+                .upload_file_to_session_uri(&uri, &mut file, total_size, mime_type, false)
+                .await;
+            if result.is_ok() {
+                if let Ok(mut session_ids) = self.upload_session_ids.lock() {
+                    session_ids.remove(&uri);
+                }
+            }
+            result
         }
     }
 
     async fn find_uploaded_file(
         &self,
         parent_drive_id: &str,
-        name: &str,
-        mime_type: &str,
-        total_size: u64,
-        modified_time: Option<i64>,
+        upload_id: &str,
     ) -> Result<Option<DriveFile>, ApiError> {
-        let files = self.list_children(parent_drive_id).await?;
-        let mut matches = files.into_iter().filter(|file| {
-            file.name == name
-                && file.mime_type == mime_type
-                && file.size == total_size
-                && modified_time.map_or(true, |mtime| file.modified_time == mtime)
-        });
+        let query = format!(
+            "'{}' in parents and trashed = false and appProperties has {{ key='{}' and value='{}' }}",
+            escape_drive_query_literal(parent_drive_id),
+            UPLOAD_ID_PROPERTY,
+            escape_drive_query_literal(upload_id),
+        );
+        let files = self.list_files_with_query(&query).await?;
+        let mut matches = files.into_iter();
         let Some(file) = matches.next() else {
             return Ok(None);
         };
@@ -1166,6 +1213,20 @@ fn is_expired_upload_session(error: &ApiError) -> bool {
     matches!(
         error,
         ApiError::NotFound(_) | ApiError::UnexpectedStatus { status: 410, .. }
+    )
+}
+
+fn new_upload_id() -> String {
+    static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(1);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        timestamp,
+        NEXT_UPLOAD_ID.fetch_add(1, Ordering::Relaxed)
     )
 }
 
@@ -2117,6 +2178,12 @@ mod tests {
             let request =
                 String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
             assert!(request.starts_with("POST /upload/drive/v3/files?uploadType=resumable"));
+            let metadata: serde_json::Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let upload_id = metadata["appProperties"][UPLOAD_ID_PROPERTY]
+                .as_str()
+                .unwrap()
+                .to_string();
             let session_url = format!("http://{}/upload/drive/v3/session/expired", addr);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -2149,7 +2216,12 @@ mod tests {
             let request =
                 String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
             assert!(request.starts_with("GET /drive/v3/files?"));
-            let body = r#"{"files":[{"id":"already_created","name":"retry.txt","mimeType":"text/plain","size":"11","parents":["root"]}]}"#;
+            assert!(request.contains("appProperties"));
+            assert!(request.contains(&upload_id));
+            let body = format!(
+                r#"{{"files":[{{"id":"already_created","name":"retry.txt","mimeType":"text/plain","size":"11","parents":["root"],"appProperties":{{"{}":"{}"}}}}]}}"#,
+                UPLOAD_ID_PROPERTY, upload_id
+            );
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -2200,7 +2272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_expired_creation_session_is_replaced_when_file_is_missing() {
+    async fn test_expired_creation_session_does_not_adopt_metadata_only_match() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_handle = tokio::spawn(async move {
@@ -2237,6 +2309,7 @@ mod tests {
             let request =
                 String::from_utf8_lossy(&read_full_request(&mut stream).await).into_owned();
             assert!(request.starts_with("GET /drive/v3/files?"));
+            assert!(request.contains("appProperties"));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"files\":[]}")
                 .await
