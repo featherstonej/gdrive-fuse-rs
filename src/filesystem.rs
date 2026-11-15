@@ -655,6 +655,7 @@ impl GDriveFS {
 
     fn track_open_handle(&mut self, ino: u64, fh: u64, flags: i32) {
         self.open_handles.entry(ino).or_default().insert(fh, flags);
+        self.cache.retain_open_inode(ino);
     }
 
     fn is_handle_writable(&self, ino: u64, fh: u64) -> bool {
@@ -669,13 +670,18 @@ impl GDriveFS {
 
     fn untrack_open_handle(&mut self, ino: u64, fh: u64) -> bool {
         let mut was_writable = false;
+        let mut was_open = false;
         if let Some(handles) = self.open_handles.get_mut(&ino) {
             if let Some(flags) = handles.remove(&fh) {
                 was_writable = (flags & WRITE_OPEN_FLAGS) != 0;
+                was_open = true;
             }
             if handles.is_empty() {
                 self.open_handles.remove(&ino);
             }
+        }
+        if was_open {
+            self.cache.release_open_inode(ino);
         }
         if let Some(st) = self.staged_files.get_mut(&ino) {
             if st.open_handles.remove(&fh) {
@@ -3871,11 +3877,44 @@ mod tests {
         });
 
         let auth = Arc::new(AuthManager::new_static_for_test("test-token"));
-        let api = DriveClient::with_base_url(auth, format!("http://{}/drive/v3", addr)).unwrap();
-        let cache = MetadataCache::open_in_memory(300).unwrap();
+        let api = Arc::new(
+            DriveClient::with_base_url(auth, format!("http://{}/drive/v3", addr)).unwrap(),
+        );
+        let cache = Arc::new(MetadataCache::open_in_memory(300).unwrap());
         cache.set_change_page_token("expired_tok_1").unwrap();
-        cache.sync_directory_children(FUSE_ROOT_ID, &[]).unwrap();
+        cache
+            .sync_directory_children(
+                FUSE_ROOT_ID,
+                &[crate::api::DriveFile {
+                    id: "open_file".to_string(),
+                    name: "open.txt".to_string(),
+                    mime_type: "text/plain".to_string(),
+                    size: 0,
+                    modified_time: 1_700_000_100,
+                    parents: vec!["root".to_string()],
+                    trashed: false,
+                    web_view_link: None,
+                }],
+            )
+            .unwrap();
         assert!(!cache.is_dir_stale(FUSE_ROOT_ID).unwrap());
+
+        let file = cache.get_by_drive_id("open_file").unwrap().unwrap();
+        let mut fs = GDriveFS::with_full_config(
+            api.clone(),
+            Arc::clone(&cache),
+            Handle::current(),
+            DEFAULT_ATTR_TTL,
+            DEFAULT_READ_CHUNK_SIZE,
+            GoogleDocsMode::Browser,
+            true,
+        );
+        let fh = fs
+            .handle_open_with_fh(file.inode, libc::O_RDONLY)
+            .expect("opening file must retain its inode mapping");
+        let second_fh = fs
+            .handle_open_with_fh(file.inode, libc::O_RDONLY)
+            .expect("multiple open handles must retain the inode mapping");
 
         let count = sync_changes_once(&api, &cache)
             .await
@@ -3886,6 +3925,26 @@ mod tests {
             Some("fresh_tok_500")
         );
         assert!(cache.is_dir_stale(FUSE_ROOT_ID).unwrap());
+        assert!(cache.get_by_inode(file.inode).unwrap().is_some());
+        assert_eq!(
+            cache
+                .lookup_child(FUSE_ROOT_ID, "open.txt")
+                .unwrap()
+                .unwrap()
+                .inode,
+            file.inode
+        );
+        assert_eq!(
+            fs.handle_read(file.inode, 0, 10).unwrap(),
+            Bytes::new(),
+            "an open file must remain readable after cache recovery"
+        );
+        fs.handle_release(file.inode, fh).unwrap();
+        cache.clear_all().unwrap();
+        assert!(cache.get_by_inode(file.inode).unwrap().is_some());
+        fs.handle_release(file.inode, second_fh).unwrap();
+        cache.clear_all().unwrap();
+        assert!(cache.get_by_inode(file.inode).unwrap().is_none());
 
         server_handle.await.unwrap();
     }

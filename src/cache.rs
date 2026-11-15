@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 use crate::api::{ChangeItem, DriveFile, FOLDER_MIME_TYPE, GOOGLE_APPS_MIME_PREFIX};
 
@@ -141,6 +141,7 @@ pub struct MetadataCache {
     conn: Mutex<Connection>,
     ttl_secs: u64,
     evicted_inodes: Mutex<HashSet<u64>>,
+    open_inode_counts: Mutex<HashMap<u64, usize>>,
     removal_tracker: Mutex<RemovalTracker>,
     staging_namespace: Option<String>,
 }
@@ -500,6 +501,7 @@ impl MetadataCache {
             conn: Mutex::new(conn),
             ttl_secs,
             evicted_inodes: Mutex::new(HashSet::new()),
+            open_inode_counts: Mutex::new(HashMap::new()),
             removal_tracker: Mutex::new(RemovalTracker::default()),
             staging_namespace: None,
         })
@@ -1395,6 +1397,24 @@ impl MetadataCache {
         }
     }
 
+    pub(crate) fn retain_open_inode(&self, inode: u64) {
+        if let Ok(mut counts) = self.open_inode_counts.lock() {
+            let count = counts.entry(inode).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn release_open_inode(&self, inode: u64) {
+        if let Ok(mut counts) = self.open_inode_counts.lock() {
+            if let Some(count) = counts.get_mut(&inode) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.remove(&inode);
+                }
+            }
+        }
+    }
+
     /// Drains the inodes removed remotely so the FUSE layer can defer deleting open file records.
     pub fn take_removed_inodes(&self) -> Vec<RemovedInode> {
         match self.removal_tracker.lock() {
@@ -1447,31 +1467,53 @@ impl MetadataCache {
     }
 
     /// Clears all clean cached files, directory edges, and sync state while preserving reserved root (`1`),
-    /// "Shared with me" (`2`), and any locally dirty/pending inodes (along with their ancestor directory chain
-    /// and parent-child edges so nested dirty files remain reachable).
+    /// "Shared with me" (`2`), open inodes, and any locally dirty/pending inodes (along with their ancestor
+    /// directory chain and parent-child edges so nested dirty files remain reachable).
     pub fn clear_all(&self) -> Result<(), CacheError> {
-        let mut conn = self.lock_conn()?;
-        let tx = conn.transaction()?;
-
-        const PRESERVED_CTE: &str = "
-            WITH RECURSIVE preserved(inode) AS (
+        let open_inode_counts = self
+            .open_inode_counts
+            .lock()
+            .map_err(|_| CacheError::LockPoisoned)?;
+        let open_inodes = open_inode_counts
+            .keys()
+            .map(|inode| *inode as i64)
+            .collect::<Vec<_>>();
+        let open_inode_clause = if open_inodes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " OR inode IN ({})",
+                std::iter::repeat("?")
+                    .take(open_inodes.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let preserved_cte = format!(
+            "WITH RECURSIVE preserved(inode) AS (
                 SELECT inode FROM files
-                WHERE inode <= ?1 OR dirty != 0 OR drive_id LIKE 'pending:%'
+                WHERE inode <= ?1 OR dirty != 0 OR drive_id LIKE 'pending:%'{open_inode_clause}
                 UNION
                 SELECT pc.parent_inode
                 FROM parent_child pc
                 INNER JOIN preserved p ON pc.child_inode = p.inode
-            )
-        ";
+            )"
+        );
+        let mut preserved_params = Vec::with_capacity(open_inodes.len() + 1);
+        preserved_params.push(SHARED_WITH_ME_INODE as i64);
+        preserved_params.extend(open_inodes);
+
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
 
         let mut evicted_inodes = Vec::new();
         {
             let sql = format!(
                 "{} SELECT inode FROM files WHERE inode NOT IN (SELECT inode FROM preserved)",
-                PRESERVED_CTE
+                preserved_cte
             );
             let mut stmt = tx.prepare(&sql)?;
-            let rows = stmt.query_map(params![SHARED_WITH_ME_INODE as i64], |r| {
+            let rows = stmt.query_map(params_from_iter(preserved_params.iter().copied()), |r| {
                 let ino: i64 = r.get(0)?;
                 Ok(ino as u64)
             })?;
@@ -1482,17 +1524,23 @@ impl MetadataCache {
 
         let delete_edges_sql = format!(
             "{} DELETE FROM parent_child WHERE child_inode NOT IN (SELECT inode FROM preserved) OR parent_inode NOT IN (SELECT inode FROM preserved)",
-            PRESERVED_CTE
+            preserved_cte
         );
-        tx.execute(&delete_edges_sql, params![SHARED_WITH_ME_INODE as i64])?;
+        tx.execute(
+            &delete_edges_sql,
+            params_from_iter(preserved_params.iter().copied()),
+        )?;
 
         tx.execute("DELETE FROM sync_state", [])?;
 
         let delete_files_sql = format!(
             "{} DELETE FROM files WHERE inode NOT IN (SELECT inode FROM preserved)",
-            PRESERVED_CTE
+            preserved_cte
         );
-        tx.execute(&delete_files_sql, params![SHARED_WITH_ME_INODE as i64])?;
+        tx.execute(
+            &delete_files_sql,
+            params_from_iter(preserved_params.iter().copied()),
+        )?;
 
         tx.execute("UPDATE files SET last_synced_at = NULL WHERE is_dir != 0", [])?;
 
