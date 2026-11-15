@@ -1066,6 +1066,8 @@ impl GDriveFS {
             e.to_errno()
         })?;
 
+        // Cache `effective_name` values are internal keys; FUSE-visible names must use the
+        // original file name so native-document extensions and collisions are handled here.
         let raw_display_names: Vec<String> = children
             .iter()
             .map(|entry| {
@@ -3840,6 +3842,101 @@ mod tests {
         assert_eq!(
             fs.handle_access(FUSE_ROOT_ID, libc::R_OK | libc::W_OK),
             Err(libc::EROFS)
+        );
+    }
+
+    #[test]
+    fn test_display_names_after_cache_insert_and_rename_use_fuse_names() {
+        let rt = Runtime::new().unwrap();
+        let fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+        let native_doc = crate::api::DriveFile {
+            id: "doc_plan".to_string(),
+            name: "Plan".to_string(),
+            mime_type: "application/vnd.google-apps.document".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let other_file = crate::api::DriveFile {
+            id: "file_other".to_string(),
+            name: "Other".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let entries = fs
+            .cache
+            .sync_directory_children(FUSE_ROOT_ID, &[native_doc, other_file.clone()])
+            .unwrap();
+        let other_inode = entries
+            .iter()
+            .find(|entry| entry.file.drive_id == other_file.id)
+            .unwrap()
+            .inode;
+
+        let folder = crate::api::DriveFile {
+            id: "folder_plan".to_string(),
+            name: "Plan".to_string(),
+            mime_type: FOLDER_MIME_TYPE.to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+        let inserted_folder = fs
+            .cache
+            .insert_child_file(FUSE_ROOT_ID, "Plan", &folder)
+            .unwrap();
+        assert_eq!(inserted_folder.effective_name, "Plan (1)");
+        assert_eq!(
+            fs.find_child_by_display_name(FUSE_ROOT_ID, "Plan")
+                .unwrap()
+                .unwrap()
+                .drive_id,
+            "folder_plan"
+        );
+        assert_eq!(
+            fs.find_child_by_display_name(FUSE_ROOT_ID, "Plan.gdoc")
+                .unwrap()
+                .unwrap()
+                .drive_id,
+            "doc_plan"
+        );
+
+        let mut renamed_file = other_file;
+        renamed_file.name = "Plan (1)".to_string();
+        fs.cache
+            .rename_entry(
+                FUSE_ROOT_ID,
+                other_inode,
+                FUSE_ROOT_ID,
+                "Plan (1)",
+                Some(&renamed_file),
+            )
+            .unwrap();
+        assert_eq!(
+            fs.find_child_by_display_name(FUSE_ROOT_ID, "Plan (1)")
+                .unwrap()
+                .unwrap()
+                .drive_id,
+            "file_other"
+        );
+        assert_eq!(
+            fs.find_child_by_display_name(FUSE_ROOT_ID, "Plan.gdoc")
+                .unwrap()
+                .unwrap()
+                .drive_id,
+            "doc_plan"
         );
     }
 
