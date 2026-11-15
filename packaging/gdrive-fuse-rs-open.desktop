@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Google Drive Web Document
+Comment=Open Google Workspace document in default web browser
+Exec=/usr/bin/gdrive-fuse-rs --open-doc %f
+Icon=text-html
+Terminal=false
+NoDisplay=true
+MimeType=application/x-gdrive-doc;application/x-gdrive-sheet;application/x-gdrive-slides;application/x-gdrive-link;

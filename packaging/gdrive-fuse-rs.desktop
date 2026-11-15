@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Google Drive (gdrive-fuse-rs)
+GenericName=Google Drive Cloud Storage
+Comment=Sign in and mount your Google Drive folder in GNOME Files
+Exec=/usr/bin/gdrive-fuse-rs --setup
+Icon=folder-remote
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=Google;Drive;Cloud;FUSE;Mount;
+StartupNotify=true

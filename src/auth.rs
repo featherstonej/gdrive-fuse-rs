@@ -90,6 +90,7 @@ pub enum GoogleDocsMode {
 /// User configuration loaded from `~/.config/gdrive-fuse-rs/config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
+    pub mount_point_path: Option<PathBuf>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub cache_ttl_secs: Option<u64>,
