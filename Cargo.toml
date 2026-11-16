@@ -17,7 +17,7 @@ fuser = { version = "0.14", default-features = false }
 libc = "0.2"
 
 # HTTP & API Client
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2", "system-proxy", "json", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 url = "2.5"
@@ -41,3 +41,56 @@ anyhow = "1.0"
 env_logger = "0.11"
 log = "0.4"
 clap = { version = "4.5", features = ["derive", "env"] }
+
+[package.metadata.deb]
+maintainer = "featherstonej"
+copyright = "2026, featherstonej"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+A lightweight, memory-safe Google Drive FUSE filesystem written in Rust for Linux and GNOME. \
+Supports on-demand streaming, clickable Google Docs/Sheets/Slides shortcuts, real storage quota \
+reporting, background incremental change sync, and resumable read-write uploads."""
+depends = "$auto, fuse3"
+recommends = "gnome-keyring, xdg-utils"
+section = "utils"
+priority = "optional"
+maintainer-scripts = "packaging/debian"
+assets = [
+    ["target/release/gdrive-fuse-rs", "usr/bin/", "755"],
+    ["packaging/gdrive-fuse-rs.service", "usr/lib/systemd/user/", "644"],
+    ["packaging/gdrive-fuse-rs.desktop", "usr/share/applications/", "644"],
+    ["packaging/gdrive-fuse-rs-open.desktop", "usr/share/applications/", "644"],
+    ["packaging/gdrive-fuse-rs.xml", "usr/share/mime/packages/", "644"],
+    ["README.md", "usr/share/doc/gdrive-fuse-rs/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Lightweight, memory-safe Google Drive FUSE filesystem for Linux and GNOME"
+license = "GPL-3.0-only"
+post_install_script = """
+if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database /usr/share/mime >/dev/null 2>&1 || :
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database /usr/share/applications >/dev/null 2>&1 || :
+fi
+"""
+post_uninstall_script = """
+if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database /usr/share/mime >/dev/null 2>&1 || :
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database /usr/share/applications >/dev/null 2>&1 || :
+fi
+"""
+assets = [
+    { source = "target/release/gdrive-fuse-rs", dest = "/usr/bin/gdrive-fuse-rs", mode = "755" },
+    { source = "packaging/gdrive-fuse-rs.service", dest = "/usr/lib/systemd/user/gdrive-fuse-rs.service", mode = "644" },
+    { source = "packaging/gdrive-fuse-rs.desktop", dest = "/usr/share/applications/gdrive-fuse-rs.desktop", mode = "644" },
+    { source = "packaging/gdrive-fuse-rs-open.desktop", dest = "/usr/share/applications/gdrive-fuse-rs-open.desktop", mode = "644" },
+    { source = "packaging/gdrive-fuse-rs.xml", dest = "/usr/share/mime/packages/gdrive-fuse-rs.xml", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/gdrive-fuse-rs/README.md", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+fuse3 = "*"

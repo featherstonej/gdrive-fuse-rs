@@ -1,0 +1,92 @@
+name: Release Packages (.deb, .rpm, .tar.gz)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-packages:
+    name: Build Linux Packages (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install FUSE runtime for tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+
+      - name: Run test suite and Clippy
+        run: |
+          cargo test
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Build optimized release binary
+        env:
+          GDRIVE_DEFAULT_CLIENT_ID: ${{ secrets.GDRIVE_DEFAULT_CLIENT_ID }}
+          GDRIVE_DEFAULT_CLIENT_SECRET: ${{ secrets.GDRIVE_DEFAULT_CLIENT_SECRET }}
+        run: |
+          cargo build --release --locked
+          ldd target/release/gdrive-fuse-rs
+
+      - name: Install cargo-deb and cargo-generate-rpm
+        run: |
+          cargo install cargo-deb cargo-generate-rpm
+
+      - name: Package .deb and .rpm and standalone .tar.gz
+        run: |
+          mkdir -p dist
+          cargo deb --no-build
+          cp target/debian/*.deb dist/
+
+          strip -s target/release/gdrive-fuse-rs
+          cargo generate-rpm
+          cp target/generate-rpm/*.rpm dist/
+
+          STAGE_DIR="dist/gdrive-fuse-rs-x86_64-unknown-linux-gnu"
+          mkdir -p "$STAGE_DIR/packaging"
+          cp target/release/gdrive-fuse-rs "$STAGE_DIR/"
+          cp README.md LICENSE "$STAGE_DIR/"
+          cp packaging/gdrive-fuse-rs.service \
+             packaging/gdrive-fuse-rs.desktop \
+             packaging/gdrive-fuse-rs-open.desktop \
+             packaging/gdrive-fuse-rs.xml \
+             "$STAGE_DIR/packaging/"
+          tar -C dist -czf dist/gdrive-fuse-rs-x86_64-unknown-linux-gnu.tar.gz gdrive-fuse-rs-x86_64-unknown-linux-gnu
+          rm -rf "$STAGE_DIR"
+
+          cd dist
+          sha256sum *.deb *.rpm *.tar.gz > SHA256SUMS.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdrive-fuse-rs-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

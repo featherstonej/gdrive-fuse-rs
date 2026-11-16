@@ -31,7 +31,7 @@ pub const DEFAULT_CHANGE_POLL_SECS: u64 = 30;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "gdrive-fuse-rs", version, about, long_about = None)]
 pub struct CliArgs {
-    /// Local directory path where Google Drive will be mounted.
+    /// Local directory path where Google Drive will be mounted (defaults to ~/GoogleDrive).
     #[arg(short = 'm', long = "mount-point", value_name = "PATH")]
     pub mount_point: Option<PathBuf>,
 
@@ -99,6 +99,10 @@ pub struct CliArgs {
     #[arg(long = "install-systemd", default_value_t = false)]
     pub install_systemd: bool,
 
+    /// Sign in with Google, enable and start the background systemd user service, and open the mount directory.
+    #[arg(long = "setup", default_value_t = false)]
+    pub setup: bool,
+
     /// Open a `.gdoc`, `.gsheet`, `.gslides`, or `.gdrive` shortcut file in the default web browser.
     #[arg(long = "open-doc", value_name = "FILE")]
     pub open_doc: Option<PathBuf>,
@@ -117,7 +121,7 @@ fn main() -> Result<()> {
 
     let args = CliArgs::parse();
 
-    if args.install_systemd && args.client_secret.is_some() {
+    if (args.install_systemd || args.setup) && args.client_secret.is_some() {
         bail!(
             "--client-secret cannot be stored in a systemd unit; configure it in the config file or system keyring"
         );
@@ -142,7 +146,7 @@ fn main() -> Result<()> {
         clear_keyring_credentials()
             .context("Failed to clear OAuth2 credentials from system keyring")?;
         log::info!("Cleared stored Google Drive OAuth2 credentials from system keyring.");
-        if args.mount_point.is_none() && !args.clear_cache && !args.install_systemd {
+        if args.mount_point.is_none() && !args.clear_cache && !args.install_systemd && !args.setup {
             return Ok(());
         }
     }
@@ -171,61 +175,31 @@ fn main() -> Result<()> {
         };
         let _ = MetadataCache::clear_staging_dir(&stage_dir);
         log::info!("Removed SQLite metadata cache at {}.", db_path.display());
-        if args.mount_point.is_none() && !args.install_systemd {
+        if args.mount_point.is_none() && !args.install_systemd && !args.setup {
             return Ok(());
         }
     }
 
-    if args.install_systemd {
-        let exe_path = std::env::current_exe()
-            .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/gdrive-fuse-rs"));
-        let cwd = std::env::current_dir().context("Failed to resolve paths for systemd unit")?;
-        let absolute_path = |path: PathBuf| {
-            if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            }
-        };
-        let unit_mount_point = absolute_path(args.mount_point.clone().unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join("GoogleDrive")
-        }));
-        let mut unit_cli_args = args.clone();
-        unit_cli_args.config = unit_cli_args.config.map(&absolute_path);
-        unit_cli_args.cache_db = unit_cli_args.cache_db.map(&absolute_path);
-        unit_cli_args.staging_dir = unit_cli_args.staging_dir.map(&absolute_path);
-        let unit_args = systemd_mount_args(&unit_cli_args);
-        let unit_contents = generate_systemd_unit(&exe_path, &unit_mount_point, &unit_args);
-        let config_dir = dirs::config_dir()
-            .context("Could not determine user ~/.config directory for systemd unit")?;
-        let unit_dir = config_dir.join("systemd").join("user");
-        std::fs::create_dir_all(&unit_dir).with_context(|| {
-            format!(
-                "Failed to create systemd user unit directory {}",
-                unit_dir.display()
-            )
-        })?;
-        let unit_path = unit_dir.join("gdrive-fuse-rs.service");
-        std::fs::write(&unit_path, unit_contents).with_context(|| {
-            format!(
-                "Failed to write systemd unit file to {}",
-                unit_path.display()
-            )
-        })?;
-        log::info!(
-            "Installed systemd user unit to {}. Run:\n  systemctl --user daemon-reload && systemctl --user enable --now gdrive-fuse-rs.service",
-            unit_path.display()
-        );
-        if args.mount_point.is_none() {
+    if args.install_systemd || args.setup {
+        let unit_mount_point = install_user_systemd_unit(&args, &config)?;
+        if !args.setup && args.mount_point.is_none() {
             return Ok(());
+        }
+        if args.setup {
+            return run_guided_setup(&args, &config, &unit_mount_point);
         }
     }
 
-    let mount_point = args
-        .mount_point
-        .context("Missing required --mount-point <PATH> argument")?;
+    let (mount_point, auto_create_mount_point) =
+        resolve_mount_point(args.mount_point.clone(), config.mount_point_path.clone());
+    if auto_create_mount_point && !mount_point.exists() {
+        std::fs::create_dir_all(&mount_point).with_context(|| {
+            format!(
+                "Failed to create default mount point directory {}",
+                mount_point.display()
+            )
+        })?;
+    }
 
     if !mount_point.exists() {
         bail!(
@@ -627,6 +601,134 @@ fn systemd_mount_args(args: &CliArgs) -> Vec<String> {
     unit_args
 }
 
+/// Returns the default user mount point (`~/GoogleDrive`).
+pub fn default_mount_point() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("GoogleDrive")
+}
+
+/// Resolves the target mount point in priority order:
+/// 1. CLI `--mount-point <PATH>` (`auto_create = false`)
+/// 2. `config.toml` `mount_point_path` (`auto_create = false`)
+/// 3. Default `~/GoogleDrive` (`auto_create = true`)
+pub fn resolve_mount_point(
+    cli_mount: Option<PathBuf>,
+    config_mount: Option<PathBuf>,
+) -> (PathBuf, bool) {
+    if let Some(path) = cli_mount {
+        (path, false)
+    } else if let Some(path) = config_mount {
+        (path, false)
+    } else {
+        (default_mount_point(), true)
+    }
+}
+
+fn install_user_systemd_unit(args: &CliArgs, config: &AppConfig) -> Result<PathBuf> {
+    let exe_path =
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/gdrive-fuse-rs"));
+    let cwd = std::env::current_dir().context("Failed to resolve paths for systemd unit")?;
+    let absolute_path = |path: PathBuf| {
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    };
+    let (raw_mount, _) =
+        resolve_mount_point(args.mount_point.clone(), config.mount_point_path.clone());
+    let unit_mount_point = absolute_path(raw_mount);
+    let mut unit_cli_args = args.clone();
+    unit_cli_args.config = unit_cli_args.config.map(&absolute_path);
+    unit_cli_args.cache_db = unit_cli_args.cache_db.map(&absolute_path);
+    unit_cli_args.staging_dir = unit_cli_args.staging_dir.map(&absolute_path);
+    let unit_args = systemd_mount_args(&unit_cli_args);
+    let unit_contents = generate_systemd_unit(&exe_path, &unit_mount_point, &unit_args);
+    let config_dir = dirs::config_dir()
+        .context("Could not determine user ~/.config directory for systemd unit")?;
+    let unit_dir = config_dir.join("systemd").join("user");
+    std::fs::create_dir_all(&unit_dir).with_context(|| {
+        format!(
+            "Failed to create systemd user unit directory {}",
+            unit_dir.display()
+        )
+    })?;
+    let unit_path = unit_dir.join("gdrive-fuse-rs.service");
+    std::fs::write(&unit_path, unit_contents).with_context(|| {
+        format!(
+            "Failed to write systemd unit file to {}",
+            unit_path.display()
+        )
+    })?;
+    log::info!(
+        "Installed systemd user unit to {}. Run:\n  systemctl --user daemon-reload && systemctl --user enable --now gdrive-fuse-rs.service",
+        unit_path.display()
+    );
+    Ok(unit_mount_point)
+}
+
+fn run_guided_setup(args: &CliArgs, config: &AppConfig, mount_point: &Path) -> Result<()> {
+    std::fs::create_dir_all(mount_point).with_context(|| {
+        format!(
+            "Failed to create mount point directory {}",
+            mount_point.display()
+        )
+    })?;
+
+    let credentials =
+        resolve_credentials(args.client_id.clone(), args.client_secret.clone(), config)
+            .context("Failed to resolve Google OAuth2 client credentials")?;
+    let read_only = args.read_only || config.read_only.unwrap_or(false);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to initialize Tokio async runtime")?;
+
+    log::info!(
+        "Completing Google Drive OAuth2 sign-in (mode={})...",
+        if read_only { "read-only" } else { "read-write" }
+    );
+    rt.block_on(AuthManager::authenticate_with_mode(
+        credentials,
+        !args.no_browser,
+        read_only,
+    ))
+    .context("Google OAuth2 authentication failed during setup")?;
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        let _ = install_gdrive_mime_handlers(&exe_path);
+    }
+
+    let reload_ok = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()
+        .is_ok_and(|s| s.success());
+    let enable_ok = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "--now", "gdrive-fuse-rs.service"])
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if reload_ok && enable_ok {
+        log::info!(
+            "Enabled and started gdrive-fuse-rs.service (mounted at {}).",
+            mount_point.display()
+        );
+    } else {
+        log::warn!(
+            "Could not automatically start systemd user service; you can mount directly with: gdrive-fuse-rs --mount-point {}",
+            mount_point.display()
+        );
+    }
+
+    if !args.no_browser {
+        let _ = open::that(mount_point);
+    }
+
+    Ok(())
+}
+
 fn resolve_chunk_size(cli_size: Option<usize>, config_size: Option<usize>) -> Result<usize> {
     let chunk_size = cli_size.or(config_size).unwrap_or(DEFAULT_READ_CHUNK_SIZE);
     if chunk_size > MAX_READ_CHUNK_SIZE {
@@ -863,5 +965,36 @@ mod tests {
         assert!(ro_allow_other_opts.contains(&MountOption::RO));
         assert!(ro_allow_other_opts.contains(&MountOption::AllowOther));
         assert!(ro_allow_other_opts.contains(&MountOption::AutoUnmount));
+    }
+
+    #[test]
+    fn test_resolve_mount_point_priority_and_default_auto_create_flag() {
+        let (cli_mp, cli_auto) = resolve_mount_point(
+            Some(PathBuf::from("/cli/mount")),
+            Some(PathBuf::from("/cfg/mount")),
+        );
+        assert_eq!(cli_mp, PathBuf::from("/cli/mount"));
+        assert!(!cli_auto);
+
+        let (cfg_mp, cfg_auto) = resolve_mount_point(None, Some(PathBuf::from("/cfg/mount")));
+        assert_eq!(cfg_mp, PathBuf::from("/cfg/mount"));
+        assert!(!cfg_auto);
+
+        let (def_mp, def_auto) = resolve_mount_point(None, None);
+        assert_eq!(def_mp, default_mount_point());
+        assert!(def_mp.ends_with("GoogleDrive"));
+        assert!(def_auto);
+    }
+
+    #[test]
+    fn test_cli_setup_flag_and_zero_arg_parsing() {
+        let zero_args =
+            CliArgs::try_parse_from(["gdrive-fuse-rs"]).expect("Zero arguments must parse");
+        assert!(zero_args.mount_point.is_none());
+        assert!(!zero_args.setup);
+
+        let setup_args = CliArgs::try_parse_from(["gdrive-fuse-rs", "--setup"])
+            .expect("--setup flag must parse");
+        assert!(setup_args.setup);
     }
 }

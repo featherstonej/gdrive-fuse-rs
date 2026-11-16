@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-gdrive-doc">
+    <comment>Google Docs Shortcut</comment>
+    <glob pattern="*.gdoc"/>
+  </mime-type>
+  <mime-type type="application/x-gdrive-sheet">
+    <comment>Google Sheets Shortcut</comment>
+    <glob pattern="*.gsheet"/>
+  </mime-type>
+  <mime-type type="application/x-gdrive-slides">
+    <comment>Google Slides Shortcut</comment>
+    <glob pattern="*.gslides"/>
+  </mime-type>
+  <mime-type type="application/x-gdrive-link">
+    <comment>Google Drive Web Shortcut</comment>
+    <glob pattern="*.gdrive"/>
+  </mime-type>
+</mime-info>
