@@ -807,6 +807,20 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         && std::fs::metadata(&unit_mount_point).is_ok();
 
     if already_mounted_healthy {
+        let reload_status = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .context("Failed to reload systemd user units")?;
+        if !reload_status.success() {
+            bail!("Failed to reload systemd user units");
+        }
+        let enable_status = std::process::Command::new("systemctl")
+            .args(["--user", "enable", "gdrive-fuse-rs.service"])
+            .status()
+            .context("Failed to enable gdrive-fuse-rs.service")?;
+        if !enable_status.success() {
+            bail!("Failed to enable gdrive-fuse-rs.service");
+        }
         if !args.no_browser {
             let _ = open::that(&unit_mount_point);
         }
