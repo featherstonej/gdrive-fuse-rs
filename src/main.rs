@@ -855,10 +855,13 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         .status()
         .is_ok_and(|s| s.success());
 
-    if enable_autostart {
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "enable", "gdrive-fuse-rs.service"])
-            .status();
+    let action = if enable_autostart { "enable" } else { "disable" };
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", action, "gdrive-fuse-rs.service"])
+        .status()
+        .with_context(|| format!("Failed to run systemctl --user {action}"))?;
+    if !status.success() {
+        bail!("Failed to {action} gdrive-fuse-rs.service for login auto-mount");
     }
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "stop", "gdrive-fuse-rs.service"])
