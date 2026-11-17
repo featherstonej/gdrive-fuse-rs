@@ -957,7 +957,9 @@ pub fn is_fuse_mounted_in_proc_mounts(proc_mounts: &str, mount_point: &Path) -> 
         let Some(fstype) = cols.next() else {
             continue;
         };
-        if !fstype.starts_with("fuse") {
+        if !matches!(_device, Some("gdrive") | Some("gdrive-fuse-rs"))
+            || !matches!(fstype, "fuse" | "fuse.gdrive-fuse-rs")
+        {
             continue;
         }
         let mp = unescape_proc_mounts_path(mp_escaped);
