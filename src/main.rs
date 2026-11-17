@@ -691,18 +691,22 @@ fn install_user_systemd_unit(args: &CliArgs, config: &AppConfig) -> Result<PathB
     Ok(unit_mount_point)
 }
 
-fn clear_local_cache_and_staging(args: &CliArgs, config: &AppConfig) -> Result<()> {
+fn cache_cleanup_paths(args: &CliArgs, config: &AppConfig) -> Result<(PathBuf, PathBuf)> {
     let db_path = args
         .cache_db
         .clone()
         .or_else(|| config.cache_db_path.clone())
         .unwrap_or_else(MetadataCache::default_db_path);
-    MetadataCache::remove_db_files(&db_path).with_context(|| {
-        format!(
-            "Failed to remove SQLite metadata cache at {}",
-            db_path.display()
-        )
-    })?;
+    let db_path = match std::fs::symlink_metadata(&db_path) {
+        Ok(_) => std::fs::canonicalize(&db_path).with_context(|| {
+            format!(
+                "Failed to resolve SQLite metadata cache at {}",
+                db_path.display()
+            )
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => db_path,
+        Err(err) => return Err(err).context("Failed to inspect SQLite metadata cache path"),
+    };
     let stage_dir = args
         .staging_dir
         .clone()
@@ -713,9 +717,33 @@ fn clear_local_cache_and_staging(args: &CliArgs, config: &AppConfig) -> Result<(
     } else {
         stage_dir
     };
+    Ok((db_path, stage_dir))
+}
+
+fn clear_local_cache_and_staging(args: &CliArgs, config: &AppConfig) -> Result<()> {
+    let (db_path, stage_dir) = cache_cleanup_paths(args, config)?;
     MetadataCache::clear_staging_dir(&stage_dir)
         .with_context(|| format!("Failed to clear staging directory {}", stage_dir.display()))?;
+    MetadataCache::remove_db_files(&db_path).with_context(|| {
+        format!(
+            "Failed to remove SQLite metadata cache at {}",
+            db_path.display()
+        )
+    })?;
     log::info!("Removed SQLite metadata cache at {}.", db_path.display());
+    Ok(())
+}
+
+fn stop_existing_service(systemctl: &std::ffi::OsStr, existing_unit: bool) -> Result<()> {
+    if existing_unit {
+        let status = std::process::Command::new(systemctl)
+            .args(["--user", "stop", "gdrive-fuse-rs.service"])
+            .status()
+            .context("Failed to stop existing gdrive-fuse-rs.service")?;
+        if !status.success() {
+            bail!("Failed to stop existing gdrive-fuse-rs.service");
+        }
+    }
     Ok(())
 }
 
@@ -748,9 +776,7 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
     let load_state = std::str::from_utf8(&service_state.stdout)
         .context("Invalid systemd service load state")?
         .trim();
-    if load_state != "not-found"
-        && (!service_state.status.success() || load_state.is_empty())
-    {
+    if load_state != "not-found" && (!service_state.status.success() || load_state.is_empty()) {
         bail!(
             "Failed to check existing gdrive-fuse-rs.service: {}",
             String::from_utf8_lossy(&service_state.stderr).trim()
@@ -811,18 +837,10 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         enable_autostart = outcome.enable_autostart;
         switch_account = outcome.switch_account;
 
-        if existing_unit {
-            let status = std::process::Command::new("systemctl")
-                .args(["--user", "stop", "gdrive-fuse-rs.service"])
-                .status()
-                .context("Failed to stop existing gdrive-fuse-rs.service")?;
-            if !status.success() {
-                bail!("Failed to stop existing gdrive-fuse-rs.service");
-            }
-        }
+        stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
         if outcome.switch_account {
-            clear_keyring_tokens().context("Failed to clear OAuth2 tokens from system keyring")?;
             clear_local_cache_and_staging(args, &active_config)?;
+            clear_keyring_tokens().context("Failed to clear OAuth2 tokens from system keyring")?;
             log::info!("Cleared previous Google account session and metadata cache.");
         }
 
@@ -832,6 +850,10 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
             })?;
             log::info!("Saved configuration to {}.", save_path.display());
         }
+    }
+
+    if !wizard_ran {
+        stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
     }
 
     let mut unit_args = args.clone();
@@ -844,47 +866,6 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         unit_args.no_shared_with_me = !active_config.shared_with_me.unwrap_or(true);
     }
     let args = &unit_args;
-    let unit_mount_point = install_user_systemd_unit(args, &active_config)?;
-    cleanup_stale_fuse_mount(&unit_mount_point);
-    std::fs::create_dir_all(&unit_mount_point).with_context(|| {
-        format!(
-            "Failed to create mount point directory {}",
-            unit_mount_point.display()
-        )
-    })?;
-    let already_mounted_healthy = !wizard_ran
-        && !args.logout
-        && !args.clear_cache
-        && std::fs::read_to_string("/proc/mounts")
-            .is_ok_and(|m| is_fuse_mounted_in_proc_mounts(&m, &unit_mount_point))
-        && std::fs::metadata(&unit_mount_point).is_ok();
-
-    if already_mounted_healthy {
-        let reload_status = std::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()
-            .context("Failed to reload systemd user units")?;
-        if !reload_status.success() {
-            bail!("Failed to reload systemd user units");
-        }
-        let action = if enable_autostart {
-            "enable"
-        } else {
-            "disable"
-        };
-        let enable_status = std::process::Command::new("systemctl")
-            .args(["--user", action, "gdrive-fuse-rs.service"])
-            .status()
-            .context("Failed to enable gdrive-fuse-rs.service")?;
-        if !enable_status.success() {
-            bail!("Failed to enable gdrive-fuse-rs.service");
-        }
-        if !args.no_browser {
-            let _ = open::that(&unit_mount_point);
-        }
-        return Ok(());
-    }
-
     let credentials = resolve_credentials(
         args.client_id.clone(),
         args.client_secret.clone(),
@@ -904,6 +885,22 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         switch_account,
     ))
     .context("Google OAuth2 authentication failed during setup")?;
+
+    let unit_mount_point = install_user_systemd_unit(args, &active_config)?;
+    cleanup_stale_fuse_mount(&unit_mount_point);
+    std::fs::create_dir_all(&unit_mount_point).with_context(|| {
+        format!(
+            "Failed to create mount point directory {}",
+            unit_mount_point.display()
+        )
+    })?;
+    let mounts = std::fs::read_to_string("/proc/mounts").context("Failed to inspect mounts")?;
+    if is_fuse_mounted_in_proc_mounts(&mounts, &unit_mount_point) {
+        bail!(
+            "A Google Drive mount is still active at {}; unmount it before setup",
+            unit_mount_point.display()
+        );
+    }
 
     if let Ok(exe_path) = std::env::current_exe() {
         let _ = install_gdrive_mime_handlers(&exe_path);
@@ -928,15 +925,6 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         .with_context(|| format!("Failed to run systemctl --user {action}"))?;
     if !status.success() {
         bail!("Failed to {action} gdrive-fuse-rs.service for login auto-mount");
-    }
-    if !wizard_ran {
-        let status = std::process::Command::new("systemctl")
-            .args(["--user", "stop", "gdrive-fuse-rs.service"])
-            .status()
-            .context("Failed to stop gdrive-fuse-rs.service")?;
-        if !status.success() {
-            bail!("Failed to stop gdrive-fuse-rs.service");
-        }
     }
     cleanup_stale_fuse_mount(&unit_mount_point);
 
@@ -1086,6 +1074,119 @@ fn parse_chunk_size(value: &str) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_setup_stops_existing_service_before_applying_requested_options() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-stop-service-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let command = dir.join("systemctl");
+        let called = dir.join("called");
+        std::fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                called.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        stop_existing_service(command.as_os_str(), false).unwrap();
+        assert!(!called.exists());
+        stop_existing_service(command.as_os_str(), true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&called).unwrap(),
+            "--user\nstop\ngdrive-fuse-rs.service\n"
+        );
+        let args = CliArgs::try_parse_from(["gdrive-fuse-rs", "--setup", "--read-only"]).unwrap();
+        assert!(systemd_mount_args(&args).contains(&"--read-only".to_owned()));
+        std::fs::write(&command, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(stop_existing_service(command.as_os_str(), true).is_err());
+        std::fs::remove_file(command).unwrap();
+        std::fs::remove_file(called).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_cache_cleanup_keeps_database_if_staging_cleanup_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-cleanup-error-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db = dir.join("cache.db");
+        let stage = dir.join("not-a-directory");
+        std::fs::write(&db, b"metadata").unwrap();
+        std::fs::write(&stage, b"staged").unwrap();
+        let args = CliArgs::try_parse_from([
+            "gdrive-fuse-rs",
+            "--cache-db",
+            db.to_str().unwrap(),
+            "--staging-dir",
+            stage.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(clear_local_cache_and_staging(&args, &AppConfig::default()).is_err());
+        assert_eq!(std::fs::read(&db).unwrap(), b"metadata");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"staged");
+        std::fs::remove_file(db).unwrap();
+        std::fs::remove_file(stage).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_cache_cleanup_resolves_database_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-cleanup-symlink-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db = dir.join("target.db");
+        let link = dir.join("link.db");
+        let stage = dir.join("staging");
+        std::fs::write(&db, b"metadata").unwrap();
+        std::fs::write(dir.join("target.db-wal"), b"wal").unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("inode_1.stage"), b"staged").unwrap();
+        symlink(&db, &link).unwrap();
+        assert_eq!(
+            MetadataCache::default_staging_dir_for_db(&db),
+            MetadataCache::default_staging_dir_for_db(&link)
+        );
+        let default_args =
+            CliArgs::try_parse_from(["gdrive-fuse-rs", "--cache-db", link.to_str().unwrap()])
+                .unwrap();
+        let (resolved_db, resolved_stage) =
+            cache_cleanup_paths(&default_args, &AppConfig::default()).unwrap();
+        assert_eq!(resolved_db, std::fs::canonicalize(&db).unwrap());
+        assert_eq!(
+            resolved_stage,
+            MetadataCache::default_staging_dir_for_db(&db)
+        );
+        let args = CliArgs::try_parse_from([
+            "gdrive-fuse-rs",
+            "--cache-db",
+            link.to_str().unwrap(),
+            "--staging-dir",
+            stage.to_str().unwrap(),
+        ])
+        .unwrap();
+        clear_local_cache_and_staging(&args, &AppConfig::default()).unwrap();
+        assert!(!db.exists());
+        assert!(!dir.join("target.db-wal").exists());
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        assert!(!stage.join("inode_1.stage").exists());
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir(stage).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn test_cli_args_parsing_readme_invocation() {

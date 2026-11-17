@@ -314,18 +314,36 @@ impl MetadataCache {
 
     /// Removes any leftover `inode_*.stage` or `.inode_*.stage` upload snapshot files in `staging_dir`.
     pub fn clear_staging_dir(staging_dir: &Path) -> Result<(), CacheError> {
-        if !staging_dir.exists() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(staging_dir)? {
+        Self::clear_staging_dir_with(staging_dir, |path| fs::remove_file(path))
+    }
+
+    fn clear_staging_dir_with(
+        staging_dir: &Path,
+        mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<(), CacheError> {
+        let entries = match fs::read_dir(staging_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(staging_dir) {
+                    Ok(_) => return Err(err.into()),
+                    Err(metadata_err) if metadata_err.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(())
+                    }
+                    Err(metadata_err) => return Err(metadata_err.into()),
+                }
+            }
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.is_file() {
+            let file_type = entry.file_type()?;
+            if file_type.is_file() || file_type.is_symlink() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if name.ends_with(".stage")
                         && name.trim_start_matches('.').starts_with("inode_")
                     {
-                        let _ = fs::remove_file(&path);
+                        remove(&path)?;
                     }
                 }
             }
@@ -1668,6 +1686,31 @@ fn split_stem_and_extension(filename: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_clear_staging_reports_file_removal_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-stage-error-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let stage = dir.join("inode_1.stage");
+        fs::write(&stage, b"pending").unwrap();
+        let error = MetadataCache::clear_staging_dir_with(&dir, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected removal failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, CacheError::Io(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(fs::read(&stage).unwrap(), b"pending");
+        fs::remove_file(stage).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
 
     fn sample_drive_file(id: &str, name: &str, mime_type: &str, size: u64) -> DriveFile {
         DriveFile {

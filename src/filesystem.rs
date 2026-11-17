@@ -464,6 +464,8 @@ pub async fn sync_changes_once(
 }
 
 const MAX_CACHED_DIR_LISTINGS: usize = 256;
+const MAX_CACHED_DIR_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CACHED_DIR_ENTRIES: usize = 32_768;
 
 #[derive(Clone)]
 struct CachedDirListing {
@@ -476,6 +478,57 @@ struct CachedDirListing {
 }
 
 impl CachedDirListing {
+    fn estimated_bytes(&self) -> usize {
+        let mut bytes = self
+            .children
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, CachedFile)>())
+            .saturating_add(
+                self.by_name
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, usize)>() + 1),
+            );
+        for (name, file) in self.children.iter() {
+            bytes = bytes
+                .saturating_add(name.capacity())
+                .saturating_add(file.drive_id.capacity())
+                .saturating_add(file.name.capacity())
+                .saturating_add(file.mime_type.capacity())
+                .saturating_add(file.web_view_link.as_ref().map_or(0, String::capacity));
+        }
+        for name in self.by_name.keys() {
+            bytes = bytes.saturating_add(name.capacity());
+        }
+        bytes
+    }
+
+    fn cache_dir_listing(
+        cache: &mut HashMap<u64, CachedDirListing>,
+        dir_inode: u64,
+        listing: &CachedDirListing,
+    ) {
+        cache.remove(&dir_inode);
+        let listing_bytes = listing.estimated_bytes();
+        if listing.children.len() > MAX_CACHED_DIR_ENTRIES || listing_bytes > MAX_CACHED_DIR_BYTES {
+            return;
+        }
+        let total_bytes = cache.values().fold(listing_bytes, |total, cached| {
+            total.saturating_add(cached.estimated_bytes())
+        });
+        let total_entries = cache
+            .values()
+            .fold(listing.children.len(), |total, cached| {
+                total.saturating_add(cached.children.len())
+            });
+        if cache.len() >= MAX_CACHED_DIR_LISTINGS
+            || total_bytes > MAX_CACHED_DIR_BYTES
+            || total_entries > MAX_CACHED_DIR_ENTRIES
+        {
+            cache.clear();
+        }
+        cache.insert(dir_inode, listing.clone());
+    }
+
     fn entries(
         &self,
         ino: u64,
@@ -1181,11 +1234,11 @@ impl GDriveFS {
             listing_started.elapsed()
         );
 
-        let mut cache_map = self.dir_listing_cache.borrow_mut();
-        if cache_map.len() >= MAX_CACHED_DIR_LISTINGS && !cache_map.contains_key(&dir_inode) {
-            cache_map.clear();
-        }
-        cache_map.insert(dir_inode, listing.clone());
+        CachedDirListing::cache_dir_listing(
+            &mut self.dir_listing_cache.borrow_mut(),
+            dir_inode,
+            &listing,
+        );
 
         Ok(listing)
     }
@@ -3845,6 +3898,57 @@ mod tests {
         fs.handle_release(entry.inode, fh).unwrap();
 
         assert!(fs.cache.get_by_inode(entry.inode).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_directory_listing_cache_budget_and_oversized_entries() {
+        let file = CachedFile {
+            inode: 3,
+            drive_id: "id".into(),
+            name: "name".into(),
+            mime_type: "text/plain".into(),
+            size: 0,
+            modified_time: 0,
+            is_dir: false,
+            last_synced_at: None,
+            web_view_link: None,
+            dirty: false,
+        };
+        let listing = |name_len: usize| {
+            let name = "x".repeat(name_len);
+            CachedDirListing {
+                cache_revision: 0,
+                data_version: 0,
+                docs_mode: GoogleDocsMode::Browser,
+                shared_with_me: false,
+                children: Arc::new(vec![(name.clone(), file.clone())]),
+                by_name: Arc::new(HashMap::from([(name, 0)])),
+            }
+        };
+        let first = listing(5 * 1024 * 1024);
+        let second = listing(5 * 1024 * 1024);
+        assert!(first.estimated_bytes() <= MAX_CACHED_DIR_BYTES);
+        assert!(first.estimated_bytes() + second.estimated_bytes() > MAX_CACHED_DIR_BYTES);
+        let mut cache = HashMap::new();
+        CachedDirListing::cache_dir_listing(&mut cache, 1, &first);
+        assert!(cache.contains_key(&1));
+        CachedDirListing::cache_dir_listing(&mut cache, 2, &second);
+        assert!(!cache.contains_key(&1));
+        assert!(cache.contains_key(&2));
+        let oversized = listing(9 * 1024 * 1024);
+        assert!(oversized.estimated_bytes() > MAX_CACHED_DIR_BYTES);
+        CachedDirListing::cache_dir_listing(&mut cache, 2, &oversized);
+        assert!(cache.is_empty());
+
+        let too_many = CachedDirListing {
+            children: Arc::new(vec![
+                (String::new(), file.clone());
+                MAX_CACHED_DIR_ENTRIES + 1
+            ]),
+            ..listing(0)
+        };
+        CachedDirListing::cache_dir_listing(&mut cache, 3, &too_many);
+        assert!(!cache.contains_key(&3));
     }
 
     #[test]

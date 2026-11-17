@@ -34,9 +34,10 @@ Once installed, you can either launch **Google Drive (gdrive-fuse-rs)** directly
 gdrive-fuse-rs --setup
 ```
 
-The setup wizard URL grants access to its local session; do not share it. The optional
-GNOME Files performance setting affects all folders. The application does not modify
-Tracker's ignored-directory settings automatically.
+The setup page asks for a one-time code from a private file whose path is shown in the
+browser. Open that file with your file manager or `cat`, then paste its contents into
+the page. Do not share the code. The optional GNOME Files performance setting affects
+all folders. The application does not modify Tracker's ignored-directory settings automatically.
 
 **Warning:** `--clear-cache` and the wizard's account-switch option can delete pending
 local writes and must not be used while any mount uses the cache. Back up the metadata

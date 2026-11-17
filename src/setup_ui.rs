@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -15,6 +17,50 @@ use crate::default_mount_point;
 
 const SETUP_UI_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SETUP_HTTP_REQUEST_BYTES: usize = 32 * 1024;
+
+struct SetupCodeFile {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl SetupCodeFile {
+    fn create(code: &str) -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-fuse-rs-setup-{}",
+            CsrfToken::new_random_len(24).secret()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .context("Failed to create private setup directory")?;
+        let code_file = Self {
+            path: dir.join("code"),
+            dir,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&code_file.path)
+            .context("Failed to create private setup code file")?;
+        file.write_all(code.as_bytes())
+            .context("Failed to write private setup code")?;
+        Ok(code_file)
+    }
+}
+
+impl Drop for SetupCodeFile {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("Failed to remove setup code file: {}", err);
+            }
+        }
+        if let Err(err) = std::fs::remove_dir(&self.dir) {
+            log::warn!("Failed to remove private setup directory: {}", err);
+        }
+    }
+}
 
 /// Output returned after the user completes and saves the Local Browser Setup Wizard.
 #[derive(Debug, Clone)]
@@ -42,7 +88,8 @@ pub async fn run_browser_setup_wizard(
         .local_addr()
         .context("Failed to read setup wizard local address")?;
     let csrf_token = CsrfToken::new_random_len(32).secret().to_owned();
-    let setup_url = format!("http://127.0.0.1:{}/{}/", local_addr.port(), csrf_token);
+    let setup_code = SetupCodeFile::create(&csrf_token)?;
+    let setup_url = format!("http://127.0.0.1:{}/", local_addr.port());
 
     let existing_creds = validate_credentials(
         cli_client_id.clone(),
@@ -78,6 +125,7 @@ pub async fn run_browser_setup_wizard(
     println!("======================================================================");
     println!("Please configure your Google Drive mount in your browser:");
     println!("\n  {}\n", setup_url);
+    println!("Read the setup code from: {}", setup_code.path.display());
     println!("Waiting for configuration to be saved...");
     println!("======================================================================\n");
 
@@ -98,6 +146,7 @@ pub async fn run_browser_setup_wizard(
         listener,
         initial_config,
         &csrf_token,
+        &setup_code.path,
         default_mp,
         default_client_id,
         has_available_creds,
@@ -114,6 +163,7 @@ async fn serve_setup_wizard(
     listener: TcpListener,
     initial_config: &AppConfig,
     csrf_token: &str,
+    code_path: &Path,
     default_mp: PathBuf,
     default_client_id: String,
     has_available_creds: bool,
@@ -125,9 +175,6 @@ async fn serve_setup_wizard(
     let local_addr = listener.local_addr()?;
     let deadline = tokio::time::Instant::now() + SETUP_UI_TIMEOUT;
     let mut error_banner: Option<String> = None;
-    let form_path = format!("/{csrf_token}/");
-    let save_path = format!("/{csrf_token}/save");
-
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -160,7 +207,21 @@ async fn serve_setup_wizard(
             continue;
         }
 
-        if method == "GET" && path == form_path {
+        if method == "GET" && path == "/" {
+            let html = format!(
+                r#"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Google Drive Setup</title></head><body>
+                <h1>Google Drive Setup</h1><p>Open <code>{}</code> and paste its contents below.</p>
+                <form method="POST" action="/unlock"><label>Setup code <input name="csrf_token" type="password" required autofocus></label>
+                <button type="submit">Continue</button></form></body></html>"#,
+                escape_html_attr(&code_path.display().to_string())
+            );
+            send_html_response(&mut stream, "200 OK", &html).await;
+        } else if method == "POST" && path == "/unlock" {
+            let body = req_str.split("\r\n\r\n").nth(1).unwrap_or("");
+            if !form_has_valid_token(body, csrf_token) {
+                send_html_response(&mut stream, "403 Forbidden", "Forbidden").await;
+                continue;
+            }
             let html = render_setup_form_html(
                 csrf_token,
                 &default_mp.display().to_string(),
@@ -176,7 +237,7 @@ async fn serve_setup_wizard(
             );
             send_html_response(&mut stream, "200 OK", &html).await;
             error_banner = None;
-        } else if method == "POST" && path == save_path {
+        } else if method == "POST" && path == "/save" {
             let body = req_str.split("\r\n\r\n").nth(1).unwrap_or("");
             if !form_has_valid_token(body, csrf_token) {
                 send_html_response(&mut stream, "403 Forbidden", "Forbidden").await;
@@ -735,7 +796,7 @@ fn render_setup_form_html(
     <h1>Google Drive Setup</h1>
     <p class="subtitle">Configure how <code>gdrive-fuse-rs</code> mounts your Google Drive in GNOME Files. Settings are saved to <code>~/.config/gdrive-fuse-rs/config.toml</code>.</p>
     {error_block}
-    <form method="POST" action="/{csrf}/save">
+    <form method="POST" action="/save">
       <input type="hidden" name="csrf_token" value="{csrf}">
       <div class="field">
         <label class="block" for="mount_point">Mount Folder Path</label>
@@ -872,6 +933,25 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn test_setup_code_file_is_private_and_removed() {
+        let code = SetupCodeFile::create("private-code").unwrap();
+        let path = code.path.clone();
+        let dir = code.dir.clone();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "private-code");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(code);
+        assert!(!path.exists());
+        assert!(!dir.exists());
+    }
+
+    #[test]
     fn test_setup_request_host_origin_and_token_validation() {
         assert!(valid_setup_headers(
             "POST / HTTP/1.1\r\nHost: 127.0.0.1:1234\r\nOrigin: http://127.0.0.1:1234\r\n\r\n",
@@ -926,6 +1006,7 @@ mod tests {
                 listener,
                 &initial,
                 "session-token",
+                Path::new("/private/setup-code"),
                 PathBuf::from("/drive"),
                 "example-id".into(),
                 true,
@@ -937,33 +1018,56 @@ mod tests {
             .await
         });
         let host = format!("127.0.0.1:{}", addr.port());
-        let denied = request(addr, &format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n")).await;
-        assert!(denied.starts_with("HTTP/1.1 404"));
-        assert!(!denied.contains("private-value"));
-        assert!(request(
-            addr,
-            "GET /session-token/ HTTP/1.1\r\nHost: attacker.invalid\r\n\r\n"
-        )
-        .await
-        .starts_with("HTTP/1.1 403"));
+        let login = request(addr, &format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n")).await;
+        assert!(login.starts_with("HTTP/1.1 200"));
+        assert!(!login.contains("private-value"));
+        assert!(!login.contains("session-token"));
+        assert!(
+            request(addr, "GET / HTTP/1.1\r\nHost: attacker.invalid\r\n\r\n")
+                .await
+                .starts_with("HTTP/1.1 403")
+        );
+        let body = "csrf_token=session-token";
         let response = request(
             addr,
-            &format!("GET /session-token/ HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+            &format!(
+                "POST /unlock HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(!response.contains("private-value"));
         assert!(response.contains(r#"name="client_secret" value="""#));
         let body = "csrf_token=wrong";
+        let unlock = format!(
+            "POST /unlock HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(request(addr, &unlock).await.starts_with("HTTP/1.1 403"));
         let post = format!(
-            "POST /session-token/save HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST /save HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         assert!(request(addr, &post).await.starts_with("HTTP/1.1 403"));
-        let post = format!("POST /session-token/save HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.invalid\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let post = format!("POST /save HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.invalid\r\nContent-Length: {}\r\n\r\n{body}", body.len());
         assert!(request(addr, &post).await.starts_with("HTTP/1.1 403"));
-        server.abort();
-        let _ = server.await;
+        let body = "csrf_token=session-token&client_id=example-id&mount_point=%2Fdrive";
+        let post = format!(
+            "POST /save HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(request(addr, &post).await.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            server
+                .await
+                .unwrap()
+                .unwrap()
+                .config
+                .client_secret
+                .as_deref(),
+            Some("private-value")
+        );
     }
 
     #[tokio::test]
@@ -975,6 +1079,7 @@ mod tests {
                 listener,
                 &AppConfig::default(),
                 "session",
+                Path::new("/private/setup-code"),
                 PathBuf::from("/old"),
                 String::new(),
                 false,
@@ -989,7 +1094,7 @@ mod tests {
             "csrf_token=session&mount_point=%2Fnew&client_id=&google_docs_mode=pdf&read_only=on";
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let request = format!(
-            "POST /session/save HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST /save HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{body}",
             addr.port(),
             body.len()
         );
