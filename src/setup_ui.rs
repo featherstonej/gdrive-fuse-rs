@@ -500,7 +500,7 @@ fn render_setup_form_html(
     let chk_optimize = if optimize_nautilus { "checked" } else { "" };
 
     let (oauth_details_attr, oauth_summary, cid_required, cid_placeholder) =
-        if has_available_creds && error_message.is_none() {
+        if has_available_creds {
             (
                 "",
                 "Advanced: Use custom Google Cloud OAuth2 Client ID (Optional)",
