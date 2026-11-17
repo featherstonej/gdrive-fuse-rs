@@ -89,18 +89,18 @@ This document tracks the development phases, architectural milestones, and featu
 Prioritize sections 4.1-4.3 before performance tuning.
 
 ### 4.1 Protect Pending Writes
-- [ ] Fail and report an appropriate error if a dirty staging file is missing or unreadable; never replace it with an empty file and upload that in its place.
+- [x] Fail and report an appropriate error if a dirty staging file is missing or unreadable; never replace it with an empty file and upload that in its place.
 - [ ] Make `--clear-cache` and account-switch cleanup protect pending staged writes and avoid modifying cache files used by an active mount. Require explicit user confirmation before any destructive cleanup.
 - [ ] Test missing staging files, pending uploads, active mounts, and cleanup failures without losing staged data.
 
 ### 4.2 Harden Setup Security
 - [ ] Do not render stored client secrets in the browser setup form. Authenticate access to the local setup session with a cryptographically random, session-specific secret and validate requests so other local clients cannot retrieve or modify configuration.
-- [ ] Create credential-bearing configuration files with restrictive permissions from the outset and surface permission failures.
+- [x] Create credential-bearing configuration files with restrictive permissions from the outset and surface permission failures.
 - [ ] Test setup access controls, secret handling, and configuration-file permissions.
 
 ### 4.3 Make Change Sync Recovery Reliable
-- [ ] Propagate cache and token persistence failures instead of reporting successful change polling.
-- [ ] Do not advance the change token when expired-token cache recovery fails; preserve pending writes and retry safely.
+- [x] Propagate cache and token persistence failures instead of reporting successful change polling.
+- [x] Do not advance the change token when expired-token cache recovery fails; preserve pending writes and retry safely.
 - [ ] Prevent a directory refresh from overwriting an invalidation that occurred while the Drive listing was in flight.
 - [ ] Test recovery failures and concurrent refresh/invalidation scenarios.
 
@@ -115,6 +115,6 @@ Prioritize sections 4.1-4.3 before performance tuning.
 - [ ] Test timing and error reporting without requiring a live Drive account.
 
 ### 4.6 Documentation & Package Safeguards
-- [ ] Correct the documented cache TTL default and keep CLI help, configuration documentation, and implementation consistent.
-- [ ] Prevent unintended embedding of client secrets in release binaries and `.deb` / `.rpm` packages; document safe build and credential configuration.
-- [ ] Verify package contents and document any intentional effects on per-user GNOME settings.
+- [x] Correct the documented cache TTL default and keep CLI help, configuration documentation, and implementation consistent.
+- [x] Prevent unintended embedding of client secrets in release binaries and `.deb` / `.rpm` packages; document safe build and credential configuration.
+- [x] Verify package contents and document any intentional effects on per-user GNOME settings.

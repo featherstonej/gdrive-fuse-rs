@@ -131,57 +131,75 @@ impl AppConfig {
         let serialized = toml::to_string_pretty(self).map_err(|e| {
             AuthError::ConfigError(format!("Failed to serialize TOML configuration: {}", e))
         })?;
-        let write_result = (|| -> std::io::Result<()> {
-            use std::io::Write;
-
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let temp_path = parent.join(format!(
-                ".gdrive-fuse-rs-config-{}.tmp",
-                CsrfToken::new_random().secret()
-            ));
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temp_path)?;
-            let result = (|| -> std::io::Result<()> {
-                file.write_all(serialized.as_bytes())?;
-                file.sync_all()?;
-                match std::fs::symlink_metadata(path) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!(
-                                "Refusing to replace symlinked config file {}",
-                                path.display()
-                            ),
-                        ));
-                    }
-                    Ok(_) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err),
-                }
-                std::fs::rename(&temp_path, path)
-            })();
-            if result.is_err() {
-                let _ = std::fs::remove_file(&temp_path);
-            }
-            result
-        })();
-        write_result.map_err(|e| {
+        Self::write_config_file(path, serialized.as_bytes()).map_err(|e| {
             AuthError::ConfigError(format!(
-                "Failed to securely write config file {}: {}",
+                "Failed to secure or write config file {}: {}",
                 path.display(),
                 e
             ))
         })?;
         Ok(())
+    }
+
+    fn write_config_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        Self::write_config_file_with(path, contents, |file| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            #[cfg(not(unix))]
+            let _ = file;
+            Ok(())
+        })
+    }
+
+    fn write_config_file_with(
+        path: &Path,
+        contents: &[u8],
+        secure: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let temp_path = parent.join(format!(
+            ".gdrive-fuse-rs-config-{}.tmp",
+            CsrfToken::new_random().secret()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        let result = (|| -> std::io::Result<()> {
+            secure(&file)?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Refusing to replace symlinked config file {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+            std::fs::rename(&temp_path, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
     }
 
     /// Loads `AppConfig` from a specific path. If the file does not exist, returns `Ok(AppConfig::default())`.
@@ -311,21 +329,16 @@ fn resolve_credentials_impl(
     ))
 }
 
-/// Returns compile-time default OAuth2 client credentials (`GDRIVE_DEFAULT_CLIENT_ID` /
-/// `GDRIVE_DEFAULT_CLIENT_SECRET`) when embedded into the release binary.
+/// Returns the compile-time default OAuth2 client ID, if present.
 #[cfg(not(test))]
 pub fn builtin_default_credentials() -> Option<ClientCredentials> {
     let default_id = option_env!("GDRIVE_DEFAULT_CLIENT_ID")
         .map(str::trim)
         .filter(|s| !s.is_empty() && !is_test_placeholder_client_id(s))?
         .to_string();
-    let default_secret = option_env!("GDRIVE_DEFAULT_CLIENT_SECRET")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from);
     Some(ClientCredentials {
         client_id: default_id,
-        client_secret: default_secret,
+        client_secret: None,
     })
 }
 
@@ -971,6 +984,60 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_config_permissions_before_writing_and_permission_failure() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = PathBuf::from("target").join(format!(
+            "auth-config-test-{}",
+            CsrfToken::new_random().secret()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let cfg = AppConfig {
+            client_secret: Some("example-secret".into()),
+            ..Default::default()
+        };
+        // Check the mode before the first byte is written, not just after save.
+        AppConfig::write_config_file_with(&path, b"secret", |file| {
+            assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+            assert_eq!(file.metadata()?.len(), 0);
+            Ok(())
+        })
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = AppConfig::write_config_file_with(&path, b"replacement", |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "chmod failed",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        cfg.save_to_path(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(AppConfig::load_from_path(&path).unwrap(), cfg);
+        let link = dir.join("config-link");
+        symlink("config.toml", &link).unwrap();
+        assert!(cfg.save_to_path(&link).is_err());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(AppConfig::load_from_path(&path).unwrap(), cfg);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert!(cfg.save_to_path(&dir).is_err());
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn test_app_config_toml_deserialization_and_missing_file() {

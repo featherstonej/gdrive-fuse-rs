@@ -559,6 +559,7 @@ async fn send_html_response(stream: &mut TcpStream, status: &str, html: &str) {
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
          Referrer-Policy: no-referrer\r\n\
+         X-Content-Type-Options: nosniff\r\n\
          Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'\r\n\
          Connection: close\r\n\r\n\
          {html}",
@@ -865,7 +866,7 @@ fn render_setup_form_html(
           <div class="field">
             <label class="block" for="client_secret">Google OAuth2 Client Secret</label>
             <input type="password" id="client_secret" name="client_secret" value="" placeholder="GOCSPX-..." autocomplete="new-password">
-            <div class="hint">Leave blank to keep the existing secret for this Client ID.</div>
+            <div class="hint">Leave blank to keep the existing secret for this Client ID. Stored in your system keyring and user-only config (0600).</div>
           </div>
 
           <ol style="margin:0.5rem 0 0 1.2rem;padding:0;line-height:1.5;">
@@ -1110,8 +1111,20 @@ mod tests {
         let _ = server.await;
     }
 
+    async fn request(addr: std::net::SocketAddr, method: &str, path: &str, body: &str) -> String {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
     #[tokio::test]
-    async fn test_setup_wizard_survives_idle_preconnect_socket() {
+    async fn test_setup_wizard_access_and_secret_handling() {
         let initial = AppConfig {
             client_id: Some("prefilled-id.apps.googleusercontent.com".to_string()),
             client_secret: Some("prefilled-secret".to_string()),
@@ -1120,49 +1133,109 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let csrf = "csrf-test-1";
-
+        let csrf = "session-test-token";
         let server = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let raw_req = match tokio::time::timeout(
-                    Duration::from_millis(200),
-                    read_http_request(&mut stream),
-                )
-                .await
-                {
-                    Ok(Ok(bytes)) if !bytes.is_empty() => bytes,
-                    _ => continue,
-                };
-                let req_str = String::from_utf8_lossy(&raw_req);
-                if req_str.starts_with("POST /save") {
-                    let body = req_str.split("\r\n\r\n").nth(1).unwrap_or("");
-                    let outcome = parse_setup_form_submission(body, csrf, &initial).unwrap();
-                    send_html_response(&mut stream, "200 OK", "saved").await;
-                    return outcome;
-                }
-            }
+            serve_setup_wizard(
+                listener,
+                &initial,
+                csrf,
+                Path::new("/private/setup-code"),
+                PathBuf::from("/drive"),
+                "prefilled-id.apps.googleusercontent.com".into(),
+                true,
+                GoogleDocsMode::Browser,
+                false,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
         });
 
-        // 1. Simulate Chromium idle preconnect socket (connects and sends nothing)
+        // A speculative connection must not block an authenticated request indefinitely.
         let _idle_socket = TcpStream::connect(addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(250)).await;
-
-        // 2. Send real POST /save request on second connection
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        let form = "csrf_token=csrf-test-1&mount_point=%2Ftmp%2Ftest-drive&client_id=prefilled-id.apps.googleusercontent.com&google_docs_mode=browser&shared_with_me=on&enable_autostart=on";
-        let req = format!(
-            "POST /save HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{}",
-            form.len(),
-            form
-        );
-        client.write_all(req.as_bytes()).await.unwrap();
-
+        let login = request(addr, "GET", "/", "").await;
+        assert!(login.starts_with("HTTP/1.1 200"));
+        assert!(!login.contains("prefilled"));
+        assert!(!login.contains(csrf));
+        assert!(request(addr, "GET", "/wrong/", "")
+            .await
+            .starts_with("HTTP/1.1 404"));
+        assert!(request(addr, "POST", "/save", "csrf_token=wrong")
+            .await
+            .starts_with("HTTP/1.1 403"));
+        assert!(request(addr, "POST", "/unlock", "csrf_token=wrong")
+            .await
+            .starts_with("HTTP/1.1 403"));
+        assert!(request(
+            addr,
+            "POST",
+            "/unlock",
+            "csrf_token=session-test-token&csrf_token=wrong"
+        )
+        .await
+        .starts_with("HTTP/1.1 403"));
+        let html = request(addr, "POST", "/unlock", "csrf_token=session-test-token").await;
+        assert!(html.starts_with("HTTP/1.1 200"));
+        assert!(html.contains("Referrer-Policy: no-referrer"));
+        assert!(html.contains("prefilled-id.apps.googleusercontent.com"));
+        assert!(!html.contains("prefilled-secret"));
+        assert!(html.contains(r#"name="client_secret" value="""#));
+        let form = "csrf_token=session-test-token&mount_point=%2Fdrive&client_id=prefilled-id.apps.googleusercontent.com";
+        assert!(request(addr, "POST", "/save", form)
+            .await
+            .starts_with("HTTP/1.1 200"));
         let outcome = server.await.unwrap();
         assert_eq!(
             outcome.config.mount_point_path,
-            Some(PathBuf::from("/tmp/test-drive"))
+            Some(PathBuf::from("/drive"))
         );
+        assert_eq!(
+            outcome.config.client_secret.as_deref(),
+            Some("prefilled-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validation_error_does_not_echo_submitted_secret() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            serve_setup_wizard(
+                listener,
+                &AppConfig::default(),
+                "error-session",
+                Path::new("/private/setup-code"),
+                PathBuf::from("/drive"),
+                String::new(),
+                false,
+                GoogleDocsMode::Browser,
+                false,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+        });
+        let response = request(
+            addr,
+            "POST",
+            "/save",
+            "csrf_token=error-session&client_secret=not-to-echo",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(!response.contains("not-to-echo"));
+        assert!(response.contains("A Google OAuth2 Client ID is required"));
+        let response = request(
+            addr,
+            "POST",
+            "/save",
+            "csrf_token=error-session&client_id=my-id.apps.googleusercontent.com",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"));
+        server.await.unwrap();
     }
 
     #[test]
@@ -1216,6 +1289,31 @@ mod tests {
         );
         assert!(html.contains(r#"id="optimize_nautilus" name="optimize_nautilus" >"#));
         assert!(html.contains("for all folders in GNOME Files"));
+    }
+
+    #[test]
+    fn test_changed_client_id_does_not_reuse_old_secret() {
+        let base = AppConfig {
+            client_id: Some("old-id".into()),
+            client_secret: Some("old-secret".into()),
+            ..Default::default()
+        };
+        let unchanged =
+            parse_setup_form_submission("csrf_token=t&client_id=old-id", "t", &base).unwrap();
+        assert_eq!(
+            unchanged.config.client_secret.as_deref(),
+            Some("old-secret")
+        );
+        let changed =
+            parse_setup_form_submission("csrf_token=t&client_id=new-id", "t", &base).unwrap();
+        assert_eq!(changed.config.client_secret, None);
+        let replaced = parse_setup_form_submission(
+            "csrf_token=t&client_id=new-id&client_secret=new-secret",
+            "t",
+            &base,
+        )
+        .unwrap();
+        assert_eq!(replaced.config.client_secret.as_deref(), Some("new-secret"));
     }
 
     #[test]

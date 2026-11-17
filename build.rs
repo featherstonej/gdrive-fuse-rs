@@ -2,7 +2,6 @@ use std::path::Path;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=GDRIVE_DEFAULT_CLIENT_ID");
-    println!("cargo:rerun-if-env-changed=GDRIVE_DEFAULT_CLIENT_SECRET");
     println!("cargo:rerun-if-changed=.env.build");
 
     // If GDRIVE_DEFAULT_CLIENT_ID is not already set in the environment, load from .env.build if present.
@@ -22,10 +21,7 @@ fn main() {
                     if let Some((key, val)) = trimmed.split_once('=') {
                         let key = key.trim();
                         let val = val.trim().trim_matches('"').trim_matches('\'');
-                        if (key == "GDRIVE_DEFAULT_CLIENT_ID"
-                            || key == "GDRIVE_DEFAULT_CLIENT_SECRET")
-                            && !val.is_empty()
-                        {
+                        if key == "GDRIVE_DEFAULT_CLIENT_ID" && !val.is_empty() {
                             println!("cargo:rustc-env={}={}", key, val);
                         }
                     }

@@ -383,6 +383,12 @@ impl MetadataCache {
         Self::init_connection(conn, ttl_secs)
     }
 
+    #[cfg(test)]
+    pub(crate) fn execute_test_sql(&self, sql: &str) -> Result<(), CacheError> {
+        self.lock_conn()?.execute_batch(sql)?;
+        Ok(())
+    }
+
     /// Returns the configured directory metadata TTL in seconds.
     pub fn ttl_secs(&self) -> u64 {
         self.ttl_secs
