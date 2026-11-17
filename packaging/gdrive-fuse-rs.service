@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=/bin/mkdir -p "%h/GoogleDrive"
 ExecStart=/usr/bin/gdrive-fuse-rs --mount-point "%h/GoogleDrive" --no-browser
-ExecStop=/bin/sh -c 'fusermount3 -u "$1" || fusermount -u "$1"' sh "%h/GoogleDrive"
+ExecStop=-/bin/sh -c 'fusermount3 -u "$1" || fusermount -u "$1"' sh "%h/GoogleDrive"
 Restart=on-failure
 RestartSec=5
 

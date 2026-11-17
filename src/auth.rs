@@ -109,6 +109,81 @@ impl AppConfig {
         dirs::config_dir().map(|dir| dir.join("gdrive-fuse-rs").join("config.toml"))
     }
 
+    /// Returns `true` if the default configuration file (`~/.config/gdrive-fuse-rs/config.toml`) exists on disk.
+    pub fn exists_default() -> bool {
+        Self::default_path().is_some_and(|p| p.exists())
+    }
+
+    /// Serializes and writes `AppConfig` as TOML to `path`, creating parent directories and restricting
+    /// file permissions to `0600` on Unix.
+    pub fn save_to_path(&self, path: &Path) -> Result<(), AuthError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AuthError::ConfigError(format!(
+                        "Failed to create config directory {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
+        let serialized = toml::to_string_pretty(self).map_err(|e| {
+            AuthError::ConfigError(format!("Failed to serialize TOML configuration: {}", e))
+        })?;
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let temp_path = parent.join(format!(
+                ".gdrive-fuse-rs-config-{}.tmp",
+                CsrfToken::new_random().secret()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp_path)?;
+            let result = (|| -> std::io::Result<()> {
+                file.write_all(serialized.as_bytes())?;
+                file.sync_all()?;
+                match std::fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "Refusing to replace symlinked config file {}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
+                std::fs::rename(&temp_path, path)
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp_path);
+            }
+            result
+        })();
+        write_result.map_err(|e| {
+            AuthError::ConfigError(format!(
+                "Failed to securely write config file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        Ok(())
+    }
+
     /// Loads `AppConfig` from a specific path. If the file does not exist, returns `Ok(AppConfig::default())`.
     pub fn load_from_path(path: &Path) -> Result<Self, AuthError> {
         if !path.exists() {
@@ -153,13 +228,36 @@ pub fn resolve_credentials(
     cli_secret: Option<String>,
     config: &AppConfig,
 ) -> Result<ClientCredentials, AuthError> {
+    resolve_credentials_impl(cli_id, cli_secret, config, true)
+}
+
+pub fn validate_credentials(
+    cli_id: Option<String>,
+    cli_secret: Option<String>,
+    config: &AppConfig,
+) -> Result<ClientCredentials, AuthError> {
+    resolve_credentials_impl(cli_id, cli_secret, config, false)
+}
+
+fn resolve_credentials_impl(
+    cli_id: Option<String>,
+    cli_secret: Option<String>,
+    config: &AppConfig,
+    persist: bool,
+) -> Result<ClientCredentials, AuthError> {
     let clean_opt = |opt: Option<String>| -> Option<String> {
         opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
     };
+    #[cfg(not(test))]
+    let clean_id = |opt: Option<String>| -> Option<String> {
+        clean_opt(opt).filter(|s| !is_test_placeholder_client_id(s))
+    };
+    #[cfg(test)]
+    let clean_id = clean_opt;
 
-    let cli_id = clean_opt(cli_id);
+    let cli_id = clean_id(cli_id);
     let cli_secret = clean_opt(cli_secret);
-    let cfg_id = clean_opt(config.client_id.clone());
+    let cfg_id = clean_id(config.client_id.clone());
     let cfg_secret = clean_opt(config.client_secret.clone());
 
     if let Some(client_id) = cli_id {
@@ -181,7 +279,7 @@ pub fn resolve_credentials(
             client_id,
             client_secret,
         };
-        if creds.client_secret.is_some() {
+        if persist && creds.client_secret.is_some() {
             persist_credentials_to_keyring(&creds);
         }
         return Ok(creds);
@@ -192,7 +290,9 @@ pub fn resolve_credentials(
             client_id,
             client_secret: cfg_secret,
         };
-        persist_credentials_to_keyring(&creds);
+        if persist {
+            persist_credentials_to_keyring(&creds);
+        }
         return Ok(creds);
     }
 
@@ -200,13 +300,8 @@ pub fn resolve_credentials(
         return Ok(creds);
     }
 
-    if let Some(default_id) = clean_opt(option_env!("GDRIVE_DEFAULT_CLIENT_ID").map(String::from)) {
-        let default_secret =
-            clean_opt(option_env!("GDRIVE_DEFAULT_CLIENT_SECRET").map(String::from));
-        return Ok(ClientCredentials {
-            client_id: default_id,
-            client_secret: default_secret,
-        });
+    if let Some(creds) = builtin_default_credentials() {
+        return Ok(creds);
     }
 
     Err(AuthError::MissingCredentials(
@@ -216,7 +311,48 @@ pub fn resolve_credentials(
     ))
 }
 
+/// Returns compile-time default OAuth2 client credentials (`GDRIVE_DEFAULT_CLIENT_ID` /
+/// `GDRIVE_DEFAULT_CLIENT_SECRET`) when embedded into the release binary.
+#[cfg(not(test))]
+pub fn builtin_default_credentials() -> Option<ClientCredentials> {
+    let default_id = option_env!("GDRIVE_DEFAULT_CLIENT_ID")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !is_test_placeholder_client_id(s))?
+        .to_string();
+    let default_secret = option_env!("GDRIVE_DEFAULT_CLIENT_SECRET")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    Some(ClientCredentials {
+        client_id: default_id,
+        client_secret: default_secret,
+    })
+}
+
+#[cfg(test)]
+pub fn builtin_default_credentials() -> Option<ClientCredentials> {
+    None
+}
+
+fn is_test_placeholder_client_id(client_id: &str) -> bool {
+    matches!(
+        client_id.trim(),
+        "prefilled-id.apps.googleusercontent.com"
+            | "my-id.apps.googleusercontent.com"
+            | "placeholder-id.apps.googleusercontent.com"
+            | "config-id-placeholder"
+            | "cli-id-placeholder"
+    )
+}
+
+#[cfg(test)]
+fn persist_credentials_to_keyring(_creds: &ClientCredentials) {}
+
+#[cfg(not(test))]
 fn persist_credentials_to_keyring(creds: &ClientCredentials) {
+    if is_test_placeholder_client_id(&creds.client_id) {
+        return;
+    }
     match keyring::Entry::new(KEYRING_SERVICE, KEYRING_CLIENT_CONFIG_USER) {
         Ok(entry) => {
             if let Ok(json) = serde_json::to_string(creds) {
@@ -237,16 +373,27 @@ fn persist_credentials_to_keyring(creds: &ClientCredentials) {
     }
 }
 
+#[cfg(test)]
+fn load_credentials_from_keyring() -> Option<ClientCredentials> {
+    None
+}
+
+#[cfg(not(test))]
 fn load_credentials_from_keyring() -> Option<ClientCredentials> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_CLIENT_CONFIG_USER).ok()?;
     let json = entry.get_password().ok()?;
     let creds: ClientCredentials = serde_json::from_str(&json).ok()?;
-    if creds.client_id.trim().is_empty() {
+    let trimmed = creds.client_id.trim();
+    if trimmed.is_empty() || is_test_placeholder_client_id(trimmed) {
         return None;
     }
     Some(creds)
 }
 
+#[cfg(test)]
+fn persist_refresh_token_to_keyring(_refresh_token: &str) {}
+
+#[cfg(not(test))]
 fn persist_refresh_token_to_keyring(refresh_token: &str) {
     match keyring::Entry::new(KEYRING_SERVICE, KEYRING_REFRESH_TOKEN_USER) {
         Ok(entry) => {
@@ -265,6 +412,10 @@ fn persist_refresh_token_to_keyring(refresh_token: &str) {
     }
 }
 
+#[cfg(test)]
+fn persist_token_scope_to_keyring(_scope: &str) {}
+
+#[cfg(not(test))]
 fn persist_token_scope_to_keyring(scope: &str) {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_SCOPE_USER) {
         if let Err(e) = entry.set_password(scope) {
@@ -276,6 +427,12 @@ fn persist_token_scope_to_keyring(scope: &str) {
     }
 }
 
+#[cfg(test)]
+fn load_token_scope_from_keyring() -> Option<String> {
+    None
+}
+
+#[cfg(not(test))]
 fn load_token_scope_from_keyring() -> Option<String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_SCOPE_USER).ok()?;
     let scope = entry.get_password().ok()?;
@@ -287,6 +444,12 @@ fn load_token_scope_from_keyring() -> Option<String> {
     }
 }
 
+#[cfg(test)]
+fn load_refresh_token_from_keyring() -> Option<String> {
+    None
+}
+
+#[cfg(not(test))]
 fn load_refresh_token_from_keyring() -> Option<String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_REFRESH_TOKEN_USER).ok()?;
     let token = entry.get_password().ok()?;
@@ -322,13 +485,8 @@ pub fn scope_satisfies_mode(granted_scope: &str, read_only: bool) -> bool {
     false
 }
 
-/// Removes stored OAuth2 refresh tokens and cached client credentials from the system keyring.
-pub fn clear_keyring_credentials() -> Result<(), AuthError> {
-    for user in [
-        KEYRING_REFRESH_TOKEN_USER,
-        KEYRING_TOKEN_SCOPE_USER,
-        KEYRING_CLIENT_CONFIG_USER,
-    ] {
+fn clear_keyring_entries(users: &[&str]) -> Result<(), AuthError> {
+    for &user in users {
         let entry = keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| {
             AuthError::KeyringError(format!(
                 "Failed to access keyring entry for '{}': {}",
@@ -346,6 +504,20 @@ pub fn clear_keyring_credentials() -> Result<(), AuthError> {
         }
     }
     Ok(())
+}
+
+/// Removes the signed-in account's tokens while preserving client credentials.
+pub fn clear_keyring_tokens() -> Result<(), AuthError> {
+    clear_keyring_entries(&[KEYRING_REFRESH_TOKEN_USER, KEYRING_TOKEN_SCOPE_USER])
+}
+
+/// Removes both account tokens and stored OAuth client credentials.
+pub fn clear_keyring_credentials() -> Result<(), AuthError> {
+    clear_keyring_entries(&[
+        KEYRING_REFRESH_TOKEN_USER,
+        KEYRING_TOKEN_SCOPE_USER,
+        KEYRING_CLIENT_CONFIG_USER,
+    ])
 }
 
 /// Represents an in-memory cached OAuth2 access token with its expiration timestamp.
@@ -409,9 +581,21 @@ impl AuthManager {
         open_browser: bool,
         read_only: bool,
     ) -> Result<Self, AuthError> {
+        Self::authenticate_with_account_selection(creds, open_browser, read_only, false).await
+    }
+
+    pub async fn authenticate_with_account_selection(
+        creds: ClientCredentials,
+        open_browser: bool,
+        read_only: bool,
+        select_account: bool,
+    ) -> Result<Self, AuthError> {
         let target_scope = required_oauth_scope(read_only);
 
-        if let Some(saved_refresh) = load_refresh_token_from_keyring() {
+        if let Some(saved_refresh) = (!select_account)
+            .then(load_refresh_token_from_keyring)
+            .flatten()
+        {
             let stored_scope = load_token_scope_from_keyring();
             let needs_scope_upgrade = match stored_scope.as_deref() {
                 Some(scope_str) => !scope_satisfies_mode(scope_str, read_only),
@@ -465,8 +649,13 @@ impl AuthManager {
             }
         }
 
-        let (cached_token, refresh_token) =
-            Self::run_interactive_pkce_flow_with_scope(&creds, open_browser, target_scope).await?;
+        let (cached_token, refresh_token) = Self::run_interactive_pkce_flow_with_scope(
+            &creds,
+            open_browser,
+            target_scope,
+            select_account,
+        )
+        .await?;
 
         if let Some(ref rt) = refresh_token {
             persist_refresh_token_to_keyring(rt);
@@ -551,6 +740,15 @@ impl AuthManager {
         redirect_uri: &str,
         scope: &str,
     ) -> Result<(Url, CsrfToken, PkceCodeVerifier), AuthError> {
+        Self::build_authorization_url(creds, redirect_uri, scope, false)
+    }
+
+    fn build_authorization_url(
+        creds: &ClientCredentials,
+        redirect_uri: &str,
+        scope: &str,
+        select_account: bool,
+    ) -> Result<(Url, CsrfToken, PkceCodeVerifier), AuthError> {
         let redirect_url = RedirectUrl::new(redirect_uri.to_string())
             .map_err(|e| AuthError::OAuthError(format!("Invalid redirect URL: {}", e)))?;
         let client = Self::build_oauth_client(creds, Some(redirect_url))?;
@@ -559,7 +757,14 @@ impl AuthManager {
             .authorize_url(CsrfToken::new_random)
             .add_scope(Scope::new(scope.to_string()))
             .add_extra_param("access_type", "offline")
-            .add_extra_param("prompt", "consent")
+            .add_extra_param(
+                "prompt",
+                if select_account {
+                    "select_account consent"
+                } else {
+                    "consent"
+                },
+            )
             .set_pkce_challenge(pkce_challenge)
             .url();
         Ok((auth_url, csrf_token, pkce_verifier))
@@ -598,6 +803,7 @@ impl AuthManager {
         creds: &ClientCredentials,
         open_browser: bool,
         scope: &str,
+        select_account: bool,
     ) -> Result<(CachedToken, Option<String>), AuthError> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let local_addr = listener.local_addr()?;
@@ -607,7 +813,7 @@ impl AuthManager {
 
         let client = Self::build_oauth_client(creds, Some(redirect_url))?;
         let (auth_url, csrf_token, pkce_verifier) =
-            Self::build_authorization_url_for_scope(creds, &redirect_uri_str, scope)?;
+            Self::build_authorization_url(creds, &redirect_uri_str, scope, select_account)?;
 
         println!(
             "\nPlease authenticate with Google Drive by visiting the following URL:\n{}\n",
@@ -999,6 +1205,20 @@ mod tests {
         assert!(ro_url
             .query_pairs()
             .any(|(k, v)| k == "scope" && v == GOOGLE_DRIVE_READONLY_SCOPE));
+
+        let (switch_url, _, _) = AuthManager::build_authorization_url(
+            &creds,
+            "http://127.0.0.1:8080",
+            GOOGLE_DRIVE_FULL_SCOPE,
+            true,
+        )
+        .unwrap();
+        assert!(switch_url
+            .query_pairs()
+            .any(|(key, value)| key == "prompt" && value == "select_account consent"));
+        assert!(rw_url
+            .query_pairs()
+            .any(|(key, value)| key == "prompt" && value == "consent"));
 
         // Verify Phase 3 AppConfig fields parse cleanly
         let raw_toml = r#"

@@ -19,5 +19,7 @@ Cargo.lock
 client_secret*.json
 *credentials*.json
 config.toml
+.env
+.env.build
 
 

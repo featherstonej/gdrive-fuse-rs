@@ -463,6 +463,99 @@ pub async fn sync_changes_once(
     }
 }
 
+const MAX_CACHED_DIR_LISTINGS: usize = 256;
+const MAX_CACHED_DIR_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CACHED_DIR_ENTRIES: usize = 32_768;
+
+#[derive(Clone)]
+struct CachedDirListing {
+    cache_revision: u64,
+    data_version: u64,
+    docs_mode: GoogleDocsMode,
+    shared_with_me: bool,
+    children: Arc<Vec<(String, CachedFile)>>,
+    by_name: Arc<HashMap<String, usize>>,
+}
+
+impl CachedDirListing {
+    fn estimated_bytes(&self) -> usize {
+        let mut bytes = self
+            .children
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, CachedFile)>())
+            .saturating_add(
+                self.by_name
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, usize)>() + 1),
+            );
+        for (name, file) in self.children.iter() {
+            bytes = bytes
+                .saturating_add(name.capacity())
+                .saturating_add(file.drive_id.capacity())
+                .saturating_add(file.name.capacity())
+                .saturating_add(file.mime_type.capacity())
+                .saturating_add(file.web_view_link.as_ref().map_or(0, String::capacity));
+        }
+        for name in self.by_name.keys() {
+            bytes = bytes.saturating_add(name.capacity());
+        }
+        bytes
+    }
+
+    fn cache_dir_listing(
+        cache: &mut HashMap<u64, CachedDirListing>,
+        dir_inode: u64,
+        listing: &CachedDirListing,
+    ) {
+        cache.remove(&dir_inode);
+        let listing_bytes = listing.estimated_bytes();
+        if listing.children.len() > MAX_CACHED_DIR_ENTRIES || listing_bytes > MAX_CACHED_DIR_BYTES {
+            return;
+        }
+        let total_bytes = cache.values().fold(listing_bytes, |total, cached| {
+            total.saturating_add(cached.estimated_bytes())
+        });
+        let total_entries = cache
+            .values()
+            .fold(listing.children.len(), |total, cached| {
+                total.saturating_add(cached.children.len())
+            });
+        if cache.len() >= MAX_CACHED_DIR_LISTINGS
+            || total_bytes > MAX_CACHED_DIR_BYTES
+            || total_entries > MAX_CACHED_DIR_ENTRIES
+        {
+            cache.clear();
+        }
+        cache.insert(dir_inode, listing.clone());
+    }
+
+    fn entries(
+        &self,
+        ino: u64,
+        parent_ino: u64,
+        shared_with_me: bool,
+    ) -> impl Iterator<Item = (u64, FileType, &str)> {
+        [
+            (ino, FileType::Directory, "."),
+            (parent_ino, FileType::Directory, ".."),
+        ]
+        .into_iter()
+        .chain((ino == FUSE_ROOT_ID && shared_with_me).then_some((
+            SHARED_WITH_ME_INODE,
+            FileType::Directory,
+            SHARED_WITH_ME_NAME,
+        )))
+        .chain(self.children.iter().map(|(name, file)| {
+            let kind = if file.is_dir {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            (file.inode, kind, name.as_str())
+        }))
+    }
+}
+
 /// Google Drive FUSE filesystem implementation supporting both Read-Only and Read-Write modes.
 pub struct GDriveFS {
     api: Arc<DriveClient>,
@@ -483,6 +576,7 @@ pub struct GDriveFS {
     open_handles: HashMap<u64, HashMap<u64, i32>>,
     unlinked_inodes: HashSet<u64>,
     remote_unlinked_generations: HashMap<u64, u64>,
+    dir_listing_cache: std::cell::RefCell<HashMap<u64, CachedDirListing>>,
     next_fh: u64,
 }
 
@@ -585,6 +679,7 @@ impl GDriveFS {
             open_handles: HashMap::new(),
             unlinked_inodes: HashSet::new(),
             remote_unlinked_generations: HashMap::new(),
+            dir_listing_cache: std::cell::RefCell::new(HashMap::new()),
             next_fh: 1,
         };
         if !read_only {
@@ -962,17 +1057,7 @@ impl GDriveFS {
             return Err(libc::ENOTDIR);
         }
 
-        let is_stale = match self.cache.is_dir_stale(dir_inode) {
-            Ok(stale) => stale,
-            Err(e) => {
-                log::error!(
-                    "Cache error checking staleness for directory inode {}: {}",
-                    dir_inode,
-                    e
-                );
-                return Err(e.to_errno());
-            }
-        };
+        let is_stale = self.cache.is_cached_file_stale(&dir_file);
 
         if is_stale {
             log::debug!(
@@ -980,6 +1065,7 @@ impl GDriveFS {
                 dir_inode,
                 dir_file.drive_id
             );
+            let fetch_started = Instant::now();
             let children_res = if dir_inode == SHARED_WITH_ME_INODE
                 || dir_file.drive_id == SHARED_WITH_ME_DRIVE_ID
             {
@@ -999,6 +1085,8 @@ impl GDriveFS {
                 api_err.to_errno()
             })?;
 
+            let fetch_elapsed = fetch_started.elapsed();
+            let sync_started = Instant::now();
             self.cache
                 .sync_directory_children(dir_inode, &children)
                 .map_err(|cache_err| {
@@ -1009,6 +1097,13 @@ impl GDriveFS {
                     );
                     cache_err.to_errno()
                 })?;
+            log::debug!(
+                "Directory inode {}: fetched {} entries in {:?}, cached in {:?}",
+                dir_inode,
+                children.len(),
+                fetch_elapsed,
+                sync_started.elapsed()
+            );
         }
 
         Ok(dir_file)
@@ -1052,12 +1147,28 @@ impl GDriveFS {
         }
     }
 
-    /// Computes the disambiguated POSIX display names for all cached children of `dir_inode`
-    /// after applying Google Workspace file extensions and reserving `"Shared with me"` in root.
-    fn disambiguated_children(
+    /// Computes (or retrieves from the in-memory revision-validated cache) the disambiguated
+    /// POSIX display names and `O(1)` lookup index for all cached children of `dir_inode`.
+    fn disambiguated_children_cached(
         &self,
         dir_inode: u64,
-    ) -> Result<Vec<(String, CachedFile)>, libc::c_int> {
+    ) -> Result<CachedDirListing, libc::c_int> {
+        let current_rev = self.cache.revision();
+        let data_version = self.cache.data_version().map_err(|e| {
+            log::error!("Failed to check cache data version: {}", e);
+            e.to_errno()
+        })?;
+        if let Some(cached) = self.dir_listing_cache.borrow().get(&dir_inode) {
+            if cached.cache_revision == current_rev
+                && cached.data_version == data_version
+                && cached.docs_mode == self.google_docs_mode
+                && cached.shared_with_me == self.shared_with_me
+            {
+                return Ok(cached.clone());
+            }
+        }
+
+        let listing_started = Instant::now();
         let children = self.cache.list_children(dir_inode).map_err(|e| {
             log::error!(
                 "Cache error listing children for inode {}: {}",
@@ -1101,10 +1212,35 @@ impl GDriveFS {
             final_names[idx] = disambiguate_filename(&raw_display_names[idx], &mut used_names);
         }
 
-        Ok(final_names
-            .into_iter()
-            .zip(children.into_iter().map(|e| e.file))
-            .collect())
+        let mut by_name = HashMap::with_capacity(children.len());
+        let mut ordered = Vec::with_capacity(children.len());
+        for (idx, (name, entry)) in final_names.into_iter().zip(children).enumerate() {
+            by_name.insert(name.clone(), idx);
+            ordered.push((name, entry.file));
+        }
+
+        let listing = CachedDirListing {
+            cache_revision: current_rev,
+            data_version,
+            docs_mode: self.google_docs_mode,
+            shared_with_me: self.shared_with_me,
+            children: Arc::new(ordered),
+            by_name: Arc::new(by_name),
+        };
+        log::debug!(
+            "Directory inode {}: prepared {} display names in {:?}",
+            dir_inode,
+            listing.children.len(),
+            listing_started.elapsed()
+        );
+
+        CachedDirListing::cache_dir_listing(
+            &mut self.dir_listing_cache.borrow_mut(),
+            dir_inode,
+            &listing,
+        );
+
+        Ok(listing)
     }
 
     fn find_child_by_display_name(
@@ -1112,10 +1248,11 @@ impl GDriveFS {
         parent: u64,
         name: &str,
     ) -> Result<Option<CachedFile>, libc::c_int> {
-        Ok(self
-            .disambiguated_children(parent)?
-            .into_iter()
-            .find_map(|(display_name, file)| (display_name == name).then_some(file)))
+        let listing = self.disambiguated_children_cached(parent)?;
+        Ok(listing
+            .by_name
+            .get(name)
+            .map(|&idx| listing.children[idx].1.clone()))
     }
 
     /// Resolves `lookup` for a child `name` inside `parent` inode.
@@ -1143,8 +1280,7 @@ impl GDriveFS {
         }
     }
 
-    /// Resolves `readdir` for `ino`, returning `.` and `..` followed by all cached children.
-    pub fn handle_readdir(&self, ino: u64) -> Result<Vec<(u64, FileType, String)>, libc::c_int> {
+    fn directory_listing(&self, ino: u64) -> Result<(u64, CachedDirListing), libc::c_int> {
         if ino == SHARED_WITH_ME_INODE && !self.shared_with_me {
             return Err(libc::ENOENT);
         }
@@ -1156,32 +1292,17 @@ impl GDriveFS {
             e.to_errno()
         })?;
 
-        let children = self.disambiguated_children(ino)?;
+        Ok((parent_ino, self.disambiguated_children_cached(ino)?))
+    }
 
-        let mut entries = Vec::with_capacity(children.len() + 3);
-        entries.extend([
-            (ino, FileType::Directory, ".".to_string()),
-            (parent_ino, FileType::Directory, "..".to_string()),
-        ]);
-
-        if ino == FUSE_ROOT_ID && self.shared_with_me {
-            entries.push((
-                SHARED_WITH_ME_INODE,
-                FileType::Directory,
-                SHARED_WITH_ME_NAME.to_string(),
-            ));
-        }
-
-        for (display_name, file) in children {
-            let kind = if file.is_dir {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
-            entries.push((file.inode, kind, display_name));
-        }
-
-        Ok(entries)
+    /// Resolves `readdir` for `ino`, returning `.` and `..` followed by all cached children.
+    #[cfg(test)]
+    pub fn handle_readdir(&self, ino: u64) -> Result<Vec<(u64, FileType, String)>, libc::c_int> {
+        let (parent_ino, listing) = self.directory_listing(ino)?;
+        Ok(listing
+            .entries(ino, parent_ino, self.shared_with_me)
+            .map(|(inode, kind, name)| (inode, kind, name.to_string()))
+            .collect())
     }
 
     /// Validates `access` permissions on `ino`, rejecting `W_OK` with `libc::EROFS` when mounted read-only.
@@ -2531,10 +2652,12 @@ impl Filesystem for GDriveFS {
             return;
         }
 
-        match self.handle_readdir(ino) {
-            Ok(entries) => {
-                for (idx, (child_ino, kind, name)) in
-                    entries.into_iter().enumerate().skip(offset as usize)
+        match self.directory_listing(ino) {
+            Ok((parent_ino, listing)) => {
+                for (idx, (child_ino, kind, name)) in listing
+                    .entries(ino, parent_ino, self.shared_with_me)
+                    .enumerate()
+                    .skip(offset as usize)
                 {
                     let next_offset = (idx + 1) as i64;
                     if reply.add(child_ino, next_offset, kind, name) {
@@ -3775,6 +3898,194 @@ mod tests {
         fs.handle_release(entry.inode, fh).unwrap();
 
         assert!(fs.cache.get_by_inode(entry.inode).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_directory_listing_cache_budget_and_oversized_entries() {
+        let file = CachedFile {
+            inode: 3,
+            drive_id: "id".into(),
+            name: "name".into(),
+            mime_type: "text/plain".into(),
+            size: 0,
+            modified_time: 0,
+            is_dir: false,
+            last_synced_at: None,
+            web_view_link: None,
+            dirty: false,
+        };
+        let listing = |name_len: usize| {
+            let name = "x".repeat(name_len);
+            CachedDirListing {
+                cache_revision: 0,
+                data_version: 0,
+                docs_mode: GoogleDocsMode::Browser,
+                shared_with_me: false,
+                children: Arc::new(vec![(name.clone(), file.clone())]),
+                by_name: Arc::new(HashMap::from([(name, 0)])),
+            }
+        };
+        let first = listing(5 * 1024 * 1024);
+        let second = listing(5 * 1024 * 1024);
+        assert!(first.estimated_bytes() <= MAX_CACHED_DIR_BYTES);
+        assert!(first.estimated_bytes() + second.estimated_bytes() > MAX_CACHED_DIR_BYTES);
+        let mut cache = HashMap::new();
+        CachedDirListing::cache_dir_listing(&mut cache, 1, &first);
+        assert!(cache.contains_key(&1));
+        CachedDirListing::cache_dir_listing(&mut cache, 2, &second);
+        assert!(!cache.contains_key(&1));
+        assert!(cache.contains_key(&2));
+        let oversized = listing(9 * 1024 * 1024);
+        assert!(oversized.estimated_bytes() > MAX_CACHED_DIR_BYTES);
+        CachedDirListing::cache_dir_listing(&mut cache, 2, &oversized);
+        assert!(cache.is_empty());
+
+        let too_many = CachedDirListing {
+            children: Arc::new(vec![
+                (String::new(), file.clone());
+                MAX_CACHED_DIR_ENTRIES + 1
+            ]),
+            ..listing(0)
+        };
+        CachedDirListing::cache_dir_listing(&mut cache, 3, &too_many);
+        assert!(!cache.contains_key(&3));
+    }
+
+    #[test]
+    fn test_directory_listing_cache_reuses_and_invalidates_after_sync() {
+        let rt = Runtime::new().unwrap();
+        let fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+        let file = |id: &str, name: &str| crate::api::DriveFile {
+            id: id.to_string(),
+            name: name.to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 0,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".to_string()],
+            trashed: false,
+            web_view_link: None,
+        };
+
+        fs.cache
+            .sync_directory_children(FUSE_ROOT_ID, &[file("first", "first.txt")])
+            .unwrap();
+        let first = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        let reused = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert!(Arc::ptr_eq(&first.children, &reused.children));
+
+        fs.cache
+            .sync_directory_children(FUSE_ROOT_ID, &[file("second", "second.txt")])
+            .unwrap();
+        let refreshed = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert!(!Arc::ptr_eq(&reused.children, &refreshed.children));
+        assert_eq!(refreshed.children[0].0, "second.txt");
+    }
+
+    #[test]
+    fn test_directory_listing_invalidated_by_another_connection() {
+        let rt = Runtime::new().unwrap();
+        let mut fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-listing-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db_path = dir.join("metadata.db");
+        fs.cache = Arc::new(MetadataCache::open(&db_path, 300).unwrap());
+        let other = MetadataCache::open(&db_path, 300).unwrap();
+        let first = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert!(first.children.is_empty());
+
+        other
+            .sync_directory_children(
+                FUSE_ROOT_ID,
+                &[crate::api::DriveFile {
+                    id: "external".into(),
+                    name: "external.txt".into(),
+                    mime_type: "text/plain".into(),
+                    size: 0,
+                    modified_time: 0,
+                    parents: vec!["root".into()],
+                    trashed: false,
+                    web_view_link: None,
+                }],
+            )
+            .unwrap();
+        let updated = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert_eq!(updated.children[0].0, "external.txt");
+        drop(other);
+        drop(fs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_directory_listing_resumes_at_offsets_without_copying_names() {
+        let rt = Runtime::new().unwrap();
+        let fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+        let files = (0..100)
+            .map(|i| crate::api::DriveFile {
+                id: format!("file-{i}"),
+                name: format!("file-{i}.txt"),
+                mime_type: "text/plain".to_string(),
+                size: 0,
+                modified_time: 1_700_000_000,
+                parents: vec!["root".to_string()],
+                trashed: false,
+                web_view_link: None,
+            })
+            .collect::<Vec<_>>();
+        fs.cache
+            .sync_directory_children(FUSE_ROOT_ID, &files)
+            .unwrap();
+        let (parent, listing) = fs.directory_listing(FUSE_ROOT_ID).unwrap();
+        for shared in [false, true] {
+            let expected = listing
+                .entries(FUSE_ROOT_ID, parent, shared)
+                .collect::<Vec<_>>();
+            let paged = (0..expected.len())
+                .step_by(7)
+                .flat_map(|offset| {
+                    listing
+                        .entries(FUSE_ROOT_ID, parent, shared)
+                        .skip(offset)
+                        .take(7)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(paged, expected);
+            assert!(listing
+                .entries(FUSE_ROOT_ID, parent, shared)
+                .nth(expected.len() + 1)
+                .is_none());
+            let first_child = if shared { 3 } else { 2 };
+            assert!(std::ptr::eq(
+                expected[first_child].2.as_ptr(),
+                listing.children[0].0.as_ptr()
+            ));
+        }
+        assert_eq!(
+            listing
+                .entries(123, parent, true)
+                .take(2)
+                .collect::<Vec<_>>(),
+            vec![
+                (123, FileType::Directory, "."),
+                (parent, FileType::Directory, "..")
+            ]
+        );
+        assert_eq!(listing.entries(123, parent, true).count(), files.len() + 2);
     }
 
     #[test]

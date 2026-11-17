@@ -6,6 +6,8 @@ mod auth;
 mod cache;
 #[allow(dead_code)]
 mod filesystem;
+#[allow(dead_code)]
+mod setup_ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +19,8 @@ use fuser::{MountOption, Session};
 
 use crate::api::DriveClient;
 use crate::auth::{
-    clear_keyring_credentials, resolve_credentials, AppConfig, AuthManager, GoogleDocsMode,
+    clear_keyring_credentials, clear_keyring_tokens, resolve_credentials, validate_credentials,
+    AppConfig, AuthManager, GoogleDocsMode,
 };
 use crate::cache::MetadataCache;
 use crate::filesystem::{
@@ -103,6 +106,10 @@ pub struct CliArgs {
     #[arg(long = "setup", default_value_t = false)]
     pub setup: bool,
 
+    /// Open the local browser configuration wizard to customize settings in ~/.config/gdrive-fuse-rs/config.toml.
+    #[arg(long = "configure", default_value_t = false)]
+    pub configure: bool,
+
     /// Open a `.gdoc`, `.gsheet`, `.gslides`, or `.gdrive` shortcut file in the default web browser.
     #[arg(long = "open-doc", value_name = "FILE")]
     pub open_doc: Option<PathBuf>,
@@ -133,7 +140,7 @@ fn main() -> Result<()> {
 
     let config = match &args.config {
         Some(path) => {
-            if !path.exists() {
+            if !path.exists() && !args.setup && !args.configure {
                 bail!("Configuration file does not exist: {}", path.display());
             }
             AppConfig::load_from_path(path)
@@ -142,56 +149,72 @@ fn main() -> Result<()> {
         None => AppConfig::load_default().context("Failed to load default configuration")?,
     };
 
+    if (args.logout || args.clear_cache) && (args.setup || args.configure) {
+        let output = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--value",
+                "gdrive-fuse-rs.service",
+            ])
+            .output()
+            .context("Failed to check gdrive-fuse-rs.service before cleanup")?;
+        let load_state = std::str::from_utf8(&output.stdout)
+            .context("Invalid systemd service load state")?
+            .trim();
+        if load_state != "not-found" {
+            if !output.status.success() || load_state.is_empty() {
+                bail!(
+                    "Failed to check gdrive-fuse-rs.service before cleanup: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let status = std::process::Command::new("systemctl")
+                .args(["--user", "stop", "gdrive-fuse-rs.service"])
+                .status()
+                .context("Failed to stop gdrive-fuse-rs.service before cleanup")?;
+            if !status.success() {
+                bail!("Failed to stop gdrive-fuse-rs.service before cleanup");
+            }
+        }
+    }
+
     if args.logout {
         clear_keyring_credentials()
             .context("Failed to clear OAuth2 credentials from system keyring")?;
         log::info!("Cleared stored Google Drive OAuth2 credentials from system keyring.");
-        if args.mount_point.is_none() && !args.clear_cache && !args.install_systemd && !args.setup {
+        if args.mount_point.is_none()
+            && !args.clear_cache
+            && !args.install_systemd
+            && !args.setup
+            && !args.configure
+        {
             return Ok(());
         }
     }
 
     if args.clear_cache {
-        let db_path = args
-            .cache_db
-            .clone()
-            .or_else(|| config.cache_db_path.clone())
-            .unwrap_or_else(MetadataCache::default_db_path);
-        MetadataCache::remove_db_files(&db_path).with_context(|| {
-            format!(
-                "Failed to remove SQLite metadata cache at {}",
-                db_path.display()
-            )
-        })?;
-        let stage_dir = args
-            .staging_dir
-            .clone()
-            .or_else(|| config.staging_dir_path.clone())
-            .unwrap_or_else(|| MetadataCache::default_staging_dir_for_db(&db_path));
-        let stage_dir = if stage_dir == MetadataCache::default_staging_dir() {
-            MetadataCache::default_staging_dir_for_db(&db_path)
-        } else {
-            stage_dir
-        };
-        let _ = MetadataCache::clear_staging_dir(&stage_dir);
-        log::info!("Removed SQLite metadata cache at {}.", db_path.display());
-        if args.mount_point.is_none() && !args.install_systemd && !args.setup {
+        clear_local_cache_and_staging(&args, &config)?;
+        if args.mount_point.is_none() && !args.install_systemd && !args.setup && !args.configure {
             return Ok(());
         }
     }
 
-    if args.install_systemd || args.setup {
-        let unit_mount_point = install_user_systemd_unit(&args, &config)?;
-        if !args.setup && args.mount_point.is_none() {
+    if args.setup || args.configure {
+        return run_guided_setup(&args, &config);
+    }
+
+    if args.install_systemd {
+        let _ = install_user_systemd_unit(&args, &config)?;
+        if args.mount_point.is_none() {
             return Ok(());
-        }
-        if args.setup {
-            return run_guided_setup(&args, &config, &unit_mount_point);
         }
     }
 
     let (mount_point, auto_create_mount_point) =
         resolve_mount_point(args.mount_point.clone(), config.mount_point_path.clone());
+    cleanup_stale_fuse_mount(&mount_point);
     if auto_create_mount_point && !mount_point.exists() {
         std::fs::create_dir_all(&mount_point).with_context(|| {
             format!(
@@ -533,7 +556,7 @@ pub fn generate_systemd_unit(exe_path: &Path, mount_point: &Path, args: &[String
          Type=simple\n\
          ExecStartPre=/bin/mkdir -p \"{mp}\"\n\
          ExecStart=\"{exe}\" --mount-point \"{mp}\" --no-browser{args}\n\
-         ExecStop=/bin/sh -c 'fusermount3 -u \"$1\" || fusermount -u \"$1\"' sh \"{mp}\"\n\
+         ExecStop=-/bin/sh -c 'fusermount3 -u \"$1\" || fusermount -u \"$1\"' sh \"{mp}\"\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
@@ -668,34 +691,247 @@ fn install_user_systemd_unit(args: &CliArgs, config: &AppConfig) -> Result<PathB
     Ok(unit_mount_point)
 }
 
-fn run_guided_setup(args: &CliArgs, config: &AppConfig, mount_point: &Path) -> Result<()> {
-    std::fs::create_dir_all(mount_point).with_context(|| {
+fn cache_cleanup_paths(args: &CliArgs, config: &AppConfig) -> Result<(PathBuf, PathBuf)> {
+    let db_path = args
+        .cache_db
+        .clone()
+        .or_else(|| config.cache_db_path.clone())
+        .unwrap_or_else(MetadataCache::default_db_path);
+    let db_path = match std::fs::symlink_metadata(&db_path) {
+        Ok(_) => std::fs::canonicalize(&db_path).with_context(|| {
+            format!(
+                "Failed to resolve SQLite metadata cache at {}",
+                db_path.display()
+            )
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => db_path,
+        Err(err) => return Err(err).context("Failed to inspect SQLite metadata cache path"),
+    };
+    let stage_dir = args
+        .staging_dir
+        .clone()
+        .or_else(|| config.staging_dir_path.clone())
+        .unwrap_or_else(|| MetadataCache::default_staging_dir_for_db(&db_path));
+    let stage_dir = if stage_dir == MetadataCache::default_staging_dir() {
+        MetadataCache::default_staging_dir_for_db(&db_path)
+    } else {
+        stage_dir
+    };
+    Ok((db_path, stage_dir))
+}
+
+fn clear_local_cache_and_staging(args: &CliArgs, config: &AppConfig) -> Result<()> {
+    let (db_path, stage_dir) = cache_cleanup_paths(args, config)?;
+    MetadataCache::clear_staging_dir(&stage_dir)
+        .with_context(|| format!("Failed to clear staging directory {}", stage_dir.display()))?;
+    MetadataCache::remove_db_files(&db_path).with_context(|| {
         format!(
-            "Failed to create mount point directory {}",
-            mount_point.display()
+            "Failed to remove SQLite metadata cache at {}",
+            db_path.display()
         )
     })?;
+    log::info!("Removed SQLite metadata cache at {}.", db_path.display());
+    Ok(())
+}
 
-    let credentials =
-        resolve_credentials(args.client_id.clone(), args.client_secret.clone(), config)
-            .context("Failed to resolve Google OAuth2 client credentials")?;
-    let read_only = args.read_only || config.read_only.unwrap_or(false);
+fn stop_existing_service(systemctl: &std::ffi::OsStr, existing_unit: bool) -> Result<()> {
+    if existing_unit {
+        let status = std::process::Command::new(systemctl)
+            .args(["--user", "stop", "gdrive-fuse-rs.service"])
+            .status()
+            .context("Failed to stop existing gdrive-fuse-rs.service")?;
+        if !status.success() {
+            bail!("Failed to stop existing gdrive-fuse-rs.service");
+        }
+    }
+    Ok(())
+}
 
+fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("Failed to initialize Tokio async runtime")?;
 
+    let config_file_path = args.config.clone().or_else(AppConfig::default_path);
+    let config_exists = config_file_path.as_ref().is_some_and(|p| p.exists());
+    let has_resolvable_creds = validate_credentials(
+        args.client_id.clone(),
+        args.client_secret.clone(),
+        initial_config,
+    )
+    .is_ok();
+
+    let mut active_config = initial_config.clone();
+    let service_state = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=LoadState",
+            "--value",
+            "gdrive-fuse-rs.service",
+        ])
+        .output()
+        .context("Failed to check existing gdrive-fuse-rs.service")?;
+    let load_state = std::str::from_utf8(&service_state.stdout)
+        .context("Invalid systemd service load state")?
+        .trim();
+    if load_state != "not-found" && (!service_state.status.success() || load_state.is_empty()) {
+        bail!(
+            "Failed to check existing gdrive-fuse-rs.service: {}",
+            String::from_utf8_lossy(&service_state.stderr).trim()
+        );
+    }
+    let existing_unit = load_state != "not-found";
+    let mut enable_autostart = if config_exists && existing_unit {
+        systemd_autostart_state()?.0
+    } else {
+        true
+    };
+    let mut switch_account = false;
+
+    // Prepare defaults in memory; persist only after the wizard is submitted.
+    if !config_exists {
+        if active_config.mount_point_path.is_none() {
+            active_config.mount_point_path =
+                Some(args.mount_point.clone().unwrap_or_else(default_mount_point));
+        }
+        if active_config.google_docs_mode.is_none() {
+            active_config.google_docs_mode = Some(GoogleDocsMode::Browser);
+        }
+        if active_config.shared_with_me.is_none() {
+            active_config.shared_with_me = Some(true);
+        }
+        if active_config.read_only.is_none() {
+            active_config.read_only = Some(args.read_only);
+        }
+        if let Ok(existing_creds) = validate_credentials(
+            args.client_id.clone(),
+            args.client_secret.clone(),
+            &active_config,
+        ) {
+            let is_builtin = auth::builtin_default_credentials()
+                .as_ref()
+                .is_some_and(|b| b.client_id == existing_creds.client_id);
+            if !is_builtin {
+                active_config.client_id = Some(existing_creds.client_id);
+                active_config.client_secret = existing_creds.client_secret;
+            }
+        } else {
+            active_config.client_id = None;
+            active_config.client_secret = None;
+        }
+    }
+
+    let wizard_ran = args.configure || !config_exists || !has_resolvable_creds;
+    if wizard_ran {
+        active_config.google_docs_mode = args.google_docs_mode.or(active_config.google_docs_mode);
+        active_config.read_only = Some(args.read_only || active_config.read_only.unwrap_or(false));
+        active_config.shared_with_me =
+            Some(!args.no_shared_with_me && active_config.shared_with_me.unwrap_or(true));
+        if let Some(client_id) = args
+            .client_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if active_config.client_id.as_deref().map(str::trim) != Some(client_id) {
+                active_config.client_secret = None;
+            }
+            active_config.client_id = Some(client_id.to_owned());
+            if let Some(client_secret) = args
+                .client_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                active_config.client_secret = Some(client_secret.to_owned());
+            }
+        }
+        let outcome = rt.block_on(setup_ui::run_browser_setup_wizard(
+            &active_config,
+            args.mount_point.clone(),
+            args.client_id.clone(),
+            args.client_secret.clone(),
+            !args.no_browser,
+            enable_autostart,
+        ))?;
+        active_config = outcome.config;
+        enable_autostart = outcome.enable_autostart;
+        switch_account = outcome.switch_account;
+
+        stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
+        if outcome.switch_account {
+            clear_local_cache_and_staging(args, &active_config)?;
+            clear_keyring_tokens().context("Failed to clear OAuth2 tokens from system keyring")?;
+            log::info!("Cleared previous Google account session and metadata cache.");
+        }
+
+        if let Some(ref save_path) = config_file_path {
+            active_config.save_to_path(save_path).with_context(|| {
+                format!("Failed to save configuration to {}", save_path.display())
+            })?;
+            log::info!("Saved configuration to {}.", save_path.display());
+        }
+    }
+
+    if !wizard_ran {
+        stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
+    }
+
+    let mut unit_args = args.clone();
+    if wizard_ran {
+        unit_args.mount_point = active_config.mount_point_path.clone();
+        unit_args.client_id = active_config.client_id.clone();
+        unit_args.client_secret = active_config.client_secret.clone();
+        unit_args.google_docs_mode = active_config.google_docs_mode;
+        unit_args.read_only = active_config.read_only.unwrap_or(false);
+        unit_args.no_shared_with_me = !active_config.shared_with_me.unwrap_or(true);
+    }
+    let args = &unit_args;
+    let credentials = resolve_credentials(
+        args.client_id.clone(),
+        args.client_secret.clone(),
+        &active_config,
+    )
+    .context("Failed to resolve Google OAuth2 client credentials")?;
+    let read_only = args.read_only || active_config.read_only.unwrap_or(false);
+
     log::info!(
         "Completing Google Drive OAuth2 sign-in (mode={})...",
         if read_only { "read-only" } else { "read-write" }
     );
-    rt.block_on(AuthManager::authenticate_with_mode(
+    rt.block_on(AuthManager::authenticate_with_account_selection(
         credentials,
         !args.no_browser,
         read_only,
+        switch_account,
     ))
     .context("Google OAuth2 authentication failed during setup")?;
+
+    let mut service_args = (*args).clone();
+    if wizard_ran && config_file_path.is_some() {
+        service_args.client_id = None;
+        service_args.client_secret = None;
+        service_args.google_docs_mode = None;
+        service_args.read_only = false;
+        service_args.no_shared_with_me = false;
+    }
+    let unit_mount_point = install_user_systemd_unit(&service_args, &active_config)?;
+    cleanup_stale_fuse_mount(&unit_mount_point);
+    std::fs::create_dir_all(&unit_mount_point).with_context(|| {
+        format!(
+            "Failed to create mount point directory {}",
+            unit_mount_point.display()
+        )
+    })?;
+    let mounts = std::fs::read_to_string("/proc/mounts").context("Failed to inspect mounts")?;
+    if is_fuse_mounted_in_proc_mounts(&mounts, &unit_mount_point) {
+        bail!(
+            "A Google Drive mount is still active at {}; unmount it before setup",
+            unit_mount_point.display()
+        );
+    }
 
     if let Ok(exe_path) = std::env::current_exe() {
         let _ = install_gdrive_mime_handlers(&exe_path);
@@ -704,29 +940,142 @@ fn run_guided_setup(args: &CliArgs, config: &AppConfig, mount_point: &Path) -> R
     let reload_ok = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status()
-        .is_ok_and(|s| s.success());
-    let enable_ok = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "--now", "gdrive-fuse-rs.service"])
-        .status()
-        .is_ok_and(|s| s.success());
+        .context("Failed to reload systemd user units")?;
+    if !reload_ok.success() {
+        bail!("Failed to reload systemd user units");
+    }
 
-    if reload_ok && enable_ok {
-        log::info!(
-            "Enabled and started gdrive-fuse-rs.service (mounted at {}).",
-            mount_point.display()
-        );
+    let action = if enable_autostart {
+        "enable"
     } else {
-        log::warn!(
-            "Could not automatically start systemd user service; you can mount directly with: gdrive-fuse-rs --mount-point {}",
-            mount_point.display()
+        "disable"
+    };
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", action, "gdrive-fuse-rs.service"])
+        .status()
+        .with_context(|| format!("Failed to run systemctl --user {action}"))?;
+    if !status.success() {
+        bail!("Failed to {action} gdrive-fuse-rs.service for login auto-mount");
+    }
+    cleanup_stale_fuse_mount(&unit_mount_point);
+
+    let restart_ok = std::process::Command::new("systemctl")
+        .args(["--user", "start", "gdrive-fuse-rs.service"])
+        .status()
+        .context("Failed to start gdrive-fuse-rs.service")?;
+    if !restart_ok.success() {
+        bail!("Failed to start gdrive-fuse-rs.service");
+    }
+    log::info!(
+        "Started gdrive-fuse-rs.service (waiting for mount at {}...).",
+        unit_mount_point.display()
+    );
+    if !wait_for_fuse_mount(&unit_mount_point, Duration::from_secs(15)) {
+        bail!(
+            "gdrive-fuse-rs.service did not mount {} in time; check systemd user logs",
+            unit_mount_point.display()
         );
     }
 
     if !args.no_browser {
-        let _ = open::that(mount_point);
+        let _ = open::that(&unit_mount_point);
     }
 
     Ok(())
+}
+
+fn systemd_autostart_state() -> Result<(bool, bool)> {
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "gdrive-fuse-rs.service"])
+        .output()
+        .context("Failed to check gdrive-fuse-rs.service auto-mount state")?;
+    let state = std::str::from_utf8(&output.stdout)
+        .context("Invalid systemctl auto-mount state")?
+        .trim();
+    match state {
+        "enabled" | "enabled-runtime" => Ok((true, true)),
+        "disabled" | "masked" | "masked-runtime" | "static" | "indirect" => Ok((false, true)),
+        "not-found" => Ok((true, false)),
+        _ => bail!(
+            "Failed to check gdrive-fuse-rs.service auto-mount state: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+/// Lazily unmounts `mount_point` if a previous FUSE session left it in a stale `ENOTCONN`
+/// (`Transport endpoint is not connected`, errno 107) state.
+fn cleanup_stale_fuse_mount(mount_point: &Path) {
+    let is_stale_enotconn = match std::fs::metadata(mount_point) {
+        Ok(_) => false,
+        Err(err) => err.raw_os_error() == Some(libc::ENOTCONN),
+    };
+    if is_stale_enotconn {
+        log::warn!(
+            "Detected stale FUSE mount at {} (ENOTCONN); unmounting cleanly...",
+            mount_point.display()
+        );
+        let mp_str = mount_point.to_string_lossy();
+        let succeeded = std::process::Command::new("fusermount3")
+            .args(["-uz", mp_str.as_ref()])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !succeeded {
+            let _ = std::process::Command::new("fusermount")
+                .args(["-uz", mp_str.as_ref()])
+                .status();
+        }
+    }
+}
+
+/// Checks `/proc/mounts` content to determine if `mount_point` is currently mounted by FUSE.
+pub fn is_fuse_mounted_in_proc_mounts(proc_mounts: &str, mount_point: &Path) -> bool {
+    let canonical =
+        std::fs::canonicalize(mount_point).unwrap_or_else(|_| mount_point.to_path_buf());
+    let target_raw = mount_point.to_string_lossy();
+    let target_canon = canonical.to_string_lossy();
+
+    for line in proc_mounts.lines() {
+        let mut cols = line.split_whitespace();
+        let _device = cols.next();
+        let Some(mp_escaped) = cols.next() else {
+            continue;
+        };
+        let Some(fstype) = cols.next() else {
+            continue;
+        };
+        if !matches!(_device, Some("gdrive") | Some("gdrive-fuse-rs"))
+            || !matches!(fstype, "fuse" | "fuse.gdrive-fuse-rs")
+        {
+            continue;
+        }
+        let mp = unescape_proc_mounts_path(mp_escaped);
+        if mp == target_raw.as_ref() || mp == target_canon.as_ref() {
+            return true;
+        }
+    }
+    false
+}
+
+fn unescape_proc_mounts_path(escaped: &str) -> String {
+    escaped
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+fn wait_for_fuse_mount(mount_point: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") {
+            if is_fuse_mounted_in_proc_mounts(&proc_mounts, mount_point) {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 fn resolve_chunk_size(cli_size: Option<usize>, config_size: Option<usize>) -> Result<usize> {
@@ -756,6 +1105,119 @@ fn parse_chunk_size(value: &str) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_setup_stops_existing_service_before_applying_requested_options() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-stop-service-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let command = dir.join("systemctl");
+        let called = dir.join("called");
+        std::fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                called.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        stop_existing_service(command.as_os_str(), false).unwrap();
+        assert!(!called.exists());
+        stop_existing_service(command.as_os_str(), true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&called).unwrap(),
+            "--user\nstop\ngdrive-fuse-rs.service\n"
+        );
+        let args = CliArgs::try_parse_from(["gdrive-fuse-rs", "--setup", "--read-only"]).unwrap();
+        assert!(systemd_mount_args(&args).contains(&"--read-only".to_owned()));
+        std::fs::write(&command, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(stop_existing_service(command.as_os_str(), true).is_err());
+        std::fs::remove_file(command).unwrap();
+        std::fs::remove_file(called).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_cache_cleanup_keeps_database_if_staging_cleanup_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-cleanup-error-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db = dir.join("cache.db");
+        let stage = dir.join("not-a-directory");
+        std::fs::write(&db, b"metadata").unwrap();
+        std::fs::write(&stage, b"staged").unwrap();
+        let args = CliArgs::try_parse_from([
+            "gdrive-fuse-rs",
+            "--cache-db",
+            db.to_str().unwrap(),
+            "--staging-dir",
+            stage.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(clear_local_cache_and_staging(&args, &AppConfig::default()).is_err());
+        assert_eq!(std::fs::read(&db).unwrap(), b"metadata");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"staged");
+        std::fs::remove_file(db).unwrap();
+        std::fs::remove_file(stage).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_cache_cleanup_resolves_database_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-cleanup-symlink-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db = dir.join("target.db");
+        let link = dir.join("link.db");
+        let stage = dir.join("staging");
+        std::fs::write(&db, b"metadata").unwrap();
+        std::fs::write(dir.join("target.db-wal"), b"wal").unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("inode_1.stage"), b"staged").unwrap();
+        symlink(&db, &link).unwrap();
+        assert_eq!(
+            MetadataCache::default_staging_dir_for_db(&db),
+            MetadataCache::default_staging_dir_for_db(&link)
+        );
+        let default_args =
+            CliArgs::try_parse_from(["gdrive-fuse-rs", "--cache-db", link.to_str().unwrap()])
+                .unwrap();
+        let (resolved_db, resolved_stage) =
+            cache_cleanup_paths(&default_args, &AppConfig::default()).unwrap();
+        assert_eq!(resolved_db, std::fs::canonicalize(&db).unwrap());
+        assert_eq!(
+            resolved_stage,
+            MetadataCache::default_staging_dir_for_db(&db)
+        );
+        let args = CliArgs::try_parse_from([
+            "gdrive-fuse-rs",
+            "--cache-db",
+            link.to_str().unwrap(),
+            "--staging-dir",
+            stage.to_str().unwrap(),
+        ])
+        .unwrap();
+        clear_local_cache_and_staging(&args, &AppConfig::default()).unwrap();
+        assert!(!db.exists());
+        assert!(!dir.join("target.db-wal").exists());
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        assert!(!stage.join("inode_1.stage").exists());
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir(stage).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn test_cli_args_parsing_readme_invocation() {
@@ -835,7 +1297,7 @@ mod tests {
             "ExecStart=\"/usr/local/bin/gdrive-fuse-rs\" --mount-point \"/home/alice/GoogleDrive\" --no-browser"
         ));
         assert!(unit.contains(
-            "ExecStop=/bin/sh -c 'fusermount3 -u \"$1\" || fusermount -u \"$1\"' sh \"/home/alice/GoogleDrive\""
+            "ExecStop=-/bin/sh -c 'fusermount3 -u \"$1\" || fusermount -u \"$1\"' sh \"/home/alice/GoogleDrive\""
         ));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
@@ -996,5 +1458,30 @@ mod tests {
         let setup_args = CliArgs::try_parse_from(["gdrive-fuse-rs", "--setup"])
             .expect("--setup flag must parse");
         assert!(setup_args.setup);
+
+        let configure_args = CliArgs::try_parse_from(["gdrive-fuse-rs", "--configure"])
+            .expect("--configure flag must parse");
+        assert!(configure_args.configure);
+    }
+
+    #[test]
+    fn test_is_fuse_mounted_in_proc_mounts_detection() {
+        let sample_mounts = "\
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+gdrive-fuse-rs /home/alice/GoogleDrive fuse.gdrive-fuse-rs rw,nosuid,nodev,relatime,user_id=1000,group_id=1000,default_permissions 0 0
+gdrive-fuse-rs /home/alice/My\\040Drive fuse rw,nosuid,nodev 0 0
+";
+        assert!(is_fuse_mounted_in_proc_mounts(
+            sample_mounts,
+            Path::new("/home/alice/GoogleDrive")
+        ));
+        assert!(is_fuse_mounted_in_proc_mounts(
+            sample_mounts,
+            Path::new("/home/alice/My Drive")
+        ));
+        assert!(!is_fuse_mounted_in_proc_mounts(
+            sample_mounts,
+            Path::new("/home/alice/Other")
+        ));
     }
 }
