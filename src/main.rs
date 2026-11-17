@@ -217,7 +217,7 @@ fn main() -> Result<()> {
         resolve_credentials(args.client_id.clone(), args.client_secret.clone(), &config)
             .context("Failed to resolve Google OAuth2 client credentials")?;
 
-    let cache_ttl_secs = args.cache_ttl.or(config.cache_ttl_secs).unwrap_or(3600);
+    let cache_ttl_secs = args.cache_ttl.or(config.cache_ttl_secs).unwrap_or(60);
     let chunk_size_bytes = resolve_chunk_size(args.chunk_size, config.chunk_size_bytes)?;
     let google_docs_mode = args
         .google_docs_mode
