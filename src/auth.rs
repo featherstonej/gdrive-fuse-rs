@@ -153,6 +153,20 @@ impl AppConfig {
             let result = (|| -> std::io::Result<()> {
                 file.write_all(serialized.as_bytes())?;
                 file.sync_all()?;
+                match std::fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "Refusing to replace symlinked config file {}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
                 std::fs::rename(&temp_path, path)
             })();
             if result.is_err() {
