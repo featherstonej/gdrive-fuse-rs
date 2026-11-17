@@ -495,7 +495,14 @@ impl DriveClient {
                     return Err(error);
                 }
 
-                let body_bytes = response.bytes().await?;
+                let body_bytes = match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(_) if attempt < 3 => {
+                        tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+                        continue;
+                    }
+                    Err(err) => return Err(ApiError::Http(err)),
+                };
                 break serde_json::from_slice(&body_bytes)?;
             };
 
