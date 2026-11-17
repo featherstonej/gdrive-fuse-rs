@@ -826,7 +826,7 @@ fn render_setup_form_html(
         <input type="checkbox" id="read_only" name="read_only" {chk_ro}>
         <label for="read_only">
           <strong>Strict Read-Only Mode</strong><br>
-          <span class="hint">Uses the <code>drive.readonly</code> scope and blocks local writes/deletes.</span>
+          <span class="hint">Blocks local writes/deletes. New sign-ins request <code>drive.readonly</code>, but an existing full-access grant may be reused.</span>
         </label>
       </div>
 
