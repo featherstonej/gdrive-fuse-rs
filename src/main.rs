@@ -825,6 +825,29 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
 
     let wizard_ran = args.configure || !config_exists || !has_resolvable_creds;
     if wizard_ran {
+        active_config.google_docs_mode = args.google_docs_mode.or(active_config.google_docs_mode);
+        active_config.read_only = Some(args.read_only || active_config.read_only.unwrap_or(false));
+        active_config.shared_with_me =
+            Some(!args.no_shared_with_me && active_config.shared_with_me.unwrap_or(true));
+        if let Some(client_id) = args
+            .client_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if active_config.client_id.as_deref().map(str::trim) != Some(client_id) {
+                active_config.client_secret = None;
+            }
+            active_config.client_id = Some(client_id.to_owned());
+            if let Some(client_secret) = args
+                .client_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                active_config.client_secret = Some(client_secret.to_owned());
+            }
+        }
         let outcome = rt.block_on(setup_ui::run_browser_setup_wizard(
             &active_config,
             args.mount_point.clone(),
