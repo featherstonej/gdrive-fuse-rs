@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use oauth2::CsrfToken;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use url::form_urlencoded;
 
-use crate::auth::{builtin_default_credentials, resolve_credentials, AppConfig, GoogleDocsMode};
+use crate::auth::{builtin_default_credentials, validate_credentials, AppConfig, GoogleDocsMode};
 use crate::default_mount_point;
 
 const SETUP_UI_TIMEOUT: Duration = Duration::from_secs(300);
@@ -32,6 +33,7 @@ pub async fn run_browser_setup_wizard(
     cli_client_id: Option<String>,
     cli_client_secret: Option<String>,
     open_browser: bool,
+    enable_autostart: bool,
 ) -> Result<SetupWizardOutcome> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -39,10 +41,10 @@ pub async fn run_browser_setup_wizard(
     let local_addr = listener
         .local_addr()
         .context("Failed to read setup wizard local address")?;
-    let csrf_token = generate_csrf_token();
-    let setup_url = format!("http://127.0.0.1:{}/", local_addr.port());
+    let csrf_token = CsrfToken::new_random_len(32).secret().to_owned();
+    let setup_url = format!("http://127.0.0.1:{}/{}/", local_addr.port(), csrf_token);
 
-    let existing_creds = resolve_credentials(
+    let existing_creds = validate_credentials(
         cli_client_id.clone(),
         cli_client_secret.clone(),
         initial_config,
@@ -65,14 +67,6 @@ pub async fn run_browser_setup_wizard(
         existing_creds
             .as_ref()
             .map(|c| c.client_id.clone())
-            .unwrap_or_default()
-    };
-    let default_client_secret = if using_only_builtin {
-        String::new()
-    } else {
-        existing_creds
-            .as_ref()
-            .and_then(|c| c.client_secret.clone())
             .unwrap_or_default()
     };
     let default_docs_mode = initial_config.google_docs_mode.unwrap_or_default();
@@ -100,8 +94,39 @@ pub async fn run_browser_setup_wizard(
         open_setup_window(&setup_url);
     }
 
+    serve_setup_wizard(
+        listener,
+        initial_config,
+        &csrf_token,
+        default_mp,
+        default_client_id,
+        has_available_creds,
+        default_docs_mode,
+        default_read_only,
+        default_shared_with_me,
+        enable_autostart,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_setup_wizard(
+    listener: TcpListener,
+    initial_config: &AppConfig,
+    csrf_token: &str,
+    default_mp: PathBuf,
+    default_client_id: String,
+    has_available_creds: bool,
+    default_docs_mode: GoogleDocsMode,
+    default_read_only: bool,
+    default_shared_with_me: bool,
+    default_autostart: bool,
+) -> Result<SetupWizardOutcome> {
+    let local_addr = listener.local_addr()?;
     let deadline = tokio::time::Instant::now() + SETUP_UI_TIMEOUT;
     let mut error_banner: Option<String> = None;
+    let form_path = format!("/{csrf_token}/");
+    let save_path = format!("/{csrf_token}/save");
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -130,28 +155,37 @@ pub async fn run_browser_setup_wizard(
         let method = parts.next().unwrap_or("");
         let path = parts.next().unwrap_or("");
 
-        if method == "GET" && (path == "/" || path.starts_with("/?")) {
+        if !valid_setup_headers(&req_str, local_addr.port()) {
+            send_html_response(&mut stream, "403 Forbidden", "Forbidden").await;
+            continue;
+        }
+
+        if method == "GET" && path == form_path {
             let html = render_setup_form_html(
-                &csrf_token,
+                csrf_token,
                 &default_mp.display().to_string(),
                 &default_client_id,
-                &default_client_secret,
                 has_available_creds,
                 default_docs_mode,
                 default_read_only,
                 default_shared_with_me,
-                true,
+                default_autostart,
+                false,
                 false,
                 error_banner.as_deref(),
             );
             send_html_response(&mut stream, "200 OK", &html).await;
             error_banner = None;
-        } else if method == "POST" && path == "/save" {
+        } else if method == "POST" && path == save_path {
             let body = req_str.split("\r\n\r\n").nth(1).unwrap_or("");
+            if !form_has_valid_token(body, csrf_token) {
+                send_html_response(&mut stream, "403 Forbidden", "Forbidden").await;
+                continue;
+            }
             let optimize_nautilus = form_urlencoded::parse(body.as_bytes()).any(|(key, value)| {
                 key == "optimize_nautilus" && (value == "on" || value == "true")
             });
-            match parse_setup_form_submission(body, &csrf_token, initial_config).and_then(
+            match parse_setup_form_submission(body, csrf_token, initial_config).and_then(
                 |outcome| {
                     if outcome.optimize_nautilus {
                         apply_nautilus_performance_settings(OsStr::new("gsettings"))?;
@@ -174,17 +208,28 @@ pub async fn run_browser_setup_wizard(
                 }
                 Err(validation_err) => {
                     error_banner = Some(validation_err.to_string());
+                    let fields: HashMap<String, String> = form_urlencoded::parse(body.as_bytes())
+                        .into_owned()
+                        .collect();
+                    let checked =
+                        |name: &str| fields.get(name).is_some_and(|v| v == "on" || v == "true");
+                    let docs_mode = match fields.get("google_docs_mode").map(String::as_str) {
+                        Some("desktop") => GoogleDocsMode::Desktop,
+                        Some("pdf") => GoogleDocsMode::Pdf,
+                        Some("office") => GoogleDocsMode::Office,
+                        _ => GoogleDocsMode::Browser,
+                    };
                     let html = render_setup_form_html(
-                        &csrf_token,
-                        &default_mp.display().to_string(),
-                        &default_client_id,
-                        &default_client_secret,
+                        csrf_token,
+                        fields.get("mount_point").map_or("", String::as_str),
+                        fields.get("client_id").map_or("", String::as_str),
                         has_available_creds,
-                        default_docs_mode,
-                        default_read_only,
-                        default_shared_with_me,
-                        true,
+                        docs_mode,
+                        checked("read_only"),
+                        checked("shared_with_me"),
+                        checked("enable_autostart"),
                         optimize_nautilus,
+                        checked("switch_account"),
                         error_banner.as_deref(),
                     );
                     send_html_response(&mut stream, "400 Bad Request", &html).await;
@@ -201,6 +246,37 @@ pub async fn run_browser_setup_wizard(
     }
 }
 
+fn valid_setup_headers(request: &str, port: u16) -> bool {
+    let mut hosts = Vec::new();
+    let mut origins = Vec::new();
+    for line in request
+        .split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+    {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if name.eq_ignore_ascii_case("host") {
+            hosts.push(value.trim());
+        } else if name.eq_ignore_ascii_case("origin") {
+            origins.push(value.trim());
+        }
+    }
+    let expected_host = format!("127.0.0.1:{port}");
+    let expected_origin = format!("http://{expected_host}");
+    hosts.as_slice() == [expected_host.as_str()]
+        && (origins.is_empty() || origins.as_slice() == [expected_origin.as_str()])
+}
+
+fn form_has_valid_token(body: &str, expected: &str) -> bool {
+    let mut tokens = form_urlencoded::parse(body.as_bytes())
+        .filter_map(|(key, value)| (key == "csrf_token").then_some(value));
+    !expected.is_empty()
+        && tokens.next().is_some_and(|token| token == expected)
+        && tokens.next().is_none()
+}
+
 /// Parses and validates a `application/x-www-form-urlencoded` submission from the Setup Wizard.
 pub fn parse_setup_form_submission(
     form_body: &str,
@@ -211,8 +287,7 @@ pub fn parse_setup_form_submission(
         .into_owned()
         .collect();
 
-    let submitted_csrf = fields.get("csrf_token").map(|s| s.as_str()).unwrap_or("");
-    if submitted_csrf.is_empty() || submitted_csrf != expected_csrf {
+    if !form_has_valid_token(form_body, expected_csrf) {
         bail!("Invalid security token (CSRF mismatch). Please refresh and try again.");
     }
 
@@ -233,6 +308,9 @@ pub fn parse_setup_form_submission(
         .filter(|s| !s.is_empty());
 
     let mut test_cfg = base_config.clone();
+    if client_id.is_some() && client_id != base_config.client_id {
+        test_cfg.client_secret = None;
+    }
     if client_id.is_some() {
         test_cfg.client_id = client_id.clone();
     }
@@ -240,7 +318,7 @@ pub fn parse_setup_form_submission(
         test_cfg.client_secret = client_secret.clone();
     }
 
-    if resolve_credentials(client_id.clone(), client_secret.clone(), &test_cfg).is_err() {
+    if validate_credentials(client_id.clone(), client_secret.clone(), &test_cfg).is_err() {
         bail!(
             "A Google OAuth2 Client ID is required. Please enter your Desktop OAuth2 Client ID below."
         );
@@ -271,6 +349,9 @@ pub fn parse_setup_form_submission(
 
     let mut updated = base_config.clone();
     updated.mount_point_path = Some(raw_mount);
+    if client_id.is_some() && client_id != base_config.client_id {
+        updated.client_secret = None;
+    }
     if client_id.is_some() {
         updated.client_id = client_id;
     }
@@ -335,14 +416,6 @@ fn expand_tilde_path(raw: &str) -> PathBuf {
         }
     }
     PathBuf::from(raw)
-}
-
-fn generate_csrf_token() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("csrf-{}-{}", std::process::id(), nanos)
 }
 
 /// Opens the setup wizard URL as a standalone focused desktop app window (`--app=...`) when the
@@ -428,6 +501,8 @@ async fn send_html_response(stream: &mut TcpStream, status: &str, html: &str) {
          Content-Type: text/html; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
+         Referrer-Policy: no-referrer\r\n\
+         Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'\r\n\
          Connection: close\r\n\r\n\
          {html}",
         html.len()
@@ -456,13 +531,13 @@ fn render_setup_form_html(
     csrf_token: &str,
     mount_point: &str,
     client_id: &str,
-    client_secret: &str,
     has_available_creds: bool,
     docs_mode: GoogleDocsMode,
     read_only: bool,
     shared_with_me: bool,
     enable_autostart: bool,
     optimize_nautilus: bool,
+    switch_account: bool,
     error_message: Option<&str>,
 ) -> String {
     let error_block = match error_message {
@@ -498,23 +573,24 @@ fn render_setup_form_html(
     let chk_shared = if shared_with_me { "checked" } else { "" };
     let chk_auto = if enable_autostart { "checked" } else { "" };
     let chk_optimize = if optimize_nautilus { "checked" } else { "" };
+    let chk_switch = if switch_account { "checked" } else { "" };
 
-    let (oauth_details_attr, oauth_summary, cid_required, cid_placeholder) =
-        if has_available_creds {
-            (
-                "",
-                "Advanced: Use custom Google Cloud OAuth2 Client ID (Optional)",
-                "",
-                "Leave blank to use default OAuth2 Client ID",
-            )
-        } else {
-            (
-                "open",
-                "Google Cloud OAuth2 Client Credentials (Required)",
-                "required",
-                "123456789-abc.apps.googleusercontent.com",
-            )
-        };
+    let (oauth_details_attr, oauth_summary, cid_required, cid_placeholder) = if has_available_creds
+    {
+        (
+            "",
+            "Advanced: Use custom Google Cloud OAuth2 Client ID (Optional)",
+            "",
+            "Leave blank to use default OAuth2 Client ID",
+        )
+    } else {
+        (
+            "open",
+            "Google Cloud OAuth2 Client Credentials (Required)",
+            "required",
+            "123456789-abc.apps.googleusercontent.com",
+        )
+    };
 
     format!(
         r#"<!DOCTYPE html>
@@ -663,7 +739,7 @@ fn render_setup_form_html(
     <h1>Google Drive Setup</h1>
     <p class="subtitle">Configure how <code>gdrive-fuse-rs</code> mounts your Google Drive in GNOME Files. Settings are saved to <code>~/.config/gdrive-fuse-rs/config.toml</code>.</p>
     {error_block}
-    <form method="POST" action="/save">
+    <form method="POST" action="/{csrf}/save">
       <input type="hidden" name="csrf_token" value="{csrf}">
       <div class="field">
         <label class="block" for="mount_point">Mount Folder Path</label>
@@ -714,7 +790,7 @@ fn render_setup_form_html(
       </div>
 
       <div class="checkbox-row">
-        <input type="checkbox" id="switch_account" name="switch_account">
+        <input type="checkbox" id="switch_account" name="switch_account" {chk_switch}>
         <label for="switch_account">
           <strong>Switch Google Account</strong><br>
           <span class="hint">Signs out of the current Google account, clears the local metadata cache, and prompts you to sign in with a different account.</span>
@@ -731,8 +807,8 @@ fn render_setup_form_html(
 
           <div class="field">
             <label class="block" for="client_secret">Google OAuth2 Client Secret</label>
-            <input type="password" id="client_secret" name="client_secret" value="{csec}" placeholder="GOCSPX-...">
-            <div class="hint">Stored securely in your system keyring and user-only config (0600).</div>
+            <input type="password" id="client_secret" name="client_secret" value="" placeholder="GOCSPX-..." autocomplete="new-password">
+            <div class="hint">Leave blank to keep the existing secret for this Client ID.</div>
           </div>
 
           <ol style="margin:0.5rem 0 0 1.2rem;padding:0;line-height:1.5;">
@@ -752,7 +828,6 @@ fn render_setup_form_html(
         csrf = escape_html_attr(csrf_token),
         mp = escape_html_attr(mount_point),
         cid = escape_html_attr(client_id),
-        csec = escape_html_attr(client_secret),
     )
 }
 
@@ -762,7 +837,7 @@ fn render_setup_saved_html(mount_point: &str) -> String {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Configuration Saved - gdrive-fuse-rs</title>
+<title>Configuration Submitted - gdrive-fuse-rs</title>
 <style>
   :root {{ color-scheme: light dark; }}
   body {{
@@ -784,11 +859,10 @@ fn render_setup_saved_html(mount_point: &str) -> String {
 </head>
 <body>
   <div class="card">
-    <h2>Configuration Saved</h2>
-    <p>Mounting Google Drive at <code>{}</code>...</p>
-    <p style="opacity:0.75;font-size:0.9rem;">If prompted for Google Sign-In, complete authentication in the other tab. Otherwise, your file manager will open automatically and you may close this window.</p>
+    <h2>Configuration Submitted</h2>
+    <p>Setup will attempt to mount Google Drive at <code>{}</code>.</p>
+    <p style="opacity:0.75;font-size:0.9rem;">Complete Google Sign-In if prompted. Check the application logs for the final setup result.</p>
   </div>
-  <script>setTimeout(function() {{ window.close(); }}, 2000);</script>
 </body>
 </html>"#,
         escape_html_attr(mount_point)
@@ -799,6 +873,141 @@ fn render_setup_saved_html(mount_point: &str) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn test_setup_request_host_origin_and_token_validation() {
+        assert!(valid_setup_headers(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:1234\r\nOrigin: http://127.0.0.1:1234\r\n\r\n",
+            1234
+        ));
+        assert!(!valid_setup_headers(
+            "GET / HTTP/1.1\r\nHost: attacker.invalid:1234\r\n\r\n",
+            1234
+        ));
+        assert!(!valid_setup_headers(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:1234\r\nOrigin: https://attacker.invalid\r\n\r\n",
+            1234
+        ));
+        assert!(!form_has_valid_token(
+            "csrf_token=good&csrf_token=bad",
+            "good"
+        ));
+    }
+
+    #[test]
+    fn test_changing_client_id_does_not_keep_previous_secret() {
+        let initial = AppConfig {
+            client_id: Some("old-client".into()),
+            client_secret: Some("old-secret".into()),
+            ..Default::default()
+        };
+        let result =
+            parse_setup_form_submission("csrf_token=good&client_id=new-client", "good", &initial)
+                .unwrap();
+        assert_eq!(result.config.client_id.as_deref(), Some("new-client"));
+        assert_eq!(result.config.client_secret, None);
+    }
+
+    #[tokio::test]
+    async fn test_setup_session_requires_secret_and_never_renders_client_secret() {
+        async fn request(addr: std::net::SocketAddr, request: &str) -> String {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let initial = AppConfig {
+                client_id: Some("example-id".into()),
+                client_secret: Some("private-value".into()),
+                ..Default::default()
+            };
+            serve_setup_wizard(
+                listener,
+                &initial,
+                "session-token",
+                PathBuf::from("/drive"),
+                "example-id".into(),
+                true,
+                GoogleDocsMode::Browser,
+                false,
+                true,
+                true,
+            )
+            .await
+        });
+        let host = format!("127.0.0.1:{}", addr.port());
+        let denied = request(addr, &format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n")).await;
+        assert!(denied.starts_with("HTTP/1.1 404"));
+        assert!(!denied.contains("private-value"));
+        assert!(request(
+            addr,
+            "GET /session-token/ HTTP/1.1\r\nHost: attacker.invalid\r\n\r\n"
+        )
+        .await
+        .starts_with("HTTP/1.1 403"));
+        let response = request(
+            addr,
+            &format!("GET /session-token/ HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(!response.contains("private-value"));
+        assert!(response.contains(r#"name="client_secret" value="""#));
+        let body = "csrf_token=wrong";
+        let post = format!(
+            "POST /session-token/save HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(request(addr, &post).await.starts_with("HTTP/1.1 403"));
+        let post = format!("POST /session-token/save HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.invalid\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        assert!(request(addr, &post).await.starts_with("HTTP/1.1 403"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_validation_error_preserves_submitted_fields() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            serve_setup_wizard(
+                listener,
+                &AppConfig::default(),
+                "session",
+                PathBuf::from("/old"),
+                String::new(),
+                false,
+                GoogleDocsMode::Browser,
+                false,
+                true,
+                true,
+            )
+            .await
+        });
+        let body =
+            "csrf_token=session&mount_point=%2Fnew&client_id=&google_docs_mode=pdf&read_only=on";
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST /session/save HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{body}",
+            addr.port(),
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains(r#"name="mount_point" value="/new""#));
+        assert!(response.contains(r#"value="pdf" selected"#));
+        assert!(response.contains(r#"name="read_only" checked"#));
+        assert!(!response.contains(r#"name="enable_autostart" checked"#));
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test]
     async fn test_setup_wizard_survives_idle_preconnect_socket() {
@@ -895,12 +1104,12 @@ mod tests {
             "token",
             "/tmp/drive",
             "",
-            "",
             true,
             GoogleDocsMode::Browser,
             false,
             true,
             true,
+            false,
             false,
             None,
         );

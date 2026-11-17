@@ -468,6 +468,7 @@ const MAX_CACHED_DIR_LISTINGS: usize = 256;
 #[derive(Clone)]
 struct CachedDirListing {
     cache_revision: u64,
+    data_version: u64,
     docs_mode: GoogleDocsMode,
     shared_with_me: bool,
     children: Arc<Vec<(String, CachedFile)>>,
@@ -1100,8 +1101,13 @@ impl GDriveFS {
         dir_inode: u64,
     ) -> Result<CachedDirListing, libc::c_int> {
         let current_rev = self.cache.revision();
+        let data_version = self.cache.data_version().map_err(|e| {
+            log::error!("Failed to check cache data version: {}", e);
+            e.to_errno()
+        })?;
         if let Some(cached) = self.dir_listing_cache.borrow().get(&dir_inode) {
             if cached.cache_revision == current_rev
+                && cached.data_version == data_version
                 && cached.docs_mode == self.google_docs_mode
                 && cached.shared_with_me == self.shared_with_me
             {
@@ -1162,6 +1168,7 @@ impl GDriveFS {
 
         let listing = CachedDirListing {
             cache_revision: current_rev,
+            data_version,
             docs_mode: self.google_docs_mode,
             shared_with_me: self.shared_with_me,
             children: Arc::new(ordered),
@@ -3872,6 +3879,48 @@ mod tests {
         let refreshed = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
         assert!(!Arc::ptr_eq(&reused.children, &refreshed.children));
         assert_eq!(refreshed.children[0].0, "second.txt");
+    }
+
+    #[test]
+    fn test_directory_listing_invalidated_by_another_connection() {
+        let rt = Runtime::new().unwrap();
+        let mut fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-listing-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db_path = dir.join("metadata.db");
+        fs.cache = Arc::new(MetadataCache::open(&db_path, 300).unwrap());
+        let other = MetadataCache::open(&db_path, 300).unwrap();
+        let first = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert!(first.children.is_empty());
+
+        other
+            .sync_directory_children(
+                FUSE_ROOT_ID,
+                &[crate::api::DriveFile {
+                    id: "external".into(),
+                    name: "external.txt".into(),
+                    mime_type: "text/plain".into(),
+                    size: 0,
+                    modified_time: 0,
+                    parents: vec!["root".into()],
+                    trashed: false,
+                    web_view_link: None,
+                }],
+            )
+            .unwrap();
+        let updated = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert_eq!(updated.children[0].0, "external.txt");
+        drop(other);
+        drop(fs);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

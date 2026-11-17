@@ -19,7 +19,8 @@ use fuser::{MountOption, Session};
 
 use crate::api::DriveClient;
 use crate::auth::{
-    clear_keyring_credentials, resolve_credentials, AppConfig, AuthManager, GoogleDocsMode,
+    clear_keyring_credentials, clear_keyring_tokens, resolve_credentials, validate_credentials,
+    AppConfig, AuthManager, GoogleDocsMode,
 };
 use crate::cache::MetadataCache;
 use crate::filesystem::{
@@ -149,9 +150,13 @@ fn main() -> Result<()> {
     };
 
     if (args.logout || args.clear_cache) && (args.setup || args.configure) {
-        let _ = std::process::Command::new("systemctl")
+        let status = std::process::Command::new("systemctl")
             .args(["--user", "stop", "gdrive-fuse-rs.service"])
-            .status();
+            .status()
+            .context("Failed to stop gdrive-fuse-rs.service before cleanup")?;
+        if !status.success() {
+            bail!("Failed to stop gdrive-fuse-rs.service before cleanup");
+        }
     }
 
     if args.logout {
@@ -210,8 +215,6 @@ fn main() -> Result<()> {
             mount_point.display()
         );
     }
-
-    exclude_mount_from_gnome_tracker(&mount_point);
 
     let credentials =
         resolve_credentials(args.client_id.clone(), args.client_secret.clone(), &config)
@@ -689,7 +692,8 @@ fn clear_local_cache_and_staging(args: &CliArgs, config: &AppConfig) -> Result<(
     } else {
         stage_dir
     };
-    let _ = MetadataCache::clear_staging_dir(&stage_dir);
+    MetadataCache::clear_staging_dir(&stage_dir)
+        .with_context(|| format!("Failed to clear staging directory {}", stage_dir.display()))?;
     log::info!("Removed SQLite metadata cache at {}.", db_path.display());
     Ok(())
 }
@@ -702,7 +706,7 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
 
     let config_file_path = args.config.clone().or_else(AppConfig::default_path);
     let config_exists = config_file_path.as_ref().is_some_and(|p| p.exists());
-    let has_resolvable_creds = resolve_credentials(
+    let has_resolvable_creds = validate_credentials(
         args.client_id.clone(),
         args.client_secret.clone(),
         initial_config,
@@ -710,10 +714,14 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
     .is_ok();
 
     let mut active_config = initial_config.clone();
-    let mut enable_autostart = true;
+    let (mut enable_autostart, existing_unit) = if config_exists {
+        systemd_autostart_state()?
+    } else {
+        (true, false)
+    };
+    let mut switch_account = false;
 
-    // Ensure ~/.config/gdrive-fuse-rs/config.toml is created on first run even before the
-    // wizard is submitted so the configuration directory and file always exist on disk.
+    // Prepare defaults in memory; persist only after the wizard is submitted.
     if !config_exists {
         if active_config.mount_point_path.is_none() {
             active_config.mount_point_path =
@@ -728,7 +736,7 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         if active_config.read_only.is_none() {
             active_config.read_only = Some(args.read_only);
         }
-        if let Ok(existing_creds) = resolve_credentials(
+        if let Ok(existing_creds) = validate_credentials(
             args.client_id.clone(),
             args.client_secret.clone(),
             &active_config,
@@ -744,15 +752,6 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
             active_config.client_id = None;
             active_config.client_secret = None;
         }
-        if let Some(ref save_path) = config_file_path {
-            if let Err(e) = active_config.save_to_path(save_path) {
-                log::warn!(
-                    "Could not write initial config file to {}: {}",
-                    save_path.display(),
-                    e
-                );
-            }
-        }
     }
 
     let wizard_ran = args.configure || !config_exists || !has_resolvable_creds;
@@ -763,16 +762,23 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
             args.client_id.clone(),
             args.client_secret.clone(),
             !args.no_browser,
+            enable_autostart,
         ))?;
         active_config = outcome.config;
         enable_autostart = outcome.enable_autostart;
+        switch_account = outcome.switch_account;
 
-        if outcome.switch_account {
-            let _ = std::process::Command::new("systemctl")
+        if existing_unit {
+            let status = std::process::Command::new("systemctl")
                 .args(["--user", "stop", "gdrive-fuse-rs.service"])
-                .status();
-            clear_keyring_credentials()
-                .context("Failed to clear OAuth2 credentials from system keyring")?;
+                .status()
+                .context("Failed to stop existing gdrive-fuse-rs.service")?;
+            if !status.success() {
+                bail!("Failed to stop existing gdrive-fuse-rs.service");
+            }
+        }
+        if outcome.switch_account {
+            clear_keyring_tokens().context("Failed to clear OAuth2 tokens from system keyring")?;
             clear_local_cache_and_staging(args, &active_config)?;
             log::info!("Cleared previous Google account session and metadata cache.");
         }
@@ -797,8 +803,6 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
             unit_mount_point.display()
         )
     })?;
-    exclude_mount_from_gnome_tracker(&unit_mount_point);
-
     let already_mounted_healthy = !wizard_ran
         && !args.logout
         && !args.clear_cache
@@ -814,8 +818,13 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         if !reload_status.success() {
             bail!("Failed to reload systemd user units");
         }
+        let action = if enable_autostart {
+            "enable"
+        } else {
+            "disable"
+        };
         let enable_status = std::process::Command::new("systemctl")
-            .args(["--user", "enable", "gdrive-fuse-rs.service"])
+            .args(["--user", action, "gdrive-fuse-rs.service"])
             .status()
             .context("Failed to enable gdrive-fuse-rs.service")?;
         if !enable_status.success() {
@@ -839,10 +848,11 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         "Completing Google Drive OAuth2 sign-in (mode={})...",
         if read_only { "read-only" } else { "read-write" }
     );
-    rt.block_on(AuthManager::authenticate_with_mode(
+    rt.block_on(AuthManager::authenticate_with_account_selection(
         credentials,
         !args.no_browser,
         read_only,
+        switch_account,
     ))
     .context("Google OAuth2 authentication failed during setup")?;
 
@@ -853,9 +863,16 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
     let reload_ok = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status()
-        .is_ok_and(|s| s.success());
+        .context("Failed to reload systemd user units")?;
+    if !reload_ok.success() {
+        bail!("Failed to reload systemd user units");
+    }
 
-    let action = if enable_autostart { "enable" } else { "disable" };
+    let action = if enable_autostart {
+        "enable"
+    } else {
+        "disable"
+    };
     let status = std::process::Command::new("systemctl")
         .args(["--user", action, "gdrive-fuse-rs.service"])
         .status()
@@ -863,25 +880,31 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
     if !status.success() {
         bail!("Failed to {action} gdrive-fuse-rs.service for login auto-mount");
     }
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "stop", "gdrive-fuse-rs.service"])
-        .status();
+    if !wizard_ran {
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", "stop", "gdrive-fuse-rs.service"])
+            .status()
+            .context("Failed to stop gdrive-fuse-rs.service")?;
+        if !status.success() {
+            bail!("Failed to stop gdrive-fuse-rs.service");
+        }
+    }
     cleanup_stale_fuse_mount(&unit_mount_point);
 
     let restart_ok = std::process::Command::new("systemctl")
         .args(["--user", "start", "gdrive-fuse-rs.service"])
         .status()
-        .is_ok_and(|s| s.success());
-
-    if reload_ok && restart_ok {
-        log::info!(
-            "Started gdrive-fuse-rs.service (waiting for mount at {}...).",
-            unit_mount_point.display()
-        );
-        let _ = wait_for_fuse_mount(&unit_mount_point, Duration::from_secs(15));
-    } else {
-        log::warn!(
-            "Could not automatically start systemd user service; you can mount directly with: gdrive-fuse-rs --mount-point {}",
+        .context("Failed to start gdrive-fuse-rs.service")?;
+    if !restart_ok.success() {
+        bail!("Failed to start gdrive-fuse-rs.service");
+    }
+    log::info!(
+        "Started gdrive-fuse-rs.service (waiting for mount at {}...).",
+        unit_mount_point.display()
+    );
+    if !wait_for_fuse_mount(&unit_mount_point, Duration::from_secs(15)) {
+        bail!(
+            "gdrive-fuse-rs.service did not mount {} in time; check systemd user logs",
             unit_mount_point.display()
         );
     }
@@ -891,6 +914,25 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn systemd_autostart_state() -> Result<(bool, bool)> {
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "gdrive-fuse-rs.service"])
+        .output()
+        .context("Failed to check gdrive-fuse-rs.service auto-mount state")?;
+    let state = std::str::from_utf8(&output.stdout)
+        .context("Invalid systemctl auto-mount state")?
+        .trim();
+    match state {
+        "enabled" | "enabled-runtime" => Ok((true, true)),
+        "disabled" | "masked" | "masked-runtime" | "static" | "indirect" => Ok((false, true)),
+        "not-found" => Ok((true, false)),
+        _ => bail!(
+            "Failed to check gdrive-fuse-rs.service auto-mount state: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
 }
 
 /// Lazily unmounts `mount_point` if a previous FUSE session left it in a stale `ENOTCONN`
@@ -914,51 +956,6 @@ fn cleanup_stale_fuse_mount(mount_point: &Path) {
                     .args(["-uz", mp_str.as_ref()])
                     .status()
             });
-    }
-}
-
-/// Adds the FUSE mount folder name to GNOME Tracker3's `ignored-directories` list so
-/// `tracker-miner-fs-3` does not recursively crawl every remote subfolder in the background.
-fn exclude_mount_from_gnome_tracker(mount_point: &Path) {
-    let Some(dir_name) = mount_point.file_name().and_then(|n| n.to_str()) else {
-        return;
-    };
-    if dir_name.is_empty() || dir_name.contains('\'') || dir_name.contains('"') {
-        return;
-    }
-    let Ok(output) = std::process::Command::new("gsettings")
-        .args([
-            "get",
-            "org.freedesktop.Tracker3.Miner.Files",
-            "ignored-directories",
-        ])
-        .output()
-    else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
-    let current = String::from_utf8_lossy(&output.stdout);
-    let trimmed = current.trim();
-    let entry_quoted = format!("'{}'", dir_name);
-    if trimmed.contains(&entry_quoted) {
-        return;
-    }
-    if let Some(prefix) = trimmed.strip_suffix(']') {
-        let updated = if prefix.trim_end().ends_with('[') {
-            format!("[{}]", entry_quoted)
-        } else {
-            format!("{}, {}]", prefix, entry_quoted)
-        };
-        let _ = std::process::Command::new("gsettings")
-            .args([
-                "set",
-                "org.freedesktop.Tracker3.Miner.Files",
-                "ignored-directories",
-                &updated,
-            ])
-            .status();
     }
 }
 

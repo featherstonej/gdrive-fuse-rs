@@ -34,6 +34,14 @@ Once installed, you can either launch **Google Drive (gdrive-fuse-rs)** directly
 gdrive-fuse-rs --setup
 ```
 
+The setup wizard URL grants access to its local session; do not share it. The optional
+GNOME Files performance setting affects all folders. The application does not modify
+Tracker's ignored-directory settings automatically.
+
+**Warning:** `--clear-cache` and the wizard's account-switch option can delete pending
+local writes and must not be used while any mount uses the cache. Back up the metadata
+database and staging directory first. These operations do not yet enforce exclusive access.
+
 This signs you in with Google in your browser, enables the background systemd user service (`gdrive-fuse-rs.service`) to auto-mount `~/GoogleDrive` on login, and opens `~/GoogleDrive` in GNOME Files.
 
 The setup wizard offers an optional **Reduce GNOME Files background loading** setting.
@@ -185,7 +193,7 @@ Options:
       --read-only                  Mount in strict read-only mode (uses `drive.readonly` OAuth scope and rejects writes with EROFS)
       --staging-dir <DIR>          Path to temporary write-back staging directory [env: GDRIVE_STAGING_DIR=] (default: ~/.cache/gdrive-fuse-rs/staging)
       --clear-cache                Wipe the local SQLite metadata cache before mounting (or exit if no mount point)
-      --logout                     Remove saved OAuth2 tokens from the system keyring
+      --logout                     Remove saved OAuth2 tokens and client credentials from the system keyring
       --install-systemd            Install a systemd user service at ~/.config/systemd/user/gdrive-fuse-rs.service
       --setup                      Sign in with Google, enable and start the background systemd user service, and open the mount directory
       --configure                  Open the local browser configuration wizard to customize settings in ~/.config/gdrive-fuse-rs/config.toml

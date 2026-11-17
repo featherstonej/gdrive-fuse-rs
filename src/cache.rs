@@ -520,6 +520,12 @@ impl MetadataCache {
         self.revision.load(Ordering::Acquire)
     }
 
+    /// Detects commits made by other SQLite connections to this database.
+    pub fn data_version(&self) -> Result<u64, CacheError> {
+        let conn = self.lock_conn()?;
+        Ok(conn.query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
     fn bump_revision(&self) {
         self.revision.fetch_add(1, Ordering::Release);
     }
