@@ -127,7 +127,7 @@ fn main() -> Result<()> {
 
     let args = CliArgs::parse();
 
-    if (args.install_systemd || args.setup || args.configure) && args.client_secret.is_some() {
+    if (args.install_systemd || args.setup) && args.client_secret.is_some() {
         bail!(
             "--client-secret cannot be stored in a systemd unit; configure it in the config file or system keyring"
         );
