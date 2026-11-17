@@ -464,13 +464,35 @@ impl DriveClient {
                 };
 
                 let status = response.status();
-                if status == StatusCode::TOO_MANY_REQUESTS && attempt < 3 {
-                    tokio::time::sleep(Duration::from_millis(300 * u64::from(attempt))).await;
-                    continue;
-                }
                 if !status.is_success() {
+                    let retry_after = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::trim)
+                        .and_then(|value| {
+                            value.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
+                                chrono::DateTime::parse_from_rfc2822(value).ok().map(|when| {
+                                    let seconds = when.timestamp()
+                                        .saturating_sub(chrono::Utc::now().timestamp())
+                                        .max(0) as u64;
+                                    Duration::from_secs(seconds)
+                                })
+                            })
+                        });
                     let body = response.text().await.unwrap_or_default();
-                    return Err(Self::map_status_error(status, body));
+                    let error = Self::map_status_error(status, body);
+                    if matches!(&error, ApiError::RateLimited(_)) && attempt < 3 {
+                        let delay = retry_after.unwrap_or_else(|| {
+                            Duration::from_millis(300 * (1u64 << (attempt - 1)))
+                        });
+                        // Do not retry early when the requested delay exceeds our wait budget.
+                        if delay <= Duration::from_secs(30) {
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                    }
+                    return Err(error);
                 }
 
                 let body_bytes = response.bytes().await?;
