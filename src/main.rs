@@ -785,7 +785,11 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         }
     }
 
-    let unit_mount_point = install_user_systemd_unit(args, &active_config)?;
+    let mut unit_args = args.clone();
+    if wizard_ran {
+        unit_args.mount_point = active_config.mount_point_path.clone();
+    }
+    let unit_mount_point = install_user_systemd_unit(&unit_args, &active_config)?;
     cleanup_stale_fuse_mount(&unit_mount_point);
     std::fs::create_dir_all(&unit_mount_point).with_context(|| {
         format!(
