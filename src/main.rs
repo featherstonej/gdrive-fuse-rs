@@ -997,14 +997,15 @@ fn cleanup_stale_fuse_mount(mount_point: &Path) {
             mount_point.display()
         );
         let mp_str = mount_point.to_string_lossy();
-        let _ = std::process::Command::new("fusermount3")
+        let succeeded = std::process::Command::new("fusermount3")
             .args(["-uz", mp_str.as_ref()])
             .status()
-            .or_else(|_| {
-                std::process::Command::new("fusermount")
-                    .args(["-uz", mp_str.as_ref()])
-                    .status()
-            });
+            .is_ok_and(|status| status.success());
+        if !succeeded {
+            let _ = std::process::Command::new("fusermount")
+                .args(["-uz", mp_str.as_ref()])
+                .status();
+        }
     }
 }
 
