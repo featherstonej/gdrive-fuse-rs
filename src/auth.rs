@@ -131,18 +131,32 @@ impl AppConfig {
         let serialized = toml::to_string_pretty(self).map_err(|e| {
             AuthError::ConfigError(format!("Failed to serialize TOML configuration: {}", e))
         })?;
-        std::fs::write(path, serialized).map_err(|e| {
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            file.set_len(0)?;
+            file.write_all(serialized.as_bytes())
+        })();
+        write_result.map_err(|e| {
             AuthError::ConfigError(format!(
-                "Failed to write config file {}: {}",
+                "Failed to securely write config file {}: {}",
                 path.display(),
                 e
             ))
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
         Ok(())
     }
 
