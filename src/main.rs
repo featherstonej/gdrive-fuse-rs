@@ -714,10 +714,32 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
     .is_ok();
 
     let mut active_config = initial_config.clone();
-    let (mut enable_autostart, existing_unit) = if config_exists {
-        systemd_autostart_state()?
+    let service_state = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=LoadState",
+            "--value",
+            "gdrive-fuse-rs.service",
+        ])
+        .output()
+        .context("Failed to check existing gdrive-fuse-rs.service")?;
+    let load_state = std::str::from_utf8(&service_state.stdout)
+        .context("Invalid systemd service load state")?
+        .trim();
+    if load_state != "not-found"
+        && (!service_state.status.success() || load_state.is_empty())
+    {
+        bail!(
+            "Failed to check existing gdrive-fuse-rs.service: {}",
+            String::from_utf8_lossy(&service_state.stderr).trim()
+        );
+    }
+    let existing_unit = load_state != "not-found";
+    let mut enable_autostart = if config_exists && existing_unit {
+        systemd_autostart_state()?.0
     } else {
-        (true, false)
+        true
     };
     let mut switch_account = false;
 
