@@ -886,7 +886,15 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
     ))
     .context("Google OAuth2 authentication failed during setup")?;
 
-    let unit_mount_point = install_user_systemd_unit(args, &active_config)?;
+    let mut service_args = (*args).clone();
+    if wizard_ran && config_file_path.is_some() {
+        service_args.client_id = None;
+        service_args.client_secret = None;
+        service_args.google_docs_mode = None;
+        service_args.read_only = false;
+        service_args.no_shared_with_me = false;
+    }
+    let unit_mount_point = install_user_systemd_unit(&service_args, &active_config)?;
     cleanup_stale_fuse_mount(&unit_mount_point);
     std::fs::create_dir_all(&unit_mount_point).with_context(|| {
         format!(
