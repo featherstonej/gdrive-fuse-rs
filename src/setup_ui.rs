@@ -347,16 +347,12 @@ pub fn parse_setup_form_submission(
         .get("optimize_nautilus")
         .is_some_and(|v| v == "on" || v == "true");
 
-    let mut updated = base_config.clone();
+    let mut updated = test_cfg;
     updated.mount_point_path = Some(raw_mount);
-    if client_id.is_some() && client_id != base_config.client_id {
-        updated.client_secret = None;
-    }
     if client_id.is_some() {
-        updated.client_id = client_id;
-    }
-    if client_secret.is_some() {
-        updated.client_secret = client_secret;
+        let credentials = validate_credentials(client_id, client_secret, &updated)?;
+        updated.client_id = Some(credentials.client_id);
+        updated.client_secret = credentials.client_secret;
     }
     updated.google_docs_mode = Some(google_docs_mode);
     updated.read_only = Some(read_only);
