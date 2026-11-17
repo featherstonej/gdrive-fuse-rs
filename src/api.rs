@@ -371,6 +371,8 @@ impl DriveClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(30))
             .redirect(redirect_policy)
             .build()?;
 
@@ -427,36 +429,54 @@ impl DriveClient {
         let mut page_token: Option<String> = None;
 
         loop {
-            let token = self.auth.get_access_token().await?;
+            let mut attempt = 0u32;
+            let page: FileListResponse = loop {
+                attempt += 1;
+                let token = self.auth.get_access_token().await?;
 
-            // Enable request compatibility for shared items/folders residing on Shared Drives.
-            let mut params = vec![
-                ("q", query),
-                ("pageSize", LIST_PAGE_SIZE),
-                ("fields", LIST_FIELDS),
-                ("supportsAllDrives", "true"),
-                ("includeItemsFromAllDrives", "true"),
-            ];
-            if let Some(ref pt) = page_token {
-                params.push(("pageToken", pt.as_str()));
-            }
+                // Enable request compatibility for shared items/folders residing on Shared Drives.
+                let mut params = vec![
+                    ("q", query),
+                    ("pageSize", LIST_PAGE_SIZE),
+                    ("fields", LIST_FIELDS),
+                    ("supportsAllDrives", "true"),
+                    ("includeItemsFromAllDrives", "true"),
+                ];
+                if let Some(ref pt) = page_token {
+                    params.push(("pageToken", pt.as_str()));
+                }
 
-            let response = self
-                .http
-                .get(&url)
-                .header(AUTHORIZATION, format!("Bearer {}", token))
-                .query(&params)
-                .send()
-                .await?;
+                let send_res = self
+                    .http
+                    .get(&url)
+                    .header(AUTHORIZATION, format!("Bearer {}", token))
+                    .query(&params)
+                    .send()
+                    .await;
 
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(Self::map_status_error(status, body));
-            }
+                let response = match send_res {
+                    Ok(resp) => resp,
+                    Err(_err) if attempt < 3 => {
+                        tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+                        continue;
+                    }
+                    Err(err) => return Err(ApiError::Http(err)),
+                };
 
-            let body_bytes = response.bytes().await?;
-            let page: FileListResponse = serde_json::from_slice(&body_bytes)?;
+                let status = response.status();
+                if status == StatusCode::TOO_MANY_REQUESTS && attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(300 * u64::from(attempt))).await;
+                    continue;
+                }
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(Self::map_status_error(status, body));
+                }
+
+                let body_bytes = response.bytes().await?;
+                break serde_json::from_slice(&body_bytes)?;
+            };
+
             all_files.extend(page.files);
 
             match page.next_page_token {
@@ -1710,6 +1730,7 @@ mod tests {
                 assert!(req_str.contains("sharedWithMe"));
 
                 let body = r#"{
+                    "nextPageToken": "shared_p2",
                     "files": [
                         {
                             "id": "shared_1",
@@ -1729,7 +1750,58 @@ mod tests {
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
 
-            // Request 6: export_file
+            // Request 6: list_shared_with_me (page 2)
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.contains("pageToken=shared_p2"));
+
+                let body = r#"{
+                    "nextPageToken": "shared_p3",
+                    "files": [
+                        {
+                            "id": "shared_2",
+                            "name": "Second shared file",
+                            "mimeType": "text/plain",
+                            "modifiedTime": "2025-05-03T00:00:00Z"
+                        }
+                    ]
+                }"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+
+            // Request 7: list_shared_with_me (page 3)
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.contains("pageToken=shared_p3"));
+
+                let body = r#"{
+                    "files": [
+                        {
+                            "id": "shared_3",
+                            "name": "Third shared file",
+                            "mimeType": "text/plain",
+                            "modifiedTime": "2025-05-04T00:00:00Z"
+                        }
+                    ]
+                }"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+
+            // Request 8: export_file
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -1779,8 +1851,10 @@ mod tests {
             .list_shared_with_me()
             .await
             .expect("list_shared_with_me failed");
-        assert_eq!(shared.len(), 1);
+        assert_eq!(shared.len(), 3);
         assert_eq!(shared[0].id, "shared_1");
+        assert_eq!(shared[1].id, "shared_2");
+        assert_eq!(shared[2].id, "shared_3");
         assert_eq!(
             shared[0].web_url(),
             "https://docs.google.com/document/d/shared_1/edit"

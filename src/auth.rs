@@ -109,6 +109,43 @@ impl AppConfig {
         dirs::config_dir().map(|dir| dir.join("gdrive-fuse-rs").join("config.toml"))
     }
 
+    /// Returns `true` if the default configuration file (`~/.config/gdrive-fuse-rs/config.toml`) exists on disk.
+    pub fn exists_default() -> bool {
+        Self::default_path().is_some_and(|p| p.exists())
+    }
+
+    /// Serializes and writes `AppConfig` as TOML to `path`, creating parent directories and restricting
+    /// file permissions to `0600` on Unix.
+    pub fn save_to_path(&self, path: &Path) -> Result<(), AuthError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AuthError::ConfigError(format!(
+                        "Failed to create config directory {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
+        let serialized = toml::to_string_pretty(self).map_err(|e| {
+            AuthError::ConfigError(format!("Failed to serialize TOML configuration: {}", e))
+        })?;
+        std::fs::write(path, serialized).map_err(|e| {
+            AuthError::ConfigError(format!(
+                "Failed to write config file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
     /// Loads `AppConfig` from a specific path. If the file does not exist, returns `Ok(AppConfig::default())`.
     pub fn load_from_path(path: &Path) -> Result<Self, AuthError> {
         if !path.exists() {
@@ -156,10 +193,16 @@ pub fn resolve_credentials(
     let clean_opt = |opt: Option<String>| -> Option<String> {
         opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
     };
+    #[cfg(not(test))]
+    let clean_id = |opt: Option<String>| -> Option<String> {
+        clean_opt(opt).filter(|s| !is_test_placeholder_client_id(s))
+    };
+    #[cfg(test)]
+    let clean_id = clean_opt;
 
-    let cli_id = clean_opt(cli_id);
+    let cli_id = clean_id(cli_id);
     let cli_secret = clean_opt(cli_secret);
-    let cfg_id = clean_opt(config.client_id.clone());
+    let cfg_id = clean_id(config.client_id.clone());
     let cfg_secret = clean_opt(config.client_secret.clone());
 
     if let Some(client_id) = cli_id {
@@ -200,13 +243,8 @@ pub fn resolve_credentials(
         return Ok(creds);
     }
 
-    if let Some(default_id) = clean_opt(option_env!("GDRIVE_DEFAULT_CLIENT_ID").map(String::from)) {
-        let default_secret =
-            clean_opt(option_env!("GDRIVE_DEFAULT_CLIENT_SECRET").map(String::from));
-        return Ok(ClientCredentials {
-            client_id: default_id,
-            client_secret: default_secret,
-        });
+    if let Some(creds) = builtin_default_credentials() {
+        return Ok(creds);
     }
 
     Err(AuthError::MissingCredentials(
@@ -216,7 +254,48 @@ pub fn resolve_credentials(
     ))
 }
 
+/// Returns compile-time default OAuth2 client credentials (`GDRIVE_DEFAULT_CLIENT_ID` /
+/// `GDRIVE_DEFAULT_CLIENT_SECRET`) when embedded into the release binary.
+#[cfg(not(test))]
+pub fn builtin_default_credentials() -> Option<ClientCredentials> {
+    let default_id = option_env!("GDRIVE_DEFAULT_CLIENT_ID")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !is_test_placeholder_client_id(s))?
+        .to_string();
+    let default_secret = option_env!("GDRIVE_DEFAULT_CLIENT_SECRET")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    Some(ClientCredentials {
+        client_id: default_id,
+        client_secret: default_secret,
+    })
+}
+
+#[cfg(test)]
+pub fn builtin_default_credentials() -> Option<ClientCredentials> {
+    None
+}
+
+fn is_test_placeholder_client_id(client_id: &str) -> bool {
+    matches!(
+        client_id.trim(),
+        "prefilled-id.apps.googleusercontent.com"
+            | "my-id.apps.googleusercontent.com"
+            | "placeholder-id.apps.googleusercontent.com"
+            | "config-id-placeholder"
+            | "cli-id-placeholder"
+    )
+}
+
+#[cfg(test)]
+fn persist_credentials_to_keyring(_creds: &ClientCredentials) {}
+
+#[cfg(not(test))]
 fn persist_credentials_to_keyring(creds: &ClientCredentials) {
+    if is_test_placeholder_client_id(&creds.client_id) {
+        return;
+    }
     match keyring::Entry::new(KEYRING_SERVICE, KEYRING_CLIENT_CONFIG_USER) {
         Ok(entry) => {
             if let Ok(json) = serde_json::to_string(creds) {
@@ -237,16 +316,27 @@ fn persist_credentials_to_keyring(creds: &ClientCredentials) {
     }
 }
 
+#[cfg(test)]
+fn load_credentials_from_keyring() -> Option<ClientCredentials> {
+    None
+}
+
+#[cfg(not(test))]
 fn load_credentials_from_keyring() -> Option<ClientCredentials> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_CLIENT_CONFIG_USER).ok()?;
     let json = entry.get_password().ok()?;
     let creds: ClientCredentials = serde_json::from_str(&json).ok()?;
-    if creds.client_id.trim().is_empty() {
+    let trimmed = creds.client_id.trim();
+    if trimmed.is_empty() || is_test_placeholder_client_id(trimmed) {
         return None;
     }
     Some(creds)
 }
 
+#[cfg(test)]
+fn persist_refresh_token_to_keyring(_refresh_token: &str) {}
+
+#[cfg(not(test))]
 fn persist_refresh_token_to_keyring(refresh_token: &str) {
     match keyring::Entry::new(KEYRING_SERVICE, KEYRING_REFRESH_TOKEN_USER) {
         Ok(entry) => {
@@ -265,6 +355,10 @@ fn persist_refresh_token_to_keyring(refresh_token: &str) {
     }
 }
 
+#[cfg(test)]
+fn persist_token_scope_to_keyring(_scope: &str) {}
+
+#[cfg(not(test))]
 fn persist_token_scope_to_keyring(scope: &str) {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_SCOPE_USER) {
         if let Err(e) = entry.set_password(scope) {
@@ -276,6 +370,12 @@ fn persist_token_scope_to_keyring(scope: &str) {
     }
 }
 
+#[cfg(test)]
+fn load_token_scope_from_keyring() -> Option<String> {
+    None
+}
+
+#[cfg(not(test))]
 fn load_token_scope_from_keyring() -> Option<String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_TOKEN_SCOPE_USER).ok()?;
     let scope = entry.get_password().ok()?;
@@ -287,6 +387,12 @@ fn load_token_scope_from_keyring() -> Option<String> {
     }
 }
 
+#[cfg(test)]
+fn load_refresh_token_from_keyring() -> Option<String> {
+    None
+}
+
+#[cfg(not(test))]
 fn load_refresh_token_from_keyring() -> Option<String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_REFRESH_TOKEN_USER).ok()?;
     let token = entry.get_password().ok()?;
@@ -322,13 +428,10 @@ pub fn scope_satisfies_mode(granted_scope: &str, read_only: bool) -> bool {
     false
 }
 
-/// Removes stored OAuth2 refresh tokens and cached client credentials from the system keyring.
+/// Removes the signed-in user's OAuth2 refresh token and granted scope from the system keyring
+/// while preserving any configured OAuth2 client credentials (`KEYRING_CLIENT_CONFIG_USER`).
 pub fn clear_keyring_credentials() -> Result<(), AuthError> {
-    for user in [
-        KEYRING_REFRESH_TOKEN_USER,
-        KEYRING_TOKEN_SCOPE_USER,
-        KEYRING_CLIENT_CONFIG_USER,
-    ] {
+    for user in [KEYRING_REFRESH_TOKEN_USER, KEYRING_TOKEN_SCOPE_USER] {
         let entry = keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| {
             AuthError::KeyringError(format!(
                 "Failed to access keyring entry for '{}': {}",

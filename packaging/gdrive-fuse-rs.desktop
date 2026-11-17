@@ -10,3 +10,12 @@ Terminal=false
 Categories=Network;FileTransfer;Utility;
 Keywords=Google;Drive;Cloud;FUSE;Mount;
 StartupNotify=true
+Actions=Configure;SwitchAccount;
+
+[Desktop Action Configure]
+Name=Configure Google Drive Settings...
+Exec=/usr/bin/gdrive-fuse-rs --configure
+
+[Desktop Action SwitchAccount]
+Name=Switch Google Account...
+Exec=/usr/bin/gdrive-fuse-rs --logout --clear-cache --setup

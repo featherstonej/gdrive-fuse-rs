@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::Utc;
@@ -144,6 +145,7 @@ pub struct MetadataCache {
     open_inode_counts: Mutex<HashMap<u64, usize>>,
     removal_tracker: Mutex<RemovalTracker>,
     staging_namespace: Option<String>,
+    revision: AtomicU64,
 }
 
 #[derive(Default)]
@@ -373,6 +375,8 @@ impl MetadataCache {
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            PRAGMA busy_timeout = 5000;
+            PRAGMA cache_size = -16000;
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS files (
@@ -507,7 +511,29 @@ impl MetadataCache {
             open_inode_counts: Mutex::new(HashMap::new()),
             removal_tracker: Mutex::new(RemovalTracker::default()),
             staging_namespace: None,
+            revision: AtomicU64::new(1),
         })
+    }
+
+    /// Returns a monotonically increasing revision counter that increments on any cache mutation.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::Release);
+    }
+
+    /// Checks whether a `CachedFile` directory's cached child listing is missing or older than `ttl_secs`
+    /// without issuing an extra SQLite query.
+    pub fn is_cached_file_stale(&self, file: &CachedFile) -> bool {
+        match file.last_synced_at {
+            None => true,
+            Some(synced_at) => {
+                let now = Utc::now().timestamp();
+                now - synced_at >= self.ttl_secs as i64
+            }
+        }
     }
 
     fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>, CacheError> {
@@ -631,6 +657,7 @@ impl MetadataCache {
         if updated == 0 {
             return Err(CacheError::NotFound(format!("inode {}", dir_inode)));
         }
+        self.bump_revision();
         Ok(())
     }
 
@@ -703,6 +730,7 @@ impl MetadataCache {
         if let Ok(mut tracker) = self.removal_tracker.lock() {
             tracker.cancel_removal(cached_file.inode);
         }
+        self.bump_revision();
         Ok(cached_file)
     }
 
@@ -713,7 +741,7 @@ impl MetadataCache {
         let is_dir_int = if file.is_dir() { 1i64 } else { 0i64 };
         let size_i64 = i64::try_from(file.size).unwrap_or(i64::MAX);
 
-        conn.execute(
+        let mut stmt = conn.prepare_cached(
             "INSERT INTO files (drive_id, name, mime_type, size, modified_time, is_dir, web_view_link, dirty)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
              ON CONFLICT(drive_id) DO UPDATE SET
@@ -722,7 +750,11 @@ impl MetadataCache {
                  size = CASE WHEN files.dirty != 0 THEN files.size ELSE excluded.size END,
                  modified_time = CASE WHEN files.dirty != 0 THEN files.modified_time ELSE excluded.modified_time END,
                  is_dir = excluded.is_dir,
-                 web_view_link = COALESCE(excluded.web_view_link, files.web_view_link)",
+                 web_view_link = COALESCE(excluded.web_view_link, files.web_view_link)
+             RETURNING inode, drive_id, name, mime_type, size, modified_time, is_dir, last_synced_at, web_view_link, dirty",
+        )?;
+
+        stmt.query_row(
             params![
                 file.id,
                 file.name,
@@ -732,10 +764,9 @@ impl MetadataCache {
                 is_dir_int,
                 file.web_view_link,
             ],
-        )?;
-
-        Self::get_by_drive_id_with_conn(conn, &file.id)?
-            .ok_or_else(|| CacheError::NotFound(file.id.clone()))
+            Self::map_cached_file_row,
+        )
+        .map_err(CacheError::from)
     }
 
     /// Atomically replaces and deduplicates the child entries of `parent_inode` in a single SQLite transaction,
@@ -811,15 +842,17 @@ impl MetadataCache {
             let cached_file = Self::upsert_file_with_conn(&tx, drive_file)?;
             let effective_name = names[idx].clone();
 
-            tx.execute(
-                "INSERT INTO parent_child (parent_inode, child_inode, effective_name)
-                 VALUES (?1, ?2, ?3)",
-                params![
+            {
+                let mut pc_stmt = tx.prepare_cached(
+                    "INSERT INTO parent_child (parent_inode, child_inode, effective_name)
+                     VALUES (?1, ?2, ?3)",
+                )?;
+                pc_stmt.execute(params![
                     parent_inode as i64,
                     cached_file.inode as i64,
                     &effective_name
-                ],
-            )?;
+                ])?;
+            }
 
             inserted_inodes.insert(cached_file.inode);
             entries.push(DirectoryEntry {
@@ -866,6 +899,7 @@ impl MetadataCache {
             }
         }
 
+        self.bump_revision();
         Ok(entries)
     }
 
@@ -937,6 +971,7 @@ impl MetadataCache {
             .ok_or_else(|| CacheError::NotFound(format!("inode {}", next_ino)))?;
 
         tx.commit()?;
+        self.bump_revision();
         Ok(DirectoryEntry {
             inode: cached_file.inode,
             parent_inode,
@@ -971,8 +1006,10 @@ impl MetadataCache {
             return Err(CacheError::NotFound(format!("inode {}", inode)));
         }
 
-        Self::get_by_inode_with_conn(&conn, inode)?
-            .ok_or_else(|| CacheError::NotFound(format!("inode {}", inode)))
+        let res = Self::get_by_inode_with_conn(&conn, inode)?
+            .ok_or_else(|| CacheError::NotFound(format!("inode {}", inode)));
+        self.bump_revision();
+        res
     }
 
     /// Updates an inode's Drive metadata (`drive_id`, `name`, `mime_type`, `size`, `modified_time`, `web_view_link`)
@@ -1061,6 +1098,7 @@ impl MetadataCache {
         let cached = Self::get_by_inode_with_conn(&tx, inode)?
             .ok_or_else(|| CacheError::NotFound(format!("inode {}", inode)))?;
         tx.commit()?;
+        self.bump_revision();
         Ok(cached)
     }
 
@@ -1103,6 +1141,7 @@ impl MetadataCache {
         )?;
 
         tx.commit()?;
+        self.bump_revision();
         Ok(DirectoryEntry {
             inode: cached_file.inode,
             parent_inode,
@@ -1140,6 +1179,7 @@ impl MetadataCache {
             "DELETE FROM parent_child WHERE parent_inode = ?1 AND child_inode = ?2",
             params![parent_inode as i64, child_inode as i64],
         )?;
+        self.bump_revision();
         Ok(())
     }
 
@@ -1161,6 +1201,7 @@ impl MetadataCache {
         if let Ok(mut guard) = self.evicted_inodes.lock() {
             guard.insert(inode);
         }
+        self.bump_revision();
         Ok(())
     }
 
@@ -1232,6 +1273,7 @@ impl MetadataCache {
         let updated = Self::get_by_inode_with_conn(&tx, child_inode)?
             .ok_or_else(|| CacheError::NotFound(format!("inode {}", child_inode)))?;
         tx.commit()?;
+        self.bump_revision();
         Ok(updated)
     }
 
@@ -1393,6 +1435,9 @@ impl MetadataCache {
             }
         }
 
+        if affected_count > 0 {
+            self.bump_revision();
+        }
         Ok(affected_count)
     }
 
@@ -1471,6 +1516,7 @@ impl MetadataCache {
         if let Ok(mut guard) = self.evicted_inodes.lock() {
             guard.insert(inode);
         }
+        self.bump_revision();
         Ok(true)
     }
 
@@ -1562,6 +1608,7 @@ impl MetadataCache {
             }
         }
 
+        self.bump_revision();
         Ok(())
     }
 }
@@ -1972,6 +2019,15 @@ mod tests {
             .expect("Initial sync failed");
         assert!(!cache.is_dir_stale(ROOT_INODE).unwrap());
 
+        let revision_before_empty_poll = cache.revision();
+        assert_eq!(
+            cache
+                .apply_changes(&[], Some("token_100"))
+                .expect("empty apply_changes failed"),
+            0
+        );
+        assert_eq!(cache.revision(), revision_before_empty_poll);
+
         // 1. Modify file_a and trash file_b via apply_changes
         let mut file_a_mod = file_a;
         file_a_mod.name = "alpha_v2.txt".to_string();
@@ -1994,6 +2050,7 @@ mod tests {
             .apply_changes(&changes, Some("token_101"))
             .expect("apply_changes failed");
         assert_eq!(affected, 2);
+        assert!(cache.revision() > revision_before_empty_poll);
         assert_eq!(
             cache.get_change_page_token().unwrap().as_deref(),
             Some("token_101")
