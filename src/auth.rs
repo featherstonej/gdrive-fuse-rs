@@ -134,21 +134,31 @@ impl AppConfig {
         let write_result = (|| -> std::io::Result<()> {
             use std::io::Write;
 
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let temp_path = parent.join(format!(
+                ".gdrive-fuse-rs-config-{}.tmp",
+                CsrfToken::new_random().secret()
+            ));
             let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true);
+            options.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            let mut file = options.open(path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            let mut file = options.open(&temp_path)?;
+            let result = (|| -> std::io::Result<()> {
+                file.write_all(serialized.as_bytes())?;
+                file.sync_all()?;
+                std::fs::rename(&temp_path, path)
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp_path);
             }
-            file.set_len(0)?;
-            file.write_all(serialized.as_bytes())
+            result
         })();
         write_result.map_err(|e| {
             AuthError::ConfigError(format!(
