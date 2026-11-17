@@ -18,4 +18,4 @@ Exec=/usr/bin/gdrive-fuse-rs --configure
 
 [Desktop Action SwitchAccount]
 Name=Switch Google Account...
-Exec=/usr/bin/gdrive-fuse-rs --logout --clear-cache --setup
+Exec=/usr/bin/gdrive-fuse-rs --configure
