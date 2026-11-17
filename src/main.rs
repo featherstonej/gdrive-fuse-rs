@@ -150,12 +150,33 @@ fn main() -> Result<()> {
     };
 
     if (args.logout || args.clear_cache) && (args.setup || args.configure) {
-        let status = std::process::Command::new("systemctl")
-            .args(["--user", "stop", "gdrive-fuse-rs.service"])
-            .status()
-            .context("Failed to stop gdrive-fuse-rs.service before cleanup")?;
-        if !status.success() {
-            bail!("Failed to stop gdrive-fuse-rs.service before cleanup");
+        let output = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--value",
+                "gdrive-fuse-rs.service",
+            ])
+            .output()
+            .context("Failed to check gdrive-fuse-rs.service before cleanup")?;
+        let load_state = std::str::from_utf8(&output.stdout)
+            .context("Invalid systemd service load state")?
+            .trim();
+        if load_state != "not-found" {
+            if !output.status.success() || load_state.is_empty() {
+                bail!(
+                    "Failed to check gdrive-fuse-rs.service before cleanup: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let status = std::process::Command::new("systemctl")
+                .args(["--user", "stop", "gdrive-fuse-rs.service"])
+                .status()
+                .context("Failed to stop gdrive-fuse-rs.service before cleanup")?;
+            if !status.success() {
+                bail!("Failed to stop gdrive-fuse-rs.service before cleanup");
+            }
         }
     }
 
