@@ -36,9 +36,13 @@ jobs:
       - name: Build optimized release binary
         env:
           GDRIVE_DEFAULT_CLIENT_ID: ${{ secrets.GDRIVE_DEFAULT_CLIENT_ID }}
-          GDRIVE_DEFAULT_CLIENT_SECRET: ${{ secrets.GDRIVE_DEFAULT_CLIENT_SECRET }}
+          GDRIVE_DEFAULT_CLIENT_SECRET: gdrive-fuse-test-only-secret-sentinel
         run: |
           cargo build --release --locked
+          if grep -aFq "$GDRIVE_DEFAULT_CLIENT_SECRET" target/release/gdrive-fuse-rs; then
+            echo "Build unexpectedly embedded a client secret" >&2
+            exit 1
+          fi
           ldd target/release/gdrive-fuse-rs
 
       - name: Install cargo-deb and cargo-generate-rpm
