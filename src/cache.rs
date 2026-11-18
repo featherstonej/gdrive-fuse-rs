@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row};
 
 use crate::api::{ChangeItem, DriveFile, FOLDER_MIME_TYPE, GOOGLE_APPS_MIME_PREFIX};
 
@@ -199,11 +199,7 @@ impl MetadataCache {
     /// Normalizes a database path for staging namespace computation so that a relative path whose
     /// database file does not exist yet resolves to the exact same canonical path as after
     /// `MetadataCache::open` creates the database file on disk.
-    fn normalize_db_path_for_namespace(db_path: &Path) -> PathBuf {
-        if let Ok(canonical) = fs::canonicalize(db_path) {
-            return canonical;
-        }
-
+    pub(crate) fn normalize_db_path_for_namespace(db_path: &Path) -> PathBuf {
         let abs_path = if db_path.is_absolute() {
             db_path.to_path_buf()
         } else {
@@ -211,9 +207,32 @@ impl MetadataCache {
                 .map(|cwd| cwd.join(db_path))
                 .unwrap_or_else(|_| db_path.to_path_buf())
         };
+        let mut resolved_symlink = abs_path.clone();
+        for _ in 0..40 {
+            let Ok(metadata) = fs::symlink_metadata(&resolved_symlink) else {
+                break;
+            };
+            if !metadata.file_type().is_symlink() {
+                break;
+            }
+            let Ok(target) = fs::read_link(&resolved_symlink) else {
+                break;
+            };
+            resolved_symlink = if target.is_absolute() {
+                target
+            } else {
+                resolved_symlink
+                    .parent()
+                    .map(|parent| parent.join(&target))
+                    .unwrap_or(target)
+            };
+        }
+        if let Ok(canonical) = fs::canonicalize(&resolved_symlink) {
+            return canonical;
+        }
 
         let mut normalized = PathBuf::new();
-        for comp in abs_path.components() {
+        for comp in resolved_symlink.components() {
             match comp {
                 std::path::Component::CurDir => {}
                 std::path::Component::ParentDir => {
@@ -315,6 +334,70 @@ impl MetadataCache {
     /// Removes any leftover `inode_*.stage` or `.inode_*.stage` upload snapshot files in `staging_dir`.
     pub fn clear_staging_dir(staging_dir: &Path) -> Result<(), CacheError> {
         Self::clear_staging_dir_with(staging_dir, |path| fs::remove_file(path))
+    }
+
+    /// Returns whether the staging directory contains recoverable staged or upload-snapshot data.
+    pub fn has_pending_staging_files(staging_dir: &Path) -> Result<bool, CacheError> {
+        let entries = match fs::read_dir(staging_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            let file_type = fs::symlink_metadata(&path)?.file_type();
+            if (file_type.is_file() || file_type.is_symlink())
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.ends_with(".stage")
+                            && name.trim_start_matches('.').starts_with("inode_")
+                    })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns whether an existing cache database contains dirty or pending-upload metadata.
+    pub fn database_has_pending_writes(db_path: &Path) -> Result<bool, CacheError> {
+        match fs::symlink_metadata(db_path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        }
+
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let has_files: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_files {
+            return Ok(false);
+        }
+        let mut columns = conn.prepare("PRAGMA table_info(files)")?;
+        let column_names = columns
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !column_names.iter().any(|name| name == "drive_id") {
+            return Err(CacheError::Sqlite(rusqlite::Error::InvalidQuery));
+        }
+        let query = if column_names.iter().any(|name| name == "dirty") {
+            "SELECT EXISTS(
+                SELECT 1 FROM files
+                WHERE dirty != 0 OR drive_id LIKE 'pending:%'
+            )"
+        } else {
+            "SELECT EXISTS(
+                SELECT 1 FROM files
+                WHERE drive_id LIKE 'pending:%'
+            )"
+        };
+        conn.query_row(query, [], |row| row.get(0))
+            .map_err(CacheError::from)
     }
 
     fn clear_staging_dir_with(
@@ -431,6 +514,51 @@ impl MetadataCache {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS directory_generations (
+                inode INTEGER PRIMARY KEY,
+                generation INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TRIGGER IF NOT EXISTS parent_child_insert_generation
+            AFTER INSERT ON parent_child
+            BEGIN
+                INSERT INTO directory_generations (inode, generation) VALUES (NEW.parent_inode, 1)
+                ON CONFLICT(inode) DO UPDATE SET generation = generation + 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS parent_child_delete_generation
+            AFTER DELETE ON parent_child
+            BEGIN
+                INSERT INTO directory_generations (inode, generation) VALUES (OLD.parent_inode, 1)
+                ON CONFLICT(inode) DO UPDATE SET generation = generation + 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS directory_invalidation_generation
+            AFTER UPDATE OF last_synced_at ON files
+            WHEN NEW.last_synced_at IS NULL
+            BEGIN
+                INSERT INTO directory_generations (inode, generation) VALUES (NEW.inode, 1)
+                ON CONFLICT(inode) DO UPDATE SET generation = generation + 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS file_metadata_generation
+            AFTER UPDATE OF drive_id, name, mime_type, size, modified_time, is_dir, web_view_link, dirty ON files
+            BEGIN
+                UPDATE directory_generations
+                    SET generation = generation + 1
+                    WHERE inode IN (
+                        SELECT parent_inode FROM parent_child WHERE child_inode = NEW.inode
+                    );
+                INSERT INTO directory_generations (inode, generation)
+                    SELECT DISTINCT parent_inode, 1
+                    FROM parent_child
+                    WHERE child_inode = NEW.inode
+                      AND NOT EXISTS (
+                          SELECT 1 FROM directory_generations
+                          WHERE inode = parent_child.parent_inode
+                      );
+            END;
             ",
         )?;
 
@@ -548,6 +676,23 @@ impl MetadataCache {
     pub fn data_version(&self) -> Result<u64, CacheError> {
         let conn = self.lock_conn()?;
         Ok(conn.query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
+    /// Returns the per-directory generation used to detect concurrent child-list invalidations.
+    pub fn directory_generation(&self, dir_inode: u64) -> Result<u64, CacheError> {
+        let conn = self.lock_conn()?;
+        Self::directory_generation_with_conn(&conn, dir_inode)
+    }
+
+    fn directory_generation_with_conn(
+        conn: &Connection,
+        dir_inode: u64,
+    ) -> Result<u64, CacheError> {
+        Ok(conn.query_row(
+            "SELECT COALESCE((SELECT generation FROM directory_generations WHERE inode = ?1), 0)",
+            params![dir_inode as i64],
+            |row| row.get(0),
+        )?)
     }
 
     fn bump_revision(&self) {
@@ -807,6 +952,30 @@ impl MetadataCache {
         parent_inode: u64,
         children: &[DriveFile],
     ) -> Result<Vec<DirectoryEntry>, CacheError> {
+        self.sync_directory_children_inner(parent_inode, children, None)?
+            .ok_or_else(|| {
+                CacheError::Io(std::io::Error::other(
+                    "directory listing changed during unconditional sync",
+                ))
+            })
+    }
+
+    /// Applies a remote listing only if the directory was not invalidated after the fetch began.
+    pub fn sync_directory_children_if_current(
+        &self,
+        parent_inode: u64,
+        children: &[DriveFile],
+        expected_generation: u64,
+    ) -> Result<Option<Vec<DirectoryEntry>>, CacheError> {
+        self.sync_directory_children_inner(parent_inode, children, Some(expected_generation))
+    }
+
+    fn sync_directory_children_inner(
+        &self,
+        parent_inode: u64,
+        children: &[DriveFile],
+        expected_generation: Option<u64>,
+    ) -> Result<Option<Vec<DirectoryEntry>>, CacheError> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
 
@@ -814,6 +983,12 @@ impl MetadataCache {
             .ok_or_else(|| CacheError::NotFound(format!("parent inode {}", parent_inode)))?;
         if !parent_file.is_dir {
             return Err(CacheError::NotADirectory(parent_inode));
+        }
+        if let Some(expected) = expected_generation {
+            if Self::directory_generation_with_conn(&tx, parent_inode)? != expected {
+                tx.rollback()?;
+                return Ok(None);
+            }
         }
 
         // Preserve any locally created/modified dirty children in this directory (and any child folders
@@ -930,7 +1105,7 @@ impl MetadataCache {
         }
 
         self.bump_revision();
-        Ok(entries)
+        Ok(Some(entries))
     }
 
     fn used_sibling_effective_names_with_conn(
@@ -1554,6 +1729,15 @@ impl MetadataCache {
     /// "Shared with me" (`2`), open inodes, and any locally dirty/pending inodes (along with their ancestor
     /// directory chain and parent-child edges so nested dirty files remain reachable).
     pub fn clear_all(&self) -> Result<(), CacheError> {
+        self.clear_all_with_token(None)
+    }
+
+    /// Atomically clears stale cache state and installs a replacement change token.
+    pub fn recover_change_token(&self, token: &str) -> Result<(), CacheError> {
+        self.clear_all_with_token(Some(token))
+    }
+
+    fn clear_all_with_token(&self, replacement_token: Option<&str>) -> Result<(), CacheError> {
         let open_inode_counts = self
             .open_inode_counts
             .lock()
@@ -1615,6 +1799,12 @@ impl MetadataCache {
         )?;
 
         tx.execute("DELETE FROM sync_state", [])?;
+        if let Some(token) = replacement_token {
+            tx.execute(
+                "INSERT INTO sync_state (key, value) VALUES (?1, ?2)",
+                params![CHANGES_PAGE_TOKEN_KEY, token],
+            )?;
+        }
 
         let delete_files_sql = format!(
             "{} DELETE FROM files WHERE inode NOT IN (SELECT inode FROM preserved)",
@@ -1800,6 +1990,69 @@ mod tests {
         assert!(test_dir.join("target/metadata.db").exists());
         drop(cache);
         fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_pending_write_probe_supports_legacy_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-legacy-pending-probe-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db_path = dir.join("metadata.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (
+                inode INTEGER PRIMARY KEY,
+                drive_id TEXT NOT NULL
+            );
+            INSERT INTO files (inode, drive_id) VALUES (3, 'remote-file');",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(!MetadataCache::database_has_pending_writes(&db_path).unwrap());
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO files (inode, drive_id) VALUES (4, 'pending:4')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(MetadataCache::database_has_pending_writes(&db_path).unwrap());
+
+        std::fs::remove_file(db_path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dangling_database_symlink_has_stable_staging_namespace() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-dangling-stage-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("target.db");
+        let alias = dir.join("alias.db");
+        symlink(&target, &alias).unwrap();
+
+        assert_eq!(
+            MetadataCache::default_staging_dir_for_db(&alias),
+            MetadataCache::default_staging_dir_for_db(&target)
+        );
+        MetadataCache::open(&alias, 60).unwrap();
+        assert_eq!(
+            MetadataCache::default_staging_dir_for_db(&alias),
+            MetadataCache::default_staging_dir_for_db(&target)
+        );
+
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -2055,6 +2308,85 @@ mod tests {
     }
 
     #[test]
+    fn test_in_flight_directory_sync_cannot_overwrite_invalidation() {
+        let cache = Cache::open_in_memory(60).expect("Failed to open cache");
+        cache
+            .sync_directory_children(
+                ROOT_INODE,
+                &[sample_drive_file(
+                    "original",
+                    "original.txt",
+                    "text/plain",
+                    10,
+                )],
+            )
+            .unwrap();
+        let generation_at_start = cache.directory_generation(ROOT_INODE).unwrap();
+
+        cache.mark_dir_invalidated(ROOT_INODE).unwrap();
+        let ignored = cache
+            .sync_directory_children_if_current(
+                ROOT_INODE,
+                &[sample_drive_file(
+                    "stale-response",
+                    "stale.txt",
+                    "text/plain",
+                    20,
+                )],
+                generation_at_start,
+            )
+            .unwrap();
+
+        assert!(ignored.is_none());
+        assert!(cache.is_dir_stale(ROOT_INODE).unwrap());
+        assert!(cache
+            .lookup_child(ROOT_INODE, "stale.txt")
+            .unwrap()
+            .is_none());
+
+        let current_generation = cache.directory_generation(ROOT_INODE).unwrap();
+        let applied = cache
+            .sync_directory_children_if_current(
+                ROOT_INODE,
+                &[sample_drive_file(
+                    "fresh-response",
+                    "fresh.txt",
+                    "text/plain",
+                    30,
+                )],
+                current_generation,
+            )
+            .unwrap()
+            .expect("current listing must apply");
+        assert_eq!(applied[0].effective_name, "fresh.txt");
+    }
+
+    #[test]
+    fn test_directory_generations_are_targeted() {
+        let cache = Cache::open_in_memory(60).expect("Failed to open cache");
+        let folder = sample_drive_file("folder", "folder", FOLDER_MIME_TYPE, 0);
+        let folder_inode = cache
+            .sync_directory_children(ROOT_INODE, &[folder])
+            .unwrap()[0]
+            .inode;
+        let root_before = cache.directory_generation(ROOT_INODE).unwrap();
+        let folder_before = cache.directory_generation(folder_inode).unwrap();
+
+        cache
+            .sync_directory_children(
+                folder_inode,
+                &[sample_drive_file("child", "child.txt", "text/plain", 1)],
+            )
+            .unwrap();
+
+        assert_eq!(cache.directory_generation(ROOT_INODE).unwrap(), root_before);
+        assert!(
+            cache.directory_generation(folder_inode).unwrap() > folder_before,
+            "only the mutated directory generation should advance"
+        );
+    }
+
+    #[test]
     fn test_change_page_token_and_incremental_apply_changes() {
         let cache = Cache::open_in_memory(300).expect("Failed to open cache");
         assert!(cache.get_change_page_token().unwrap().is_none());
@@ -2188,6 +2520,24 @@ mod tests {
         assert!(cache.list_children(ROOT_INODE).unwrap().is_empty());
         assert!(cache.get_change_page_token().unwrap().is_none());
         assert!(cache.is_dir_stale(ROOT_INODE).unwrap());
+    }
+
+    #[test]
+    fn test_recover_change_token_failure_preserves_existing_token() {
+        let cache = Cache::open_in_memory(60).expect("Failed to open cache");
+        cache.set_change_page_token("expired").unwrap();
+        cache
+            .execute_test_sql(
+                "CREATE TRIGGER reject_recovery_token BEFORE INSERT ON sync_state
+                 BEGIN SELECT RAISE(ABORT, 'token write rejected'); END;",
+            )
+            .unwrap();
+
+        assert!(cache.recover_change_token("fresh").is_err());
+        assert_eq!(
+            cache.get_change_page_token().unwrap().as_deref(),
+            Some("expired")
+        );
     }
 
     #[test]

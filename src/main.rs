@@ -9,6 +9,8 @@ mod filesystem;
 #[allow(dead_code)]
 mod setup_ui;
 
+use std::fs::{File, OpenOptions};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +21,8 @@ use fuser::{MountOption, Session};
 
 use crate::api::DriveClient;
 use crate::auth::{
-    clear_keyring_credentials, clear_keyring_tokens, resolve_credentials, validate_credentials,
-    AppConfig, AuthManager, GoogleDocsMode,
+    clear_keyring_client_credentials, clear_keyring_credentials, resolve_credentials,
+    validate_credentials, AppConfig, AuthManager, GoogleDocsMode,
 };
 use crate::cache::MetadataCache;
 use crate::filesystem::{
@@ -94,6 +96,18 @@ pub struct CliArgs {
     #[arg(long = "clear-cache", default_value_t = false)]
     pub clear_cache: bool,
 
+    /// Confirm destructive cache cleanup without an interactive prompt.
+    #[arg(long = "yes", default_value_t = false)]
+    pub yes: bool,
+
+    /// Serve expired complete directory listings while refreshing them in the background.
+    #[arg(long = "stale-while-revalidate", default_value_t = false)]
+    pub stale_while_revalidate: bool,
+
+    /// Enable timing diagnostics for FUSE, cache, and Drive operations (no file identifiers or contents).
+    #[arg(long = "diagnostics", default_value_t = false)]
+    pub diagnostics: bool,
+
     /// Remove stored OAuth2 tokens and client credentials from the system keyring.
     #[arg(long = "logout", default_value_t = false)]
     pub logout: bool,
@@ -148,6 +162,10 @@ fn main() -> Result<()> {
         }
         None => AppConfig::load_default().context("Failed to load default configuration")?,
     };
+
+    if args.clear_cache {
+        confirm_cache_cleanup(args.yes)?;
+    }
 
     if (args.logout || args.clear_cache) && (args.setup || args.configure) {
         let output = std::process::Command::new("systemctl")
@@ -288,16 +306,18 @@ fn main() -> Result<()> {
         .context("Google OAuth2 authentication failed")?;
     let auth_manager = Arc::new(auth_manager);
 
-    let cache = match args.cache_db.as_ref().or(config.cache_db_path.as_ref()) {
-        Some(db_path) => MetadataCache::open(db_path, cache_ttl_secs).with_context(|| {
-            format!(
-                "Failed to open SQLite metadata cache at {}",
-                db_path.display()
-            )
-        })?,
-        None => MetadataCache::open_default(cache_ttl_secs)
-            .context("Failed to open default SQLite metadata cache")?,
-    };
+    let cache_db_path = args
+        .cache_db
+        .clone()
+        .or_else(|| config.cache_db_path.clone())
+        .unwrap_or_else(MetadataCache::default_db_path);
+    let cache_lock = acquire_cache_lock(&cache_db_path)?;
+    let cache = MetadataCache::open(&cache_db_path, cache_ttl_secs).with_context(|| {
+        format!(
+            "Failed to open SQLite metadata cache at {}",
+            cache_db_path.display()
+        )
+    })?;
     let cache = Arc::new(cache);
 
     let api_client =
@@ -332,7 +352,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let fs = GDriveFS::with_phase3_config(
+    let fs = GDriveFS::with_phase4_config(
         api_client,
         cache,
         rt.handle().clone(),
@@ -342,7 +362,10 @@ fn main() -> Result<()> {
         shared_with_me,
         read_only,
         staging_dir,
+        args.stale_while_revalidate,
+        args.diagnostics,
     );
+    let _cache_lock = cache_lock;
 
     let mount_options = build_mount_options(read_only, args.allow_other);
 
@@ -621,6 +644,12 @@ fn systemd_mount_args(args: &CliArgs) -> Vec<String> {
     if args.allow_other {
         unit_args.push("--allow-other".to_owned());
     }
+    if args.stale_while_revalidate {
+        unit_args.push("--stale-while-revalidate".to_owned());
+    }
+    if args.diagnostics {
+        unit_args.push("--diagnostics".to_owned());
+    }
     unit_args
 }
 
@@ -697,16 +726,7 @@ fn cache_cleanup_paths(args: &CliArgs, config: &AppConfig) -> Result<(PathBuf, P
         .clone()
         .or_else(|| config.cache_db_path.clone())
         .unwrap_or_else(MetadataCache::default_db_path);
-    let db_path = match std::fs::symlink_metadata(&db_path) {
-        Ok(_) => std::fs::canonicalize(&db_path).with_context(|| {
-            format!(
-                "Failed to resolve SQLite metadata cache at {}",
-                db_path.display()
-            )
-        })?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => db_path,
-        Err(err) => return Err(err).context("Failed to inspect SQLite metadata cache path"),
-    };
+    let db_path = MetadataCache::normalize_db_path_for_namespace(&db_path);
     let stage_dir = args
         .staging_dir
         .clone()
@@ -721,7 +741,40 @@ fn cache_cleanup_paths(args: &CliArgs, config: &AppConfig) -> Result<(PathBuf, P
 }
 
 fn clear_local_cache_and_staging(args: &CliArgs, config: &AppConfig) -> Result<()> {
+    let (mount_point, _) =
+        resolve_mount_point(args.mount_point.clone(), config.mount_point_path.clone());
+    let proc_mounts = std::fs::read_to_string("/proc/mounts")
+        .context("Failed to inspect active FUSE mounts before cache cleanup")?;
+    if is_fuse_mounted_in_proc_mounts(&proc_mounts, &mount_point) {
+        bail!(
+            "Refusing to clear cache because {} is an active FUSE mount; unmount it first",
+            mount_point.display()
+        );
+    }
     let (db_path, stage_dir) = cache_cleanup_paths(args, config)?;
+    let _lock = acquire_cache_lock(&db_path)?;
+    if MetadataCache::has_pending_staging_files(&stage_dir).with_context(|| {
+        format!(
+            "Failed to inspect staging directory {}",
+            stage_dir.display()
+        )
+    })? {
+        bail!(
+            "Refusing to clear cache while pending writes exist in {}. Upload or recover those files first.",
+            stage_dir.display()
+        );
+    }
+    if MetadataCache::database_has_pending_writes(&db_path).with_context(|| {
+        format!(
+            "Failed to inspect pending writes in cache database {}",
+            db_path.display()
+        )
+    })? {
+        bail!(
+            "Refusing to clear cache at {} while its database records pending writes. Upload or recover those files first.",
+            db_path.display()
+        );
+    }
     MetadataCache::clear_staging_dir(&stage_dir)
         .with_context(|| format!("Failed to clear staging directory {}", stage_dir.display()))?;
     MetadataCache::remove_db_files(&db_path).with_context(|| {
@@ -732,6 +785,90 @@ fn clear_local_cache_and_staging(args: &CliArgs, config: &AppConfig) -> Result<(
     })?;
     log::info!("Removed SQLite metadata cache at {}.", db_path.display());
     Ok(())
+}
+
+fn confirm_cache_cleanup(assume_yes: bool) -> Result<()> {
+    if assume_yes {
+        return Ok(());
+    }
+    let mut stderr = io::stderr().lock();
+    if !stderr.is_terminal() {
+        bail!("--clear-cache requires explicit confirmation: rerun interactively or pass --yes");
+    }
+    write!(
+        stderr,
+        "This deletes the local metadata cache and may require Drive to be listed again. Pending staged writes are never deleted. Continue? [y/N] "
+    )?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("Failed to read cleanup confirmation")?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        bail!("Cache cleanup cancelled");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CacheLock {
+    _file: File,
+}
+
+fn acquire_cache_lock(db_path: &Path) -> Result<CacheLock> {
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create cache lock directory {}", parent.display())
+            })?;
+        }
+    }
+    let resolved_db_path = resolve_db_path_for_lock(db_path)?;
+    let mut lock_path = resolved_db_path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open cache lock {}", lock_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to secure cache lock {}", lock_path.display()))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                bail!(
+                    "Cache at {} is in use by an active gdrive-fuse-rs process; stop/unmount it before cleanup",
+                    resolved_db_path.display()
+                );
+            }
+            return Err(err).with_context(|| {
+                format!("Failed to lock cache at {}", resolved_db_path.display())
+            });
+        }
+    }
+    Ok(CacheLock { _file: file })
+}
+
+fn resolve_db_path_for_lock(db_path: &Path) -> Result<PathBuf> {
+    let normalized = MetadataCache::normalize_db_path_for_namespace(db_path);
+    let parent = normalized
+        .parent()
+        .context("Cache database path has no parent directory")?;
+    std::fs::canonicalize(parent)
+        .with_context(|| format!("Failed to resolve cache directory {}", parent.display()))?;
+    Ok(normalized)
 }
 
 fn stop_existing_service(systemctl: &std::ffi::OsStr, existing_unit: bool) -> Result<()> {
@@ -789,6 +926,7 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         true
     };
     let mut switch_account = false;
+    let mut clear_custom_credentials = false;
 
     // Prepare defaults in memory; persist only after the wizard is submitted.
     if !config_exists {
@@ -815,7 +953,7 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
                 .is_some_and(|b| b.client_id == existing_creds.client_id);
             if !is_builtin {
                 active_config.client_id = Some(existing_creds.client_id);
-                active_config.client_secret = existing_creds.client_secret;
+                active_config.client_secret = args.client_secret.clone();
             }
         } else {
             active_config.client_id = None;
@@ -829,6 +967,20 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         active_config.read_only = Some(args.read_only || active_config.read_only.unwrap_or(false));
         active_config.shared_with_me =
             Some(!args.no_shared_with_me && active_config.shared_with_me.unwrap_or(true));
+        if active_config.client_id.is_none() {
+            if let Ok(existing_creds) = validate_credentials(
+                args.client_id.clone(),
+                args.client_secret.clone(),
+                &active_config,
+            ) {
+                if auth::builtin_default_credentials()
+                    .as_ref()
+                    .is_none_or(|builtin| builtin.client_id != existing_creds.client_id)
+                {
+                    active_config.client_id = Some(existing_creds.client_id);
+                }
+            }
+        }
         if let Some(client_id) = args
             .client_id
             .as_deref()
@@ -859,24 +1011,11 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         active_config = outcome.config;
         enable_autostart = outcome.enable_autostart;
         switch_account = outcome.switch_account;
+        clear_custom_credentials = outcome.clear_custom_credentials;
 
-        stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
         if outcome.switch_account {
-            clear_local_cache_and_staging(args, &active_config)?;
-            clear_keyring_tokens().context("Failed to clear OAuth2 tokens from system keyring")?;
-            log::info!("Cleared previous Google account session and metadata cache.");
+            confirm_cache_cleanup(args.yes)?;
         }
-
-        if let Some(ref save_path) = config_file_path {
-            active_config.save_to_path(save_path).with_context(|| {
-                format!("Failed to save configuration to {}", save_path.display())
-            })?;
-            log::info!("Saved configuration to {}.", save_path.display());
-        }
-    }
-
-    if !wizard_ran {
-        stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
     }
 
     let mut unit_args = args.clone();
@@ -889,12 +1028,18 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         unit_args.no_shared_with_me = !active_config.shared_with_me.unwrap_or(true);
     }
     let args = &unit_args;
-    let credentials = resolve_credentials(
-        args.client_id.clone(),
-        args.client_secret.clone(),
-        &active_config,
-    )
-    .context("Failed to resolve Google OAuth2 client credentials")?;
+    let credentials = if clear_custom_credentials {
+        auth::builtin_default_credentials().context(
+            "No built-in OAuth2 client credentials are available after clearing custom credentials",
+        )?
+    } else {
+        resolve_credentials(
+            args.client_id.clone(),
+            args.client_secret.clone(),
+            &active_config,
+        )
+        .context("Failed to resolve Google OAuth2 client credentials")?
+    };
     let read_only = args.read_only || active_config.read_only.unwrap_or(false);
 
     log::info!(
@@ -908,6 +1053,24 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         switch_account,
     ))
     .context("Google OAuth2 authentication failed during setup")?;
+
+    if clear_custom_credentials {
+        clear_keyring_client_credentials()
+            .context("Failed to clear custom OAuth2 client credentials from system keyring")?;
+    }
+    stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
+    if switch_account {
+        clear_local_cache_and_staging(args, &active_config)?;
+        log::info!("Cleared previous Google account session and metadata cache.");
+    }
+    if wizard_ran {
+        if let Some(ref save_path) = config_file_path {
+            active_config.save_to_path(save_path).with_context(|| {
+                format!("Failed to save configuration to {}", save_path.display())
+            })?;
+            log::info!("Saved configuration to {}.", save_path.display());
+        }
+    }
 
     let mut service_args = (*args).clone();
     if wizard_ran && config_file_path.is_some() {
@@ -1156,6 +1319,8 @@ mod tests {
         std::fs::write(&stage, b"staged").unwrap();
         let args = CliArgs::try_parse_from([
             "gdrive-fuse-rs",
+            "--mount-point",
+            dir.to_str().unwrap(),
             "--cache-db",
             db.to_str().unwrap(),
             "--staging-dir",
@@ -1165,8 +1330,138 @@ mod tests {
         assert!(clear_local_cache_and_staging(&args, &AppConfig::default()).is_err());
         assert_eq!(std::fs::read(&db).unwrap(), b"metadata");
         assert_eq!(std::fs::read(&stage).unwrap(), b"staged");
+        std::fs::remove_file(dir.join("cache.db.lock")).unwrap();
         std::fs::remove_file(db).unwrap();
         std::fs::remove_file(stage).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_cache_cleanup_refuses_pending_staging_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-cleanup-pending-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db = dir.join("cache.db");
+        let stage = dir.join("staging");
+        std::fs::write(&db, b"metadata").unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        let staged = stage.join("inode_42.stage");
+        std::fs::write(&staged, b"pending write").unwrap();
+        let args = CliArgs::try_parse_from([
+            "gdrive-fuse-rs",
+            "--mount-point",
+            dir.to_str().unwrap(),
+            "--cache-db",
+            db.to_str().unwrap(),
+            "--staging-dir",
+            stage.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let error = clear_local_cache_and_staging(&args, &AppConfig::default()).unwrap_err();
+        assert!(error.to_string().contains("pending writes"));
+        assert_eq!(std::fs::read(&db).unwrap(), b"metadata");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"pending write");
+
+        std::fs::remove_file(staged).unwrap();
+        std::fs::remove_file(db).unwrap();
+        std::fs::remove_file(dir.join("cache.db.lock")).unwrap();
+        std::fs::remove_dir(stage).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_cache_cleanup_refuses_database_pending_write_without_stage() {
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-cleanup-db-pending-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db = dir.join("cache.db");
+        let stage = dir.join("staging");
+        let cache = MetadataCache::open(&db, 60).unwrap();
+        cache
+            .create_pending_file(crate::cache::ROOT_INODE, "unsent.txt", "text/plain", 1)
+            .unwrap();
+        drop(cache);
+        let args = CliArgs::try_parse_from([
+            "gdrive-fuse-rs",
+            "--mount-point",
+            dir.to_str().unwrap(),
+            "--cache-db",
+            db.to_str().unwrap(),
+            "--staging-dir",
+            stage.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let error = clear_local_cache_and_staging(&args, &AppConfig::default()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("database records pending writes"));
+        assert!(db.exists());
+        assert!(!stage.exists());
+
+        std::fs::remove_file(dir.join("cache.db.lock")).unwrap();
+        std::fs::remove_file(dir.join("cache.db-shm")).unwrap();
+        std::fs::remove_file(dir.join("cache.db-wal")).unwrap();
+        std::fs::remove_file(db).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_cache_lock_rejects_concurrent_cleanup() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-cache-lock-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db = dir.join("cache.db");
+        let alias = dir.join("cache-alias.db");
+        std::fs::write(&db, b"metadata").unwrap();
+        symlink(&db, &alias).unwrap();
+        let active = acquire_cache_lock(&alias).unwrap();
+        let error = acquire_cache_lock(&db).unwrap_err();
+        assert!(error.to_string().contains("active gdrive-fuse-rs process"));
+        drop(active);
+        acquire_cache_lock(&db).unwrap();
+        std::fs::remove_file(dir.join("cache.db.lock")).unwrap();
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_file(db).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_cache_lock_resolves_dangling_database_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-cache-lock-dangling-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("target.db");
+        let alias = dir.join("alias.db");
+        symlink(&target, &alias).unwrap();
+
+        assert_eq!(
+            resolve_db_path_for_lock(&alias).unwrap(),
+            std::fs::canonicalize(&dir)
+                .unwrap()
+                .join(target.file_name().unwrap())
+        );
+        let active = acquire_cache_lock(&alias).unwrap();
+        let error = acquire_cache_lock(&target).unwrap_err();
+        assert!(error.to_string().contains("active gdrive-fuse-rs process"));
+        drop(active);
+        std::fs::remove_file(dir.join("target.db.lock")).unwrap();
+        std::fs::remove_file(alias).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -1182,8 +1477,9 @@ mod tests {
         let db = dir.join("target.db");
         let link = dir.join("link.db");
         let stage = dir.join("staging");
-        std::fs::write(&db, b"metadata").unwrap();
-        std::fs::write(dir.join("target.db-wal"), b"wal").unwrap();
+        let cache = MetadataCache::open(&db, 60).unwrap();
+        drop(cache);
+        std::fs::write(dir.join("target.db-wal"), []).unwrap();
         std::fs::create_dir(&stage).unwrap();
         std::fs::write(stage.join("inode_1.stage"), b"staged").unwrap();
         symlink(&db, &link).unwrap();
@@ -1203,17 +1499,24 @@ mod tests {
         );
         let args = CliArgs::try_parse_from([
             "gdrive-fuse-rs",
+            "--mount-point",
+            dir.to_str().unwrap(),
             "--cache-db",
             link.to_str().unwrap(),
             "--staging-dir",
             stage.to_str().unwrap(),
         ])
         .unwrap();
+        assert!(clear_local_cache_and_staging(&args, &AppConfig::default()).is_err());
+        assert!(db.exists());
+        assert!(stage.join("inode_1.stage").exists());
+        std::fs::remove_file(stage.join("inode_1.stage")).unwrap();
         clear_local_cache_and_staging(&args, &AppConfig::default()).unwrap();
         assert!(!db.exists());
         assert!(!dir.join("target.db-wal").exists());
         assert!(std::fs::symlink_metadata(&link).is_ok());
         assert!(!stage.join("inode_1.stage").exists());
+        std::fs::remove_file(dir.join("target.db.lock")).unwrap();
         std::fs::remove_file(link).unwrap();
         std::fs::remove_dir(stage).unwrap();
         std::fs::remove_dir(dir).unwrap();
@@ -1340,6 +1643,8 @@ mod tests {
             "45",
             "--no-shared-with-me",
             "--allow-other",
+            "--stale-while-revalidate",
+            "--diagnostics",
         ])
         .expect("Mount options must parse");
         let unit = generate_systemd_unit(
@@ -1349,7 +1654,7 @@ mod tests {
         );
 
         assert!(unit.contains(
-            "ExecStart=\"/usr/local/bin/gdrive-fuse-rs\" --mount-point \"/home/alice/GoogleDrive\" --no-browser \"--config\" \"/tmp/gdrive config.toml\" \"--client-id\" \"client-id\" \"--cache-db\" \"/tmp/cache.db\" \"--cache-ttl\" \"120\" \"--chunk-size\" \"8388608\" \"--google-docs-mode\" \"pdf\" \"--change-poll-secs\" \"45\" \"--no-shared-with-me\" \"--allow-other\""
+            "ExecStart=\"/usr/local/bin/gdrive-fuse-rs\" --mount-point \"/home/alice/GoogleDrive\" --no-browser \"--config\" \"/tmp/gdrive config.toml\" \"--client-id\" \"client-id\" \"--cache-db\" \"/tmp/cache.db\" \"--cache-ttl\" \"120\" \"--chunk-size\" \"8388608\" \"--google-docs-mode\" \"pdf\" \"--change-poll-secs\" \"45\" \"--no-shared-with-me\" \"--allow-other\" \"--stale-while-revalidate\" \"--diagnostics\""
         ));
     }
 
