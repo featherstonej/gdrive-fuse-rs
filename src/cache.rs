@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row};
 
 use crate::api::{ChangeItem, DriveFile, FOLDER_MIME_TYPE, GOOGLE_APPS_MIME_PREFIX};
 
@@ -340,6 +340,26 @@ impl MetadataCache {
             }
         }
         Ok(false)
+    }
+
+    /// Returns whether an existing cache database contains dirty or pending-upload metadata.
+    pub fn database_has_pending_writes(db_path: &Path) -> Result<bool, CacheError> {
+        match fs::symlink_metadata(db_path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        }
+
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM files
+                WHERE dirty != 0 OR drive_id LIKE 'pending:%'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(CacheError::from)
     }
 
     fn clear_staging_dir_with(

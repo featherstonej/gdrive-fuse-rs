@@ -773,6 +773,17 @@ fn clear_local_cache_and_staging(args: &CliArgs, config: &AppConfig) -> Result<(
             stage_dir.display()
         );
     }
+    if MetadataCache::database_has_pending_writes(&db_path).with_context(|| {
+        format!(
+            "Failed to inspect pending writes in cache database {}",
+            db_path.display()
+        )
+    })? {
+        bail!(
+            "Refusing to clear cache at {} while its database records pending writes. Upload or recover those files first.",
+            db_path.display()
+        );
+    }
     MetadataCache::clear_staging_dir(&stage_dir)
         .with_context(|| format!("Failed to clear staging directory {}", stage_dir.display()))?;
     MetadataCache::remove_db_files(&db_path).with_context(|| {
@@ -1401,6 +1412,46 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_cleanup_refuses_database_pending_write_without_stage() {
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-cleanup-db-pending-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db = dir.join("cache.db");
+        let stage = dir.join("staging");
+        let cache = MetadataCache::open(&db, 60).unwrap();
+        cache
+            .create_pending_file(crate::cache::ROOT_INODE, "unsent.txt", "text/plain", 1)
+            .unwrap();
+        drop(cache);
+        let args = CliArgs::try_parse_from([
+            "gdrive-fuse-rs",
+            "--mount-point",
+            dir.to_str().unwrap(),
+            "--cache-db",
+            db.to_str().unwrap(),
+            "--staging-dir",
+            stage.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let error = clear_local_cache_and_staging(&args, &AppConfig::default()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("database records pending writes"));
+        assert!(db.exists());
+        assert!(!stage.exists());
+
+        std::fs::remove_file(dir.join("cache.db.lock")).unwrap();
+        std::fs::remove_file(dir.join("cache.db-shm")).unwrap();
+        std::fs::remove_file(dir.join("cache.db-wal")).unwrap();
+        std::fs::remove_file(db).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn test_cache_lock_rejects_concurrent_cleanup() {
         use std::os::unix::fs::symlink;
         let dir = std::env::temp_dir().join(format!(
@@ -1464,8 +1515,9 @@ mod tests {
         let db = dir.join("target.db");
         let link = dir.join("link.db");
         let stage = dir.join("staging");
-        std::fs::write(&db, b"metadata").unwrap();
-        std::fs::write(dir.join("target.db-wal"), b"wal").unwrap();
+        let cache = MetadataCache::open(&db, 60).unwrap();
+        drop(cache);
+        std::fs::write(dir.join("target.db-wal"), []).unwrap();
         std::fs::create_dir(&stage).unwrap();
         std::fs::write(stage.join("inode_1.stage"), b"staged").unwrap();
         symlink(&db, &link).unwrap();
