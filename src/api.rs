@@ -432,7 +432,7 @@ impl DriveClient {
             self.list_files_with_query_inner(query),
         )
         .await
-        .map_err(|_| ApiError::Timeout("directory listing exceeded 60 seconds"))?
+.map_err(|_| ApiError::Timeout("Drive file query exceeded 60 seconds"))?
     }
 
     async fn list_files_with_query_inner(&self, query: &str) -> Result<Vec<DriveFile>, ApiError> {
