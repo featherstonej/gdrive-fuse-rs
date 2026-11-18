@@ -69,6 +69,7 @@ pub struct SetupWizardOutcome {
     pub enable_autostart: bool,
     pub switch_account: bool,
     pub optimize_nautilus: bool,
+    pub clear_custom_credentials: bool,
 }
 
 /// Launches a local loopback HTTP configuration wizard (`http://127.0.0.1:<port>`) in the user's browser,
@@ -359,17 +360,22 @@ pub fn parse_setup_form_submission(
         .map(expand_tilde_path)
         .unwrap_or_else(default_mount_point);
 
-    let client_id = fields
-        .get("client_id")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let submitted_client_id = fields.get("client_id").map(|s| s.trim());
+    let clear_custom_credentials =
+        submitted_client_id == Some("") && base_config.client_id.is_some();
+    let client_id = submitted_client_id
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let client_secret = fields
         .get("client_secret")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
     let mut test_cfg = base_config.clone();
-    if client_id.is_some() && client_id != base_config.client_id {
+    if clear_custom_credentials {
+        test_cfg.client_id = None;
+        test_cfg.client_secret = None;
+    } else if client_id.is_some() && client_id != base_config.client_id {
         test_cfg.client_secret = None;
     }
     if client_id.is_some() {
@@ -379,7 +385,9 @@ pub fn parse_setup_form_submission(
         test_cfg.client_secret = client_secret.clone();
     }
 
-    if validate_credentials(client_id.clone(), client_secret.clone(), &test_cfg).is_err() {
+    if !clear_custom_credentials
+        && validate_credentials(client_id.clone(), client_secret.clone(), &test_cfg).is_err()
+    {
         bail!(
             "A Google OAuth2 Client ID is required. Please enter your Desktop OAuth2 Client ID below."
         );
@@ -410,10 +418,18 @@ pub fn parse_setup_form_submission(
 
     let mut updated = test_cfg;
     updated.mount_point_path = Some(raw_mount);
-    if client_id.is_some() {
-        let credentials = validate_credentials(client_id, client_secret, &updated)?;
+    if clear_custom_credentials {
+        updated.client_id = None;
+        updated.client_secret = None;
+    } else if let Some(client_id) = client_id {
+        let credentials =
+            validate_credentials(Some(client_id.clone()), client_secret.clone(), &updated)?;
         updated.client_id = Some(credentials.client_id);
-        updated.client_secret = credentials.client_secret;
+        updated.client_secret = client_secret.or_else(|| {
+            (base_config.client_id.as_deref() == Some(client_id.as_str()))
+                .then(|| base_config.client_secret.clone())
+                .flatten()
+        });
     }
     updated.google_docs_mode = Some(google_docs_mode);
     updated.read_only = Some(read_only);
@@ -424,6 +440,7 @@ pub fn parse_setup_form_submission(
         enable_autostart,
         switch_account,
         optimize_nautilus,
+        clear_custom_credentials,
     })
 }
 
@@ -1314,6 +1331,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(replaced.config.client_secret.as_deref(), Some("new-secret"));
+    }
+
+    #[test]
+    fn test_blank_client_id_clears_custom_credentials_without_echoing_keyring_secret() {
+        let base = AppConfig {
+            client_id: Some("custom.apps.googleusercontent.com".into()),
+            client_secret: None,
+            ..Default::default()
+        };
+
+        let outcome = parse_setup_form_submission(
+            "csrf_token=clear&client_id=&mount_point=%2Ftmp%2Fdrive",
+            "clear",
+            &base,
+        )
+        .unwrap();
+
+        assert!(outcome.clear_custom_credentials);
+        assert_eq!(outcome.config.client_id, None);
+        assert_eq!(outcome.config.client_secret, None);
+    }
+
+    #[test]
+    fn test_prefilled_keyring_secret_is_not_copied_into_saved_config() {
+        let base = AppConfig {
+            client_id: Some("my-id.apps.googleusercontent.com".into()),
+            client_secret: None,
+            ..Default::default()
+        };
+
+        let outcome = parse_setup_form_submission(
+            "csrf_token=keep&client_id=my-id.apps.googleusercontent.com",
+            "keep",
+            &base,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.config.client_id.as_deref(),
+            Some("my-id.apps.googleusercontent.com")
+        );
+        assert_eq!(outcome.config.client_secret, None);
     }
 
     #[test]

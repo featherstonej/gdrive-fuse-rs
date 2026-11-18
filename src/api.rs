@@ -24,6 +24,7 @@ pub const GOOGLE_APPS_MIME_PREFIX: &str = "application/vnd.google-apps.";
 pub const RESUMABLE_UPLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 const LIST_PAGE_SIZE: &str = "1000";
+const DIRECTORY_LIST_TIMEOUT: Duration = Duration::from_secs(60);
 const LIST_FIELDS: &str =
     "nextPageToken,files(id,name,mimeType,size,modifiedTime,parents,trashed,webViewLink)";
 const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,parents,trashed,webViewLink";
@@ -48,6 +49,9 @@ pub enum ApiError {
     #[error("Rate limited or service temporarily unavailable: {0}")]
     RateLimited(String),
 
+    #[error("Drive request timed out: {0}")]
+    Timeout(&'static str),
+
     #[error("Unexpected HTTP status {status}: {body}")]
     UnexpectedStatus { status: u16, body: String },
 
@@ -68,7 +72,7 @@ impl ApiError {
             ApiError::NotFound(_) => libc::ENOENT,
             ApiError::Unauthorized(_) => libc::EACCES,
             ApiError::Auth(auth_err) => auth_err.to_errno(),
-            ApiError::RateLimited(_) => libc::EAGAIN,
+            ApiError::RateLimited(_) | ApiError::Timeout(_) => libc::EAGAIN,
             ApiError::InvalidRange { .. } => libc::EINVAL,
             ApiError::Http(err) => {
                 if err.is_timeout() {
@@ -423,6 +427,15 @@ impl DriveClient {
     }
 
     async fn list_files_with_query(&self, query: &str) -> Result<Vec<DriveFile>, ApiError> {
+        tokio::time::timeout(
+            DIRECTORY_LIST_TIMEOUT,
+            self.list_files_with_query_inner(query),
+        )
+        .await
+        .map_err(|_| ApiError::Timeout("directory listing exceeded 60 seconds"))?
+    }
+
+    async fn list_files_with_query_inner(&self, query: &str) -> Result<Vec<DriveFile>, ApiError> {
         let url = format!("{}/files", self.base_url);
 
         let mut all_files = Vec::new();
@@ -471,14 +484,22 @@ impl DriveClient {
                         .and_then(|value| value.to_str().ok())
                         .map(str::trim)
                         .and_then(|value| {
-                            value.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
-                                chrono::DateTime::parse_from_rfc2822(value).ok().map(|when| {
-                                    let seconds = when.timestamp()
-                                        .saturating_sub(chrono::Utc::now().timestamp())
-                                        .max(0) as u64;
-                                    Duration::from_secs(seconds)
+                            value
+                                .parse::<u64>()
+                                .ok()
+                                .map(Duration::from_secs)
+                                .or_else(|| {
+                                    chrono::DateTime::parse_from_rfc2822(value)
+                                        .ok()
+                                        .map(|when| {
+                                            let seconds = when
+                                                .timestamp()
+                                                .saturating_sub(chrono::Utc::now().timestamp())
+                                                .max(0)
+                                                as u64;
+                                            Duration::from_secs(seconds)
+                                        })
                                 })
-                            })
                         });
                     let body = response.text().await.unwrap_or_default();
                     let error = Self::map_status_error(status, body);

@@ -21,8 +21,8 @@ use fuser::{MountOption, Session};
 
 use crate::api::DriveClient;
 use crate::auth::{
-    clear_keyring_credentials, clear_keyring_tokens, resolve_credentials, validate_credentials,
-    AppConfig, AuthManager, GoogleDocsMode,
+    clear_keyring_client_credentials, clear_keyring_credentials, resolve_credentials,
+    validate_credentials, AppConfig, AuthManager, GoogleDocsMode,
 };
 use crate::cache::MetadataCache;
 use crate::filesystem::{
@@ -726,16 +726,7 @@ fn cache_cleanup_paths(args: &CliArgs, config: &AppConfig) -> Result<(PathBuf, P
         .clone()
         .or_else(|| config.cache_db_path.clone())
         .unwrap_or_else(MetadataCache::default_db_path);
-    let db_path = match std::fs::symlink_metadata(&db_path) {
-        Ok(_) => std::fs::canonicalize(&db_path).with_context(|| {
-            format!(
-                "Failed to resolve SQLite metadata cache at {}",
-                db_path.display()
-            )
-        })?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => db_path,
-        Err(err) => return Err(err).context("Failed to inspect SQLite metadata cache path"),
-    };
+    let db_path = MetadataCache::normalize_db_path_for_namespace(&db_path);
     let stage_dir = args
         .staging_dir
         .clone()
@@ -871,65 +862,13 @@ fn acquire_cache_lock(db_path: &Path) -> Result<CacheLock> {
 }
 
 fn resolve_db_path_for_lock(db_path: &Path) -> Result<PathBuf> {
-    let mut current = if db_path.is_absolute() {
-        db_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("Failed to resolve relative cache database path")?
-            .join(db_path)
-    };
-
-    for _ in 0..40 {
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let target = std::fs::read_link(&current).with_context(|| {
-                    format!("Failed to resolve cache symlink {}", current.display())
-                })?;
-                current = if target.is_absolute() {
-                    target
-                } else {
-                    current
-                        .parent()
-                        .context("Cache symlink has no parent directory")?
-                        .join(target)
-                };
-            }
-            Ok(_) => {
-                return std::fs::canonicalize(&current).with_context(|| {
-                    format!(
-                        "Failed to resolve SQLite metadata cache at {}",
-                        current.display()
-                    )
-                });
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                let parent = current
-                    .parent()
-                    .context("Cache database path has no parent directory")?;
-                let canonical_parent = std::fs::canonicalize(parent).with_context(|| {
-                    format!("Failed to resolve cache directory {}", parent.display())
-                })?;
-                return Ok(canonical_parent.join(
-                    current
-                        .file_name()
-                        .context("Cache database path has no filename")?,
-                ));
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "Failed to inspect SQLite metadata cache at {}",
-                        current.display()
-                    )
-                });
-            }
-        }
-    }
-
-    bail!(
-        "Too many symlinks while resolving cache database path {}",
-        db_path.display()
-    )
+    let normalized = MetadataCache::normalize_db_path_for_namespace(db_path);
+    let parent = normalized
+        .parent()
+        .context("Cache database path has no parent directory")?;
+    std::fs::canonicalize(parent)
+        .with_context(|| format!("Failed to resolve cache directory {}", parent.display()))?;
+    Ok(normalized)
 }
 
 fn stop_existing_service(systemctl: &std::ffi::OsStr, existing_unit: bool) -> Result<()> {
@@ -987,6 +926,7 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         true
     };
     let mut switch_account = false;
+    let mut clear_custom_credentials = false;
 
     // Prepare defaults in memory; persist only after the wizard is submitted.
     if !config_exists {
@@ -1013,7 +953,7 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
                 .is_some_and(|b| b.client_id == existing_creds.client_id);
             if !is_builtin {
                 active_config.client_id = Some(existing_creds.client_id);
-                active_config.client_secret = existing_creds.client_secret;
+                active_config.client_secret = args.client_secret.clone();
             }
         } else {
             active_config.client_id = None;
@@ -1027,6 +967,20 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         active_config.read_only = Some(args.read_only || active_config.read_only.unwrap_or(false));
         active_config.shared_with_me =
             Some(!args.no_shared_with_me && active_config.shared_with_me.unwrap_or(true));
+        if active_config.client_id.is_none() {
+            if let Ok(existing_creds) = validate_credentials(
+                args.client_id.clone(),
+                args.client_secret.clone(),
+                &active_config,
+            ) {
+                if auth::builtin_default_credentials()
+                    .as_ref()
+                    .is_none_or(|builtin| builtin.client_id != existing_creds.client_id)
+                {
+                    active_config.client_id = Some(existing_creds.client_id);
+                }
+            }
+        }
         if let Some(client_id) = args
             .client_id
             .as_deref()
@@ -1057,27 +1011,11 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         active_config = outcome.config;
         enable_autostart = outcome.enable_autostart;
         switch_account = outcome.switch_account;
+        clear_custom_credentials = outcome.clear_custom_credentials;
 
         if outcome.switch_account {
             confirm_cache_cleanup(args.yes)?;
         }
-        stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
-        if outcome.switch_account {
-            clear_local_cache_and_staging(args, &active_config)?;
-            clear_keyring_tokens().context("Failed to clear OAuth2 tokens from system keyring")?;
-            log::info!("Cleared previous Google account session and metadata cache.");
-        }
-
-        if let Some(ref save_path) = config_file_path {
-            active_config.save_to_path(save_path).with_context(|| {
-                format!("Failed to save configuration to {}", save_path.display())
-            })?;
-            log::info!("Saved configuration to {}.", save_path.display());
-        }
-    }
-
-    if !wizard_ran {
-        stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
     }
 
     let mut unit_args = args.clone();
@@ -1090,12 +1028,18 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         unit_args.no_shared_with_me = !active_config.shared_with_me.unwrap_or(true);
     }
     let args = &unit_args;
-    let credentials = resolve_credentials(
-        args.client_id.clone(),
-        args.client_secret.clone(),
-        &active_config,
-    )
-    .context("Failed to resolve Google OAuth2 client credentials")?;
+    let credentials = if clear_custom_credentials {
+        auth::builtin_default_credentials().context(
+            "No built-in OAuth2 client credentials are available after clearing custom credentials",
+        )?
+    } else {
+        resolve_credentials(
+            args.client_id.clone(),
+            args.client_secret.clone(),
+            &active_config,
+        )
+        .context("Failed to resolve Google OAuth2 client credentials")?
+    };
     let read_only = args.read_only || active_config.read_only.unwrap_or(false);
 
     log::info!(
@@ -1109,6 +1053,24 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         switch_account,
     ))
     .context("Google OAuth2 authentication failed during setup")?;
+
+    if clear_custom_credentials {
+        clear_keyring_client_credentials()
+            .context("Failed to clear custom OAuth2 client credentials from system keyring")?;
+    }
+    stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
+    if switch_account {
+        clear_local_cache_and_staging(args, &active_config)?;
+        log::info!("Cleared previous Google account session and metadata cache.");
+    }
+    if wizard_ran {
+        if let Some(ref save_path) = config_file_path {
+            active_config.save_to_path(save_path).with_context(|| {
+                format!("Failed to save configuration to {}", save_path.display())
+            })?;
+            log::info!("Saved configuration to {}.", save_path.display());
+        }
+    }
 
     let mut service_args = (*args).clone();
     if wizard_ran && config_file_path.is_some() {
