@@ -317,6 +317,31 @@ impl MetadataCache {
         Self::clear_staging_dir_with(staging_dir, |path| fs::remove_file(path))
     }
 
+    /// Returns whether the staging directory contains recoverable staged or upload-snapshot data.
+    pub fn has_pending_staging_files(staging_dir: &Path) -> Result<bool, CacheError> {
+        let entries = match fs::read_dir(staging_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            let file_type = fs::symlink_metadata(&path)?.file_type();
+            if (file_type.is_file() || file_type.is_symlink())
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.ends_with(".stage")
+                            && name.trim_start_matches('.').starts_with("inode_")
+                    })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn clear_staging_dir_with(
         staging_dir: &Path,
         mut remove: impl FnMut(&Path) -> std::io::Result<()>,
@@ -431,6 +456,33 @@ impl MetadataCache {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS directory_generations (
+                inode INTEGER PRIMARY KEY,
+                generation INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TRIGGER IF NOT EXISTS parent_child_insert_generation
+            AFTER INSERT ON parent_child
+            BEGIN
+                INSERT INTO directory_generations (inode, generation) VALUES (NEW.parent_inode, 1)
+                ON CONFLICT(inode) DO UPDATE SET generation = generation + 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS parent_child_delete_generation
+            AFTER DELETE ON parent_child
+            BEGIN
+                INSERT INTO directory_generations (inode, generation) VALUES (OLD.parent_inode, 1)
+                ON CONFLICT(inode) DO UPDATE SET generation = generation + 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS directory_invalidation_generation
+            AFTER UPDATE OF last_synced_at ON files
+            WHEN NEW.last_synced_at IS NULL
+            BEGIN
+                INSERT INTO directory_generations (inode, generation) VALUES (NEW.inode, 1)
+                ON CONFLICT(inode) DO UPDATE SET generation = generation + 1;
+            END;
             ",
         )?;
 
@@ -548,6 +600,23 @@ impl MetadataCache {
     pub fn data_version(&self) -> Result<u64, CacheError> {
         let conn = self.lock_conn()?;
         Ok(conn.query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
+    /// Returns the per-directory generation used to detect concurrent child-list invalidations.
+    pub fn directory_generation(&self, dir_inode: u64) -> Result<u64, CacheError> {
+        let conn = self.lock_conn()?;
+        Self::directory_generation_with_conn(&conn, dir_inode)
+    }
+
+    fn directory_generation_with_conn(
+        conn: &Connection,
+        dir_inode: u64,
+    ) -> Result<u64, CacheError> {
+        Ok(conn.query_row(
+            "SELECT COALESCE((SELECT generation FROM directory_generations WHERE inode = ?1), 0)",
+            params![dir_inode as i64],
+            |row| row.get(0),
+        )?)
     }
 
     fn bump_revision(&self) {
@@ -807,6 +876,30 @@ impl MetadataCache {
         parent_inode: u64,
         children: &[DriveFile],
     ) -> Result<Vec<DirectoryEntry>, CacheError> {
+        self.sync_directory_children_inner(parent_inode, children, None)?
+            .ok_or_else(|| {
+                CacheError::Io(std::io::Error::other(
+                    "directory listing changed during unconditional sync",
+                ))
+            })
+    }
+
+    /// Applies a remote listing only if the directory was not invalidated after the fetch began.
+    pub fn sync_directory_children_if_current(
+        &self,
+        parent_inode: u64,
+        children: &[DriveFile],
+        expected_generation: u64,
+    ) -> Result<Option<Vec<DirectoryEntry>>, CacheError> {
+        self.sync_directory_children_inner(parent_inode, children, Some(expected_generation))
+    }
+
+    fn sync_directory_children_inner(
+        &self,
+        parent_inode: u64,
+        children: &[DriveFile],
+        expected_generation: Option<u64>,
+    ) -> Result<Option<Vec<DirectoryEntry>>, CacheError> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
 
@@ -814,6 +907,12 @@ impl MetadataCache {
             .ok_or_else(|| CacheError::NotFound(format!("parent inode {}", parent_inode)))?;
         if !parent_file.is_dir {
             return Err(CacheError::NotADirectory(parent_inode));
+        }
+        if let Some(expected) = expected_generation {
+            if Self::directory_generation_with_conn(&tx, parent_inode)? != expected {
+                tx.rollback()?;
+                return Ok(None);
+            }
         }
 
         // Preserve any locally created/modified dirty children in this directory (and any child folders
@@ -930,7 +1029,7 @@ impl MetadataCache {
         }
 
         self.bump_revision();
-        Ok(entries)
+        Ok(Some(entries))
     }
 
     fn used_sibling_effective_names_with_conn(
@@ -2051,6 +2150,85 @@ mod tests {
         assert!(
             cache_zero.is_dir_stale(ROOT_INODE).unwrap(),
             "Directory with 0s TTL must always be stale"
+        );
+    }
+
+    #[test]
+    fn test_in_flight_directory_sync_cannot_overwrite_invalidation() {
+        let cache = Cache::open_in_memory(60).expect("Failed to open cache");
+        cache
+            .sync_directory_children(
+                ROOT_INODE,
+                &[sample_drive_file(
+                    "original",
+                    "original.txt",
+                    "text/plain",
+                    10,
+                )],
+            )
+            .unwrap();
+        let generation_at_start = cache.directory_generation(ROOT_INODE).unwrap();
+
+        cache.mark_dir_invalidated(ROOT_INODE).unwrap();
+        let ignored = cache
+            .sync_directory_children_if_current(
+                ROOT_INODE,
+                &[sample_drive_file(
+                    "stale-response",
+                    "stale.txt",
+                    "text/plain",
+                    20,
+                )],
+                generation_at_start,
+            )
+            .unwrap();
+
+        assert!(ignored.is_none());
+        assert!(cache.is_dir_stale(ROOT_INODE).unwrap());
+        assert!(cache
+            .lookup_child(ROOT_INODE, "stale.txt")
+            .unwrap()
+            .is_none());
+
+        let current_generation = cache.directory_generation(ROOT_INODE).unwrap();
+        let applied = cache
+            .sync_directory_children_if_current(
+                ROOT_INODE,
+                &[sample_drive_file(
+                    "fresh-response",
+                    "fresh.txt",
+                    "text/plain",
+                    30,
+                )],
+                current_generation,
+            )
+            .unwrap()
+            .expect("current listing must apply");
+        assert_eq!(applied[0].effective_name, "fresh.txt");
+    }
+
+    #[test]
+    fn test_directory_generations_are_targeted() {
+        let cache = Cache::open_in_memory(60).expect("Failed to open cache");
+        let folder = sample_drive_file("folder", "folder", FOLDER_MIME_TYPE, 0);
+        let folder_inode = cache
+            .sync_directory_children(ROOT_INODE, &[folder])
+            .unwrap()[0]
+            .inode;
+        let root_before = cache.directory_generation(ROOT_INODE).unwrap();
+        let folder_before = cache.directory_generation(folder_inode).unwrap();
+
+        cache
+            .sync_directory_children(
+                folder_inode,
+                &[sample_drive_file("child", "child.txt", "text/plain", 1)],
+            )
+            .unwrap();
+
+        assert_eq!(cache.directory_generation(ROOT_INODE).unwrap(), root_before);
+        assert!(
+            cache.directory_generation(folder_inode).unwrap() > folder_before,
+            "only the mutated directory generation should advance"
         );
     }
 

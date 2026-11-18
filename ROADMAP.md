@@ -82,7 +82,7 @@ This document tracks the development phases, architectural milestones, and featu
 
 ---
 
-## Phase 4: Reliability, Security & Performance
+## Phase 4: Reliability, Security & Performance (Completed)
 
 **Goal:** Protect pending writes and credentials, make synchronization failures visible, and improve responsiveness and diagnostics for large Drive accounts.
 
@@ -90,29 +90,29 @@ Prioritize sections 4.1-4.3 before performance tuning.
 
 ### 4.1 Protect Pending Writes
 - [x] Fail and report an appropriate error if a dirty staging file is missing or unreadable; never replace it with an empty file and upload that in its place.
-- [ ] Make `--clear-cache` and account-switch cleanup protect pending staged writes and avoid modifying cache files used by an active mount. Require explicit user confirmation before any destructive cleanup.
-- [ ] Test missing staging files, pending uploads, active mounts, and cleanup failures without losing staged data.
+- [x] Make `--clear-cache` and account-switch cleanup protect pending staged writes and avoid modifying cache files used by an active mount. Require explicit user confirmation before any destructive cleanup.
+- [x] Test missing staging files, pending uploads, active mounts, and cleanup failures without losing staged data.
 
 ### 4.2 Harden Setup Security
-- [ ] Do not render stored client secrets in the browser setup form. Authenticate access to the local setup session with a cryptographically random, session-specific secret and validate requests so other local clients cannot retrieve or modify configuration.
+- [x] Do not render stored client secrets in the browser setup form. Authenticate access to the local setup session with a cryptographically random, session-specific secret and validate requests so other local clients cannot retrieve or modify configuration.
 - [x] Create credential-bearing configuration files with restrictive permissions from the outset and surface permission failures.
-- [ ] Test setup access controls, secret handling, and configuration-file permissions.
+- [x] Test setup access controls, secret handling, and configuration-file permissions.
 
 ### 4.3 Make Change Sync Recovery Reliable
 - [x] Propagate cache and token persistence failures instead of reporting successful change polling.
 - [x] Do not advance the change token when expired-token cache recovery fails; preserve pending writes and retry safely.
-- [ ] Prevent a directory refresh from overwriting an invalidation that occurred while the Drive listing was in flight.
-- [ ] Test recovery failures and concurrent refresh/invalidation scenarios.
+- [x] Prevent a directory refresh from overwriting an invalidation that occurred while the Drive listing was in flight.
+- [x] Test recovery failures and concurrent refresh/invalidation scenarios.
 
 ### 4.4 Improve Folder Responsiveness
-- [ ] Investigate background refresh of previously cached directory listings so a slow Drive request need not block browsing. Define and gate any stale-data behavior, preserve write and error semantics, and do not expose incomplete listings as complete.
-- [ ] Use targeted directory-listing invalidation where practical instead of rebuilding unrelated cached listings after every cache mutation.
-- [ ] Measure cold and warm folder navigation with representative large directories, and test refresh, invalidation, and concurrent changes.
+- [x] Investigate background refresh of previously cached directory listings so a slow Drive request need not block browsing. Define and gate any stale-data behavior, preserve write and error semantics, and do not expose incomplete listings as complete.
+- [x] Use targeted directory-listing invalidation where practical instead of rebuilding unrelated cached listings after every cache mutation.
+- [x] Measure cold and warm folder navigation with representative large directories, and test refresh, invalidation, and concurrent changes.
 
 ### 4.5 Improve Diagnostics
-- [ ] Add end-to-end timings for FUSE operations and file reads, distinguishing time spent waiting for Drive, the local cache, and request processing.
-- [ ] Keep diagnostics opt-in and avoid logging credentials, tokens, file contents, or unnecessary identifying information.
-- [ ] Test timing and error reporting without requiring a live Drive account.
+- [x] Add end-to-end timings for FUSE operations and file reads, distinguishing time spent waiting for Drive, the local cache, and request processing.
+- [x] Keep diagnostics opt-in and avoid logging credentials, tokens, file contents, or unnecessary identifying information.
+- [x] Test timing and error reporting without requiring a live Drive account.
 
 ### 4.6 Documentation & Package Safeguards
 - [x] Correct the documented cache TTL default and keep CLI help, configuration documentation, and implementation consistent.
