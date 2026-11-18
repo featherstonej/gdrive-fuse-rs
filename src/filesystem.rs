@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -45,6 +45,66 @@ pub const MAX_STAGED_WRITE_FILES: usize = 64;
 /// Write-related POSIX open flags that must be rejected on a read-only mount.
 const WRITE_OPEN_FLAGS: i32 =
     libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND;
+
+struct DiagnosticTimer {
+    enabled: bool,
+    operation: &'static str,
+    started: Instant,
+    cache: Duration,
+    drive: Duration,
+}
+
+impl DiagnosticTimer {
+    fn new(enabled: bool, operation: &'static str) -> Self {
+        Self {
+            enabled,
+            operation,
+            started: Instant::now(),
+            cache: Duration::ZERO,
+            drive: Duration::ZERO,
+        }
+    }
+
+    fn add_cache(&mut self, elapsed: Duration) {
+        self.cache += elapsed;
+    }
+
+    fn add_drive(&mut self, elapsed: Duration) {
+        self.drive += elapsed;
+    }
+}
+
+impl Drop for DiagnosticTimer {
+    fn drop(&mut self) {
+        if self.enabled {
+            log::info!(
+                "{}",
+                format_diagnostic_timing(
+                    self.operation,
+                    self.started.elapsed(),
+                    self.cache,
+                    self.drive
+                )
+            );
+        }
+    }
+}
+
+fn format_diagnostic_timing(
+    operation: &str,
+    total: Duration,
+    cache: Duration,
+    drive: Duration,
+) -> String {
+    let processing = total.saturating_sub(cache).saturating_sub(drive);
+    format!(
+        "diagnostic operation={operation} total_ms={:.3} drive_ms={:.3} cache_ms={:.3} processing_ms={:.3}",
+        total.as_secs_f64() * 1000.0,
+        drive.as_secs_f64() * 1000.0,
+        cache.as_secs_f64() * 1000.0,
+        processing.as_secs_f64() * 1000.0
+    )
+}
 
 /// Tracks a locally staged file actively open for writing or awaiting upload.
 #[derive(Debug, Clone)]
@@ -443,8 +503,7 @@ const MAX_CACHED_DIR_ENTRIES: usize = 32_768;
 
 #[derive(Clone)]
 struct CachedDirListing {
-    cache_revision: u64,
-    data_version: u64,
+    cache_generation: u64,
     docs_mode: GoogleDocsMode,
     shared_with_me: bool,
     children: Arc<Vec<(String, CachedFile)>>,
@@ -551,6 +610,9 @@ pub struct GDriveFS {
     unlinked_inodes: HashSet<u64>,
     remote_unlinked_generations: HashMap<u64, u64>,
     dir_listing_cache: std::cell::RefCell<HashMap<u64, CachedDirListing>>,
+    background_refreshes: Arc<Mutex<HashSet<u64>>>,
+    stale_while_revalidate: bool,
+    diagnostics: bool,
     next_fh: u64,
 }
 
@@ -624,6 +686,36 @@ impl GDriveFS {
         read_only: bool,
         staging_dir: PathBuf,
     ) -> Self {
+        Self::with_phase4_config(
+            api,
+            cache,
+            rt_handle,
+            attr_ttl,
+            chunk_size,
+            google_docs_mode,
+            shared_with_me,
+            read_only,
+            staging_dir,
+            false,
+            false,
+        )
+    }
+
+    /// Creates a filesystem with Phase 4 stale-refresh and diagnostics configuration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_phase4_config(
+        api: Arc<DriveClient>,
+        cache: Arc<MetadataCache>,
+        rt_handle: Handle,
+        attr_ttl: Duration,
+        chunk_size: usize,
+        google_docs_mode: GoogleDocsMode,
+        shared_with_me: bool,
+        read_only: bool,
+        staging_dir: PathBuf,
+        stale_while_revalidate: bool,
+        diagnostics: bool,
+    ) -> Self {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
         let scoped_staging_dir = if staging_dir == MetadataCache::default_staging_dir() {
@@ -654,6 +746,9 @@ impl GDriveFS {
             unlinked_inodes: HashSet::new(),
             remote_unlinked_generations: HashMap::new(),
             dir_listing_cache: std::cell::RefCell::new(HashMap::new()),
+            background_refreshes: Arc::new(Mutex::new(HashSet::new())),
+            stale_while_revalidate,
+            diagnostics,
             next_fh: 1,
         };
         if !read_only {
@@ -1036,53 +1131,171 @@ impl GDriveFS {
         let is_stale = self.cache.is_cached_file_stale(&dir_file);
 
         if is_stale {
+            if self.stale_while_revalidate && dir_file.last_synced_at.is_some() {
+                self.spawn_background_directory_refresh(&dir_file);
+                return Ok(dir_file);
+            }
             log::debug!(
                 "Directory inode {} (drive_id={}) is stale; fetching children from Drive API",
                 dir_inode,
                 dir_file.drive_id
             );
-            let fetch_started = Instant::now();
-            let children_res = if dir_inode == SHARED_WITH_ME_INODE
-                || dir_file.drive_id == SHARED_WITH_ME_DRIVE_ID
-            {
-                self.rt_handle.block_on(self.api.list_shared_with_me())
-            } else {
-                self.rt_handle
-                    .block_on(self.api.list_children(&dir_file.drive_id))
-            };
-
-            let children = children_res.map_err(|api_err| {
-                log::error!(
-                    "Failed to list children from Drive API for inode {} (drive_id={}): {}",
-                    dir_inode,
-                    dir_file.drive_id,
-                    api_err
-                );
-                api_err.to_errno()
-            })?;
-
-            let fetch_elapsed = fetch_started.elapsed();
-            let sync_started = Instant::now();
-            self.cache
-                .sync_directory_children(dir_inode, &children)
-                .map_err(|cache_err| {
+            for attempt in 0..2 {
+                let generation = self.cache.directory_generation(dir_inode).map_err(|e| {
                     log::error!(
-                        "Failed to sync children in cache for inode {}: {}",
+                        "Failed to read directory generation for inode {}: {}",
                         dir_inode,
-                        cache_err
+                        e
                     );
-                    cache_err.to_errno()
+                    e.to_errno()
                 })?;
-            log::debug!(
-                "Directory inode {}: fetched {} entries in {:?}, cached in {:?}",
-                dir_inode,
-                children.len(),
-                fetch_elapsed,
-                sync_started.elapsed()
-            );
+                let fetch_started = Instant::now();
+                let children_res = if dir_inode == SHARED_WITH_ME_INODE
+                    || dir_file.drive_id == SHARED_WITH_ME_DRIVE_ID
+                {
+                    self.rt_handle.block_on(self.api.list_shared_with_me())
+                } else {
+                    self.rt_handle
+                        .block_on(self.api.list_children(&dir_file.drive_id))
+                };
+
+                let children = children_res.map_err(|api_err| {
+                    log::error!(
+                        "Failed to list children from Drive API for inode {} (drive_id={}): {}",
+                        dir_inode,
+                        dir_file.drive_id,
+                        api_err
+                    );
+                    api_err.to_errno()
+                })?;
+
+                let fetch_elapsed = fetch_started.elapsed();
+                let sync_started = Instant::now();
+                let applied = self
+                    .cache
+                    .sync_directory_children_if_current(dir_inode, &children, generation)
+                    .map_err(|cache_err| {
+                        log::error!(
+                            "Failed to sync children in cache for inode {}: {}",
+                            dir_inode,
+                            cache_err
+                        );
+                        cache_err.to_errno()
+                    })?;
+                self.log_diagnostic(
+                    "directory.refresh",
+                    fetch_elapsed + sync_started.elapsed(),
+                    sync_started.elapsed(),
+                    fetch_elapsed,
+                );
+                if applied.is_some() {
+                    log::debug!(
+                        "Directory inode {}: fetched {} entries in {:?}, cached in {:?}",
+                        dir_inode,
+                        children.len(),
+                        fetch_elapsed,
+                        sync_started.elapsed()
+                    );
+                    break;
+                }
+                log::debug!(
+                    "Directory inode {} changed during Drive listing; retrying ({}/2)",
+                    dir_inode,
+                    attempt + 1
+                );
+                if attempt == 1 {
+                    return Err(libc::EAGAIN);
+                }
+            }
         }
 
         Ok(dir_file)
+    }
+
+    fn spawn_background_directory_refresh(&self, dir_file: &CachedFile) {
+        let Ok(generation) = self.cache.directory_generation(dir_file.inode) else {
+            return;
+        };
+        let mut refreshing = match self.background_refreshes.lock() {
+            Ok(refreshing) => refreshing,
+            Err(_) => return,
+        };
+        if !refreshing.insert(dir_file.inode) {
+            return;
+        }
+        drop(refreshing);
+
+        let api = Arc::clone(&self.api);
+        let cache = Arc::clone(&self.cache);
+        let refreshing = Arc::clone(&self.background_refreshes);
+        let dir_inode = dir_file.inode;
+        let drive_id = dir_file.drive_id.clone();
+        let diagnostics = self.diagnostics;
+        self.rt_handle.spawn(async move {
+            let fetch_started = Instant::now();
+            let result = if dir_inode == SHARED_WITH_ME_INODE || drive_id == SHARED_WITH_ME_DRIVE_ID
+            {
+                api.list_shared_with_me().await
+            } else {
+                api.list_children(&drive_id).await
+            };
+            let fetch_elapsed = fetch_started.elapsed();
+            match result {
+                Ok(children) => {
+                    let cache_started = Instant::now();
+                    match cache.sync_directory_children_if_current(
+                        dir_inode,
+                        &children,
+                        generation,
+                    ) {
+                        Ok(Some(_)) => {
+                            if diagnostics {
+                                log::info!("{}", format_diagnostic_timing(
+                                    "directory.background",
+                                    fetch_elapsed + cache_started.elapsed(),
+                                    cache_started.elapsed(),
+                                    fetch_elapsed,
+                                ));
+                            }
+                        }
+                        Ok(None) => log::debug!(
+                            "Discarded stale background directory listing for inode {} after invalidation",
+                            dir_inode
+                        ),
+                        Err(err) => log::warn!(
+                            "Background directory refresh cache update failed for inode {}: {}",
+                            dir_inode,
+                            err
+                        ),
+                    }
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Background directory refresh failed for inode {}: {}",
+                        dir_inode,
+                        err
+                    );
+                }
+            }
+            if let Ok(mut guard) = refreshing.lock() {
+                guard.remove(&dir_inode);
+            }
+        });
+    }
+
+    fn log_diagnostic(
+        &self,
+        operation: &'static str,
+        total: Duration,
+        cache: Duration,
+        drive: Duration,
+    ) {
+        if self.diagnostics {
+            log::info!(
+                "{}",
+                format_diagnostic_timing(operation, total, cache, drive)
+            );
+        }
     }
 
     /// Resolves `getattr` for `ino` without requiring a `fuser::ReplyAttr`.
@@ -1129,14 +1342,12 @@ impl GDriveFS {
         &self,
         dir_inode: u64,
     ) -> Result<CachedDirListing, libc::c_int> {
-        let current_rev = self.cache.revision();
-        let data_version = self.cache.data_version().map_err(|e| {
-            log::error!("Failed to check cache data version: {}", e);
+        let current_generation = self.cache.directory_generation(dir_inode).map_err(|e| {
+            log::error!("Failed to check directory generation: {}", e);
             e.to_errno()
         })?;
         if let Some(cached) = self.dir_listing_cache.borrow().get(&dir_inode) {
-            if cached.cache_revision == current_rev
-                && cached.data_version == data_version
+            if cached.cache_generation == current_generation
                 && cached.docs_mode == self.google_docs_mode
                 && cached.shared_with_me == self.shared_with_me
             {
@@ -1196,8 +1407,7 @@ impl GDriveFS {
         }
 
         let listing = CachedDirListing {
-            cache_revision: current_rev,
-            data_version,
+            cache_generation: current_generation,
             docs_mode: self.google_docs_mode,
             shared_with_me: self.shared_with_me,
             children: Arc::new(ordered),
@@ -2400,8 +2610,12 @@ impl GDriveFS {
     /// Reads up to `size` bytes from `ino` starting at `offset`, serving from the local staging file
     /// if the file is actively staged for writing, or from the 4 MB read-ahead chunk buffer otherwise.
     pub fn handle_read(&mut self, ino: u64, offset: u64, size: u32) -> Result<Bytes, libc::c_int> {
+        let mut timing = DiagnosticTimer::new(self.diagnostics, "read");
         self.drain_cache_evictions();
-        let file = match self.cache.get_by_inode(ino) {
+        let cache_started = Instant::now();
+        let cached_file = self.cache.get_by_inode(ino);
+        timing.add_cache(cache_started.elapsed());
+        let file = match cached_file {
             Ok(Some(file)) => file,
             Ok(None) => return Err(libc::ENOENT),
             Err(e) => {
@@ -2456,7 +2670,10 @@ impl GDriveFS {
                     Self::synthesize_google_doc_shortcut(&file, self.google_docs_mode)
                 }
                 GoogleDocsMode::Pdf | GoogleDocsMode::Office => {
-                    self.ensure_google_doc_exported(&file)?
+                    let drive_started = Instant::now();
+                    let bytes = self.ensure_google_doc_exported(&file);
+                    timing.add_drive(drive_started.elapsed());
+                    bytes?
                 }
             };
 
@@ -2503,20 +2720,22 @@ impl GDriveFS {
             file.size
         );
 
-        let downloaded = self
-            .rt_handle
-            .block_on(self.api.download_range(&file.drive_id, offset, chunk_end))
-            .map_err(|api_err| {
-                log::error!(
-                    "Failed to download range {}-{} for inode {} (drive_id={}): {}",
-                    offset,
-                    chunk_end,
-                    ino,
-                    file.drive_id,
-                    api_err
-                );
-                api_err.to_errno()
-            })?;
+        let drive_started = Instant::now();
+        let downloaded_result =
+            self.rt_handle
+                .block_on(self.api.download_range(&file.drive_id, offset, chunk_end));
+        timing.add_drive(drive_started.elapsed());
+        let downloaded = downloaded_result.map_err(|api_err| {
+            log::error!(
+                "Failed to download range {}-{} for inode {} (drive_id={}): {}",
+                offset,
+                chunk_end,
+                ino,
+                file.drive_id,
+                api_err
+            );
+            api_err.to_errno()
+        })?;
 
         let actual_len = std::cmp::min(expected_len, downloaded.len());
         let result_slice = downloaded.slice(0..actual_len);
@@ -2615,6 +2834,7 @@ impl Filesystem for GDriveFS {
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let _timing = DiagnosticTimer::new(self.diagnostics, "fuse.lookup");
         let Some(name_str) = name.to_str() else {
             log::warn!(
                 "Rejecting non-UTF8 filename in lookup under parent {}",
@@ -2645,6 +2865,7 @@ impl Filesystem for GDriveFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        let _timing = DiagnosticTimer::new(self.diagnostics, "fuse.readdir");
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -2686,6 +2907,7 @@ impl Filesystem for GDriveFS {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let _timing = DiagnosticTimer::new(self.diagnostics, "fuse.read");
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -4033,11 +4255,11 @@ mod tests {
             web_view_link: None,
             dirty: false,
         };
+
         let listing = |name_len: usize| {
             let name = "x".repeat(name_len);
             CachedDirListing {
-                cache_revision: 0,
-                data_version: 0,
+                cache_generation: 0,
                 docs_mode: GoogleDocsMode::Browser,
                 shared_with_me: false,
                 children: Arc::new(vec![(name.clone(), file.clone())]),
@@ -4068,6 +4290,22 @@ mod tests {
         };
         CachedDirListing::cache_dir_listing(&mut cache, 3, &too_many);
         assert!(!cache.contains_key(&3));
+    }
+
+    #[test]
+    fn test_diagnostic_timing_contains_only_component_metrics() {
+        let output = format_diagnostic_timing(
+            "read",
+            Duration::from_millis(17),
+            Duration::from_millis(3),
+            Duration::from_millis(9),
+        );
+        assert_eq!(
+            output,
+            "diagnostic operation=read total_ms=17.000 drive_ms=9.000 cache_ms=3.000 processing_ms=5.000"
+        );
+        assert!(!output.contains("token"));
+        assert!(!output.contains("path"));
     }
 
     #[test]
@@ -4102,6 +4340,90 @@ mod tests {
         let refreshed = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
         assert!(!Arc::ptr_eq(&reused.children, &refreshed.children));
         assert_eq!(refreshed.children[0].0, "second.txt");
+        let file_inode = refreshed.children[0].1.inode;
+        fs.cache
+            .update_local_write(file_inode, 512, 1_700_000_100, true)
+            .unwrap();
+        let after_local_write = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert!(!Arc::ptr_eq(
+            &refreshed.children,
+            &after_local_write.children
+        ));
+        assert_eq!(after_local_write.children[0].1.size, 512);
+        assert!(after_local_write.children[0].1.dirty);
+        let completed = crate::api::DriveFile {
+            id: "second".into(),
+            name: "uploaded.txt".into(),
+            mime_type: "text/plain".into(),
+            size: 1024,
+            modified_time: 1_700_000_200,
+            parents: vec!["root".into()],
+            trashed: false,
+            web_view_link: None,
+        };
+        fs.cache
+            .complete_file_upload(file_inode, &completed)
+            .unwrap();
+        let after_upload = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert_eq!(after_upload.children[0].0, "uploaded.txt");
+        assert_eq!(after_upload.children[0].1.size, 1024);
+        assert_eq!(after_upload.children[0].1.modified_time, 1_700_000_200);
+        assert!(!after_upload.children[0].1.dirty);
+
+        let folder = crate::api::DriveFile {
+            mime_type: FOLDER_MIME_TYPE.into(),
+            id: "folder".into(),
+            name: "folder".into(),
+            parents: vec!["root".into()],
+            ..file("ignored", "ignored")
+        };
+        let folder_inode = fs
+            .cache
+            .sync_directory_children(FUSE_ROOT_ID, &[folder])
+            .unwrap()[0]
+            .inode;
+        fs.cache.sync_directory_children(folder_inode, &[]).unwrap();
+        let folder_first = fs.disambiguated_children_cached(folder_inode).unwrap();
+        fs.cache.mark_dir_invalidated(FUSE_ROOT_ID).unwrap();
+        let folder_reused = fs.disambiguated_children_cached(folder_inode).unwrap();
+        assert!(
+            Arc::ptr_eq(&folder_first.children, &folder_reused.children),
+            "unrelated directory caches must survive targeted invalidation"
+        );
+    }
+
+    #[test]
+    fn test_large_directory_warm_listing_reuses_prepared_index() {
+        let rt = Runtime::new().unwrap();
+        let fs = make_test_fs(
+            "http://127.0.0.1:9",
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+        let files = (0..10_000)
+            .map(|i| crate::api::DriveFile {
+                id: format!("file-{i}"),
+                name: format!("folder-{i:05}.txt"),
+                mime_type: "text/plain".into(),
+                size: i,
+                modified_time: 1,
+                parents: vec!["root".into()],
+                trashed: false,
+                web_view_link: None,
+            })
+            .collect::<Vec<_>>();
+        fs.cache
+            .sync_directory_children(FUSE_ROOT_ID, &files)
+            .unwrap();
+
+        let cold = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        let warm = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert_eq!(cold.children.len(), 10_000);
+        assert!(
+            Arc::ptr_eq(&cold.children, &warm.children),
+            "warm listing should reuse the prepared child collection"
+        );
+        assert!(Arc::ptr_eq(&cold.by_name, &warm.by_name));
     }
 
     #[test]
@@ -4144,6 +4466,74 @@ mod tests {
         drop(other);
         drop(fs);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_stale_directory_refresh_does_not_block_or_publish_partial_listing() {
+        let rt = Runtime::new().unwrap();
+        let (listener, server_addr) = rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            (listener, addr)
+        });
+        let server = rt.spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_test_request(&mut stream).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let body = r#"{"files":[{
+                "id":"fresh","name":"fresh.txt","mimeType":"text/plain","size":"2",
+                "modifiedTime":"2026-01-01T00:00:00Z","parents":["root"]
+            }]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut fs = make_test_fs(
+            &format!("http://{server_addr}/drive/v3"),
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        );
+        fs.stale_while_revalidate = true;
+        fs.cache
+            .sync_directory_children(
+                FUSE_ROOT_ID,
+                &[crate::api::DriveFile {
+                    id: "old".into(),
+                    name: "old.txt".into(),
+                    mime_type: "text/plain".into(),
+                    size: 1,
+                    modified_time: 1,
+                    parents: vec!["root".into()],
+                    trashed: false,
+                    web_view_link: None,
+                }],
+            )
+            .unwrap();
+        fs.cache
+            .execute_test_sql("UPDATE files SET last_synced_at = 1 WHERE inode = 1")
+            .unwrap();
+
+        let started = Instant::now();
+        let initial = fs.handle_readdir(FUSE_ROOT_ID).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "warm listing should not wait for the slow Drive refresh"
+        );
+        let initial_names: Vec<&str> = initial.iter().map(|entry| entry.2.as_str()).collect();
+        assert_eq!(initial_names, vec![".", "..", "Shared with me", "old.txt"]);
+
+        rt.block_on(server).unwrap();
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        let refreshed = fs.handle_readdir(FUSE_ROOT_ID).unwrap();
+        let refreshed_names: Vec<&str> = refreshed.iter().map(|entry| entry.2.as_str()).collect();
+        assert_eq!(
+            refreshed_names,
+            vec![".", "..", "Shared with me", "fresh.txt"]
+        );
     }
 
     #[test]

@@ -39,9 +39,10 @@ browser. Open that file with your file manager or `cat`, then paste its contents
 the page. Do not share the code. The optional GNOME Files performance setting affects
 all folders. The application does not modify Tracker's ignored-directory settings automatically.
 
-**Warning:** `--clear-cache` and the wizard's account-switch option can delete pending
-local writes and must not be used while any mount uses the cache. Back up the metadata
-database and staging directory first. These operations do not yet enforce exclusive access.
+**Warning:** `--clear-cache` requires interactive confirmation (or `--yes`) and refuses
+to run while a matching FUSE mount or pending staged write is active. The setup wizard's
+account-switch action is explicitly destructive and applies the same staged-write and
+exclusive-cache protections.
 
 This signs you in with Google in your browser, enables the background systemd user service (`gdrive-fuse-rs.service`) to auto-mount `~/GoogleDrive` on login, and opens `~/GoogleDrive` in GNOME Files.
 
@@ -196,7 +197,10 @@ Options:
       --no-shared-with-me          Disable the top-level "Shared with me" virtual directory
       --read-only                  Mount in strict read-only mode (uses `drive.readonly` OAuth scope and rejects writes with EROFS)
       --staging-dir <DIR>          Path to temporary write-back staging directory [env: GDRIVE_STAGING_DIR=] (default: ~/.cache/gdrive-fuse-rs/staging)
-      --clear-cache                Wipe the local SQLite metadata cache before mounting (or exit if no mount point)
+      --clear-cache                Safely remove the local SQLite metadata cache after confirmation
+      --yes                        Confirm destructive cache cleanup without an interactive prompt
+      --stale-while-revalidate     Serve a complete expired cached directory while refreshing it in the background
+      --diagnostics                Log opt-in FUSE, cache, Drive, and processing timing metrics
       --logout                     Remove saved OAuth2 tokens and client credentials from the system keyring
       --install-systemd            Install a systemd user service at ~/.config/systemd/user/gdrive-fuse-rs.service
       --setup                      Sign in with Google, enable and start the background systemd user service, and open the mount directory
