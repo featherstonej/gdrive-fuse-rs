@@ -103,9 +103,12 @@ Additionally, ensure a Secret Service provider (such as **GNOME Keyring** or **K
    cargo generate-rpm
    ```
 
-   Builds can embed OAuth defaults from `.env.build` or the
-   `GDRIVE_DEFAULT_CLIENT_ID` and `GDRIVE_DEFAULT_CLIENT_SECRET` build environment.
-   Treat packages built with a client secret as sensitive; do not distribute them.
+   Builds may embed a default OAuth client ID from `.env.build` or the
+   `GDRIVE_DEFAULT_CLIENT_ID` build environment. Client secrets are not embedded;
+   if your OAuth client requires a secret, supply the client ID and secret together
+   at runtime through configuration, environment, or keyring.
+   Before distributing packages, inspect their contents with `dpkg-deb -c <package.deb>`
+   or `rpm -qpl <package.rpm>`. Never add local credential files to package assets.
 
 ---
 

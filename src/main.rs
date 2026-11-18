@@ -58,7 +58,7 @@ pub struct CliArgs {
     #[arg(long = "cache-db", env = "GDRIVE_CACHE_DB", value_name = "FILE")]
     pub cache_db: Option<PathBuf>,
 
-    /// Directory metadata cache TTL in seconds.
+    /// Directory metadata cache TTL in seconds (default: 60).
     #[arg(long = "cache-ttl", value_name = "SECONDS")]
     pub cache_ttl: Option<u64>,
 

@@ -14,7 +14,7 @@ use fuser::{
 };
 use tokio::runtime::Handle;
 
-use crate::api::{guess_mime_type, ApiError, DriveClient, StorageQuota, FOLDER_MIME_TYPE};
+use crate::api::{guess_mime_type, DriveClient, StorageQuota, FOLDER_MIME_TYPE};
 use crate::auth::GoogleDocsMode;
 use crate::cache::{
     disambiguate_filename, CachedFile, MetadataCache, ROOT_DRIVE_ID, ROOT_INODE,
@@ -172,38 +172,45 @@ fn files_equal(left_path: &Path, right_path: &Path) -> std::io::Result<bool> {
 }
 
 fn open_existing_stage_file_rw(path: &Path) -> std::io::Result<File> {
-    if let Some(parent) = path.parent() {
-        ensure_private_staging_dir(parent)?;
-    }
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f
-    };
-    #[cfg(not(unix))]
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    Ok(file)
+    OpenOptions::new().read(true).write(true).open(path)
 }
 
-fn tighten_stage_file_permissions(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+fn open_dirty_stage_file(path: &Path) -> Result<File, libc::c_int> {
+    let result = (|| {
+        if !std::fs::metadata(path)?.is_file() {
+            return Err(std::io::Error::other("staging data is not a regular file"));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other("staging data is not a regular file"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode() & 0o7777;
+            let private_mode = mode & 0o600;
+            if mode != private_mode {
+                file.set_permissions(std::fs::Permissions::from_mode(private_mode))?;
+            }
+        }
+        Ok(file)
+    })();
+    result.map_err(|error| {
+        log::error!(
+            "Cannot read dirty staging file {}: {}",
+            path.display(),
+            error
+        );
+        libc::EIO
+    })
 }
 
 /// Computed `statfs` metrics returned to the kernel and desktop file managers.
@@ -400,23 +407,12 @@ impl ReadChunkBuffer {
 
 /// Polls Google Drive `changes.list` once (initializing `startPageToken` if not yet recorded)
 /// and applies any remote changes to the local SQLite metadata cache.
-pub async fn sync_changes_once(
-    api: &DriveClient,
-    cache: &MetadataCache,
-) -> Result<usize, ApiError> {
-    let maybe_token = match cache.get_change_page_token() {
-        Ok(tok) => tok,
-        Err(e) => {
-            log::error!("Failed to read change page token from cache: {}", e);
-            None
-        }
-    };
+pub async fn sync_changes_once(api: &DriveClient, cache: &MetadataCache) -> anyhow::Result<usize> {
+    let maybe_token = cache.get_change_page_token()?;
 
     let Some(token) = maybe_token else {
         let start_token = api.get_start_page_token().await?;
-        if let Err(e) = cache.set_change_page_token(&start_token) {
-            log::error!("Failed to save initial startPageToken to cache: {}", e);
-        }
+        cache.set_change_page_token(&start_token)?;
         return Ok(0);
     };
 
@@ -424,43 +420,21 @@ pub async fn sync_changes_once(
         Ok(res) => res,
         Err(err) if err.is_expired_page_token() => {
             log::warn!(
-                "Google Drive change page token '{}' expired ({}); clearing cache and reinitializing startPageToken",
-                token,
+                "Google Drive change page token expired ({}); clearing cache and reinitializing startPageToken",
                 err
             );
-            if let Err(clear_err) = cache.clear_all() {
-                log::error!(
-                    "Failed to clear cache after expired change page token: {}",
-                    clear_err
-                );
-            }
+            cache.clear_all()?;
             let fresh_token = api.get_start_page_token().await?;
-            if let Err(set_err) = cache.set_change_page_token(&fresh_token) {
-                log::error!(
-                    "Failed to save fresh startPageToken after token expiry: {}",
-                    set_err
-                );
-            }
+            cache.set_change_page_token(&fresh_token)?;
             return Ok(0);
         }
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
-    match cache.apply_changes(&changes, Some(&new_token)) {
-        Ok(affected) => {
-            if affected > 0 {
-                log::info!(
-                    "Applied {} remote Google Drive change(s) (new page token={})",
-                    affected,
-                    new_token
-                );
-            }
-            Ok(affected)
-        }
-        Err(e) => {
-            log::error!("Failed to apply incremental Drive changes to cache: {}", e);
-            Ok(0)
-        }
+    let affected = cache.apply_changes(&changes, Some(&new_token))?;
+    if affected > 0 {
+        log::info!("Applied {} remote Google Drive change(s)", affected);
     }
+    Ok(affected)
 }
 
 const MAX_CACHED_DIR_LISTINGS: usize = 256;
@@ -727,7 +701,9 @@ impl GDriveFS {
             }
             let stage_path = self.staging_file_path(file.inode);
             if stage_path.exists() {
-                tighten_stage_file_permissions(&stage_path);
+                if open_dirty_stage_file(&stage_path).is_err() {
+                    continue;
+                }
                 let entry =
                     self.staged_files
                         .entry(file.inode)
@@ -1352,6 +1328,25 @@ impl GDriveFS {
         self.handle_open(ino, flags)?;
         let fh = self.alloc_fh();
 
+        if (flags & WRITE_OPEN_FLAGS) == 0 {
+            let file = self
+                .cache
+                .get_by_inode(ino)
+                .map_err(|e| e.to_errno())?
+                .ok_or(libc::ENOENT)?;
+            if file.dirty
+                || file.is_pending_upload()
+                || self.staged_files.get(&ino).is_some_and(|st| st.dirty)
+            {
+                let path = self
+                    .staged_files
+                    .get(&ino)
+                    .map(|st| st.path.clone())
+                    .unwrap_or_else(|| self.staging_file_path(ino));
+                open_dirty_stage_file(&path)?;
+            }
+        }
+
         if (flags & WRITE_OPEN_FLAGS) != 0 {
             let file = self
                 .cache
@@ -1366,20 +1361,30 @@ impl GDriveFS {
             }
 
             let stage_path = self.staging_file_path(ino);
-            if let Some(parent_dir) = stage_path.parent() {
-                ensure_private_staging_dir(parent_dir).map_err(|_| libc::EIO)?;
-            }
-
-            let has_dirty_stage_on_disk =
-                (file.dirty || file.is_pending_upload()) && stage_path.exists();
+            let has_dirty_stage_on_disk = file.dirty
+                || file.is_pending_upload()
+                || self.staged_files.get(&ino).is_some_and(|st| st.dirty);
             if has_dirty_stage_on_disk {
-                tighten_stage_file_permissions(&stage_path);
+                open_dirty_stage_file(&stage_path)?;
             }
             let truncate = (flags & libc::O_TRUNC) != 0;
             if truncate {
-                create_truncated_stage_file(&stage_path).map_err(|e| {
+                let stage_file = if has_dirty_stage_on_disk {
+                    open_existing_stage_file_rw(&stage_path)
+                } else {
+                    create_truncated_stage_file(&stage_path)
+                }
+                .map_err(|e| {
                     log::error!(
-                        "Failed to create/truncate staging file {}: {}",
+                        "Failed to open staging file {} for truncation: {}",
+                        stage_path.display(),
+                        e
+                    );
+                    libc::EIO
+                })?;
+                stage_file.set_len(0).map_err(|e| {
+                    log::error!(
+                        "Failed to truncate staging file {}: {}",
                         stage_path.display(),
                         e
                     );
@@ -1436,23 +1441,21 @@ impl GDriveFS {
         }
 
         let stage_path = self.staging_file_path(file.inode);
-        if let Some(parent_dir) = stage_path.parent() {
-            ensure_private_staging_dir(parent_dir).map_err(|_| libc::EIO)?;
-        }
-
-        let has_dirty_stage_on_disk =
-            (file.dirty || file.is_pending_upload()) && stage_path.exists();
+        let has_dirty_stage_on_disk = file.dirty
+            || file.is_pending_upload()
+            || self
+                .staged_files
+                .get(&file.inode)
+                .is_some_and(|st| st.dirty);
         let already_populated = self
             .staged_files
             .get(&file.inode)
             .is_some_and(|st| st.populated_from_remote);
 
-        if !already_populated {
-            if has_dirty_stage_on_disk && !overwrite_all_from_zero {
-                // Treat an existing local staging file for a dirty/pending inode as authoritative
-                // (e.g. after a restart or 410-token cache recovery) rather than overwriting it.
-                tighten_stage_file_permissions(&stage_path);
-            } else if !overwrite_all_from_zero && file.size > 0 && !file.is_pending_upload() {
+        if has_dirty_stage_on_disk {
+            open_dirty_stage_file(&stage_path)?;
+        } else if !already_populated {
+            if !overwrite_all_from_zero && file.size > 0 && !file.is_pending_upload() {
                 let downloaded = self
                     .rt_handle
                     .block_on(
@@ -1475,10 +1478,8 @@ impl GDriveFS {
             } else {
                 create_truncated_stage_file(&stage_path).map_err(|_| libc::EIO)?;
             }
-        } else if !stage_path.exists() {
-            create_truncated_stage_file(&stage_path).map_err(|_| libc::EIO)?;
         } else {
-            tighten_stage_file_permissions(&stage_path);
+            open_dirty_stage_file(&stage_path)?;
         }
 
         let entry = self
@@ -1699,42 +1700,38 @@ impl GDriveFS {
         ino: u64,
         remove_state_when_clean: bool,
     ) -> Result<(), libc::c_int> {
-        if !self.staged_files.contains_key(&ino) {
-            if let Ok(Some(file)) = self.cache.get_by_inode(ino) {
-                let stage_path = self.staging_file_path(ino);
-                if (file.dirty || file.is_pending_upload()) && stage_path.exists() {
-                    tighten_stage_file_permissions(&stage_path);
-                    self.staged_files.insert(
-                        ino,
-                        StagedFileState {
-                            ino,
-                            path: stage_path,
-                            dirty: true,
-                            populated_from_remote: true,
-                            open_handles: HashSet::new(),
-                        },
-                    );
-                }
-            }
+        let cached_file = self.cache.get_by_inode(ino).map_err(|e| e.to_errno())?;
+        let cached_dirty = cached_file
+            .as_ref()
+            .is_some_and(|file| file.dirty || file.is_pending_upload());
+        if !self.staged_files.contains_key(&ino) && cached_dirty {
+            let stage_path = self.staging_file_path(ino);
+            open_dirty_stage_file(&stage_path)?;
+            self.staged_files.insert(
+                ino,
+                StagedFileState {
+                    ino,
+                    path: stage_path,
+                    dirty: true,
+                    populated_from_remote: true,
+                    open_handles: HashSet::new(),
+                },
+            );
         }
 
         let has_open_handles = self.has_open_handles(ino);
         let (is_dirty, stage_path) = match self.staged_files.get(&ino) {
-            Some(st) => (st.dirty, st.path.clone()),
+            Some(st) => (st.dirty || cached_dirty, st.path.clone()),
             None => return Ok(()),
         };
 
         if is_dirty {
-            let Some(file) = self.cache.get_by_inode(ino).map_err(|e| e.to_errno())? else {
-                self.discard_staged_file(ino);
-                return Ok(());
+            let Some(file) = cached_file else {
+                log::error!("Cannot upload dirty staging file for missing inode {}", ino);
+                return Err(libc::EIO);
             };
 
-            if !stage_path.exists() {
-                create_truncated_stage_file(&stage_path).map_err(|_| libc::EIO)?;
-            } else {
-                tighten_stage_file_permissions(&stage_path);
-            }
+            open_dirty_stage_file(&stage_path)?;
 
             let uploaded_res = if file.is_pending_upload() {
                 let parent_ino = self.cache.get_parent_inode(ino).map_err(|e| e.to_errno())?;
@@ -2417,27 +2414,28 @@ impl GDriveFS {
             return Err(libc::EISDIR);
         }
 
-        if !self.staged_files.contains_key(&ino) && (file.dirty || file.is_pending_upload()) {
+        let dirty = file.dirty
+            || file.is_pending_upload()
+            || self.staged_files.get(&ino).is_some_and(|st| st.dirty);
+        if !self.staged_files.contains_key(&ino) && dirty {
             let stage_path = self.staging_file_path(ino);
-            if stage_path.exists() {
-                tighten_stage_file_permissions(&stage_path);
-                self.staged_files.insert(
+            open_dirty_stage_file(&stage_path)?;
+            self.staged_files.insert(
+                ino,
+                StagedFileState {
                     ino,
-                    StagedFileState {
-                        ino,
-                        path: stage_path,
-                        dirty: true,
-                        populated_from_remote: true,
-                        open_handles: HashSet::new(),
-                    },
-                );
-            }
+                    path: stage_path,
+                    dirty: true,
+                    populated_from_remote: true,
+                    open_handles: HashSet::new(),
+                },
+            );
         }
 
         // If this inode is actively staged on disk with local data, read directly from the staging file.
         if let Some(st) = self.staged_files.get(&ino) {
-            if st.populated_from_remote && st.path.exists() {
-                let mut stage_file = File::open(&st.path).map_err(|_| libc::EIO)?;
+            if st.populated_from_remote || dirty {
+                let mut stage_file = open_dirty_stage_file(&st.path)?;
                 let stage_len = stage_file.metadata().map_err(|_| libc::EIO)?.len();
                 if size == 0 || offset >= stage_len {
                     return Ok(Bytes::new());
@@ -3043,6 +3041,127 @@ mod tests {
             }
         }
         request
+    }
+
+    #[test]
+    fn test_missing_or_unreadable_dirty_staging_fails_without_upload() {
+        let rt = Runtime::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let staging_dir = PathBuf::from("target").join(format!(
+            "dirty-stage-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let mut fs = make_test_fs(
+            &format!("http://{}/drive/v3", listener.local_addr().unwrap()),
+            rt.handle().clone(),
+            DEFAULT_READ_CHUNK_SIZE,
+        )
+        .with_read_only(false)
+        .with_staging_dir(staging_dir.clone());
+        let remote = crate::api::DriveFile {
+            id: "dirty-remote".into(),
+            name: "remote.txt".into(),
+            mime_type: "text/plain".into(),
+            size: 4,
+            modified_time: 1_700_000_000,
+            parents: vec!["root".into()],
+            trashed: false,
+            web_view_link: None,
+        };
+        fs.cache
+            .sync_directory_children(FUSE_ROOT_ID, &[remote])
+            .unwrap();
+        let (pending, pending_fh) = fs
+            .handle_create(FUSE_ROOT_ID, "pending.txt", 0o644, libc::O_RDWR)
+            .unwrap();
+        fs.handle_write(pending.ino, pending_fh, 0, b"local", 0)
+            .unwrap();
+        let remote_ino = fs.handle_lookup(FUSE_ROOT_ID, "remote.txt").unwrap().ino;
+        fs.cache
+            .update_local_write(remote_ino, 4, 1_700_000_000, true)
+            .unwrap();
+        let remote_path = fs.staging_file_path(remote_ino);
+        std::fs::write(&remote_path, b"data").unwrap();
+        let remote_fh = fs.handle_open_with_fh(remote_ino, libc::O_RDWR).unwrap();
+
+        let snapshot = staging_dir.join("retained-snapshot");
+        std::fs::write(&snapshot, b"pending snapshot").unwrap();
+        fs.pending_upload_sessions.insert(
+            pending.ino,
+            PendingUploadSession {
+                uri: "retained-session".into(),
+                snapshot_path: snapshot.clone(),
+            },
+        );
+
+        for (ino, fh) in [(pending.ino, pending_fh), (remote_ino, remote_fh)] {
+            let path = fs.staging_file_path(ino);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+                if File::open(&path).is_err() {
+                    assert_eq!(fs.handle_read(ino, 0, 10), Err(libc::EIO));
+                    assert_eq!(
+                        fs.handle_open_with_fh(ino, libc::O_RDWR | libc::O_TRUNC),
+                        Err(libc::EIO)
+                    );
+                    assert_eq!(fs.handle_flush(ino, fh), Err(libc::EIO));
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        0
+                    );
+                }
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            std::fs::remove_file(&path).unwrap();
+            for recovered in [false, true] {
+                if recovered {
+                    fs.staged_files.remove(&ino);
+                }
+                for non_file in [false, true] {
+                    if non_file {
+                        std::fs::create_dir(&path).unwrap();
+                    }
+                    assert_eq!(fs.handle_read(ino, 0, 10), Err(libc::EIO));
+                    assert_eq!(fs.handle_open_with_fh(ino, libc::O_RDONLY), Err(libc::EIO));
+                    assert_eq!(
+                        fs.handle_open_with_fh(ino, libc::O_RDWR | libc::O_TRUNC),
+                        Err(libc::EIO)
+                    );
+                    assert_eq!(
+                        fs.handle_write(ino, fh, 0, b"replacement", 0),
+                        Err(libc::EIO)
+                    );
+                    assert_eq!(
+                        fs.handle_setattr(ino, Some(0), None, Some(fh)),
+                        Err(libc::EIO)
+                    );
+                    assert_eq!(fs.handle_flush(ino, fh), Err(libc::EIO));
+                    assert!(fs.cache.get_by_inode(ino).unwrap().unwrap().dirty);
+                    if non_file {
+                        assert!(path.is_dir());
+                        std::fs::remove_dir(&path).unwrap();
+                    } else {
+                        assert!(!path.exists());
+                    }
+                }
+            }
+            assert_eq!(fs.handle_release(ino, fh), Err(libc::EIO));
+            assert!(fs.cache.get_by_inode(ino).unwrap().unwrap().dirty);
+        }
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"pending snapshot");
+        assert_eq!(
+            fs.pending_upload_sessions.get(&pending.ino).unwrap().uri,
+            "retained-session"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        std::fs::remove_dir_all(staging_dir).unwrap();
     }
 
     #[test]
@@ -4270,6 +4389,91 @@ mod tests {
                 .drive_id,
             "doc_plan"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sync_changes_reports_cache_failures_without_advancing_token() {
+        async fn mock_response(
+            status: &str,
+            body: &str,
+        ) -> (DriveClient, tokio::task::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let auth = Arc::new(AuthManager::new_static_for_test("test-token"));
+            (
+                DriveClient::with_base_url(auth, format!("http://{address}/drive/v3")).unwrap(),
+                server,
+            )
+        }
+
+        let cache = MetadataCache::open_in_memory(300).unwrap();
+        cache.execute_test_sql("DROP TABLE sync_state").unwrap();
+        let auth = Arc::new(AuthManager::new_static_for_test("test-token"));
+        let api = DriveClient::with_base_url(auth, "http://127.0.0.1:1/drive/v3").unwrap();
+        assert!(sync_changes_once(&api, &cache)
+            .await
+            .unwrap_err()
+            .downcast_ref::<crate::cache::CacheError>()
+            .is_some());
+
+        let cache = MetadataCache::open_in_memory(300).unwrap();
+        cache
+            .execute_test_sql(
+                "CREATE TRIGGER reject_token_insert BEFORE INSERT ON sync_state
+                 BEGIN SELECT RAISE(ABORT, 'token write rejected'); END;",
+            )
+            .unwrap();
+        let (api, server) = mock_response("200 OK", r#"{"startPageToken":"fresh"}"#).await;
+        assert!(sync_changes_once(&api, &cache).await.is_err());
+        server.await.unwrap();
+        assert_eq!(cache.get_change_page_token().unwrap(), None);
+
+        let cache = MetadataCache::open_in_memory(300).unwrap();
+        cache.set_change_page_token("previous").unwrap();
+        cache
+            .execute_test_sql(
+                "CREATE TRIGGER reject_token_insert BEFORE INSERT ON sync_state
+                 BEGIN SELECT RAISE(ABORT, 'token write rejected'); END;",
+            )
+            .unwrap();
+        let (api, server) =
+            mock_response("200 OK", r#"{"newStartPageToken":"next","changes":[]}"#).await;
+        assert!(sync_changes_once(&api, &cache).await.is_err());
+        server.await.unwrap();
+        assert_eq!(
+            cache.get_change_page_token().unwrap().as_deref(),
+            Some("previous")
+        );
+
+        let cache = MetadataCache::open_in_memory(300).unwrap();
+        cache.set_change_page_token("expired").unwrap();
+        let pending = cache
+            .create_pending_file(FUSE_ROOT_ID, "pending.txt", "text/plain", 0)
+            .unwrap();
+        cache
+            .execute_test_sql(
+                "CREATE TRIGGER reject_cache_clear BEFORE DELETE ON sync_state
+                 BEGIN SELECT RAISE(ABORT, 'cache clear rejected'); END;",
+            )
+            .unwrap();
+        let (api, server) = mock_response("410 Gone", r#"{"error":"expired"}"#).await;
+        assert!(sync_changes_once(&api, &cache).await.is_err());
+        server.await.unwrap();
+        assert_eq!(
+            cache.get_change_page_token().unwrap().as_deref(),
+            Some("expired")
+        );
+        assert!(cache.get_by_inode(pending.inode).unwrap().unwrap().dirty);
     }
 
     #[tokio::test]
