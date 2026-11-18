@@ -4340,6 +4340,35 @@ mod tests {
         let refreshed = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
         assert!(!Arc::ptr_eq(&reused.children, &refreshed.children));
         assert_eq!(refreshed.children[0].0, "second.txt");
+        let file_inode = refreshed.children[0].1.inode;
+        fs.cache
+            .update_local_write(file_inode, 512, 1_700_000_100, true)
+            .unwrap();
+        let after_local_write = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert!(!Arc::ptr_eq(
+            &refreshed.children,
+            &after_local_write.children
+        ));
+        assert_eq!(after_local_write.children[0].1.size, 512);
+        assert!(after_local_write.children[0].1.dirty);
+        let completed = crate::api::DriveFile {
+            id: "second".into(),
+            name: "uploaded.txt".into(),
+            mime_type: "text/plain".into(),
+            size: 1024,
+            modified_time: 1_700_000_200,
+            parents: vec!["root".into()],
+            trashed: false,
+            web_view_link: None,
+        };
+        fs.cache
+            .complete_file_upload(file_inode, &completed)
+            .unwrap();
+        let after_upload = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
+        assert_eq!(after_upload.children[0].0, "uploaded.txt");
+        assert_eq!(after_upload.children[0].1.size, 1024);
+        assert_eq!(after_upload.children[0].1.modified_time, 1_700_000_200);
+        assert!(!after_upload.children[0].1.dirty);
 
         let folder = crate::api::DriveFile {
             mime_type: FOLDER_MIME_TYPE.into(),
@@ -4387,18 +4416,14 @@ mod tests {
             .sync_directory_children(FUSE_ROOT_ID, &files)
             .unwrap();
 
-        let cold_started = Instant::now();
         let cold = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
-        let cold_elapsed = cold_started.elapsed();
-        let warm_started = Instant::now();
         let warm = fs.disambiguated_children_cached(FUSE_ROOT_ID).unwrap();
-        let warm_elapsed = warm_started.elapsed();
         assert_eq!(cold.children.len(), 10_000);
-        assert!(Arc::ptr_eq(&cold.children, &warm.children));
         assert!(
-            warm_elapsed < cold_elapsed,
-            "warm listing ({warm_elapsed:?}) should reuse the cold preparation ({cold_elapsed:?})"
+            Arc::ptr_eq(&cold.children, &warm.children),
+            "warm listing should reuse the prepared child collection"
         );
+        assert!(Arc::ptr_eq(&cold.by_name, &warm.by_name));
     }
 
     #[test]

@@ -821,36 +821,7 @@ fn acquire_cache_lock(db_path: &Path) -> Result<CacheLock> {
             })?;
         }
     }
-    let resolved_db_path = match std::fs::canonicalize(db_path) {
-        Ok(path) => path,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let absolute = if db_path.is_absolute() {
-                db_path.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .context("Failed to resolve relative cache database path")?
-                    .join(db_path)
-            };
-            let parent = absolute
-                .parent()
-                .context("Cache database path has no parent directory")?;
-            std::fs::canonicalize(parent)
-                .with_context(|| format!("Failed to resolve cache directory {}", parent.display()))?
-                .join(
-                    absolute
-                        .file_name()
-                        .context("Cache database path has no filename")?,
-                )
-        }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "Failed to resolve SQLite metadata cache at {}",
-                    db_path.display()
-                )
-            })
-        }
-    };
+    let resolved_db_path = resolve_db_path_for_lock(db_path)?;
     let mut lock_path = resolved_db_path.as_os_str().to_os_string();
     lock_path.push(".lock");
     let lock_path = PathBuf::from(lock_path);
@@ -886,6 +857,68 @@ fn acquire_cache_lock(db_path: &Path) -> Result<CacheLock> {
         }
     }
     Ok(CacheLock { _file: file })
+}
+
+fn resolve_db_path_for_lock(db_path: &Path) -> Result<PathBuf> {
+    let mut current = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("Failed to resolve relative cache database path")?
+            .join(db_path)
+    };
+
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&current).with_context(|| {
+                    format!("Failed to resolve cache symlink {}", current.display())
+                })?;
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    current
+                        .parent()
+                        .context("Cache symlink has no parent directory")?
+                        .join(target)
+                };
+            }
+            Ok(_) => {
+                return std::fs::canonicalize(&current).with_context(|| {
+                    format!(
+                        "Failed to resolve SQLite metadata cache at {}",
+                        current.display()
+                    )
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let parent = current
+                    .parent()
+                    .context("Cache database path has no parent directory")?;
+                let canonical_parent = std::fs::canonicalize(parent).with_context(|| {
+                    format!("Failed to resolve cache directory {}", parent.display())
+                })?;
+                return Ok(canonical_parent.join(
+                    current
+                        .file_name()
+                        .context("Cache database path has no filename")?,
+                ));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to inspect SQLite metadata cache at {}",
+                        current.display()
+                    )
+                });
+            }
+        }
+    }
+
+    bail!(
+        "Too many symlinks while resolving cache database path {}",
+        db_path.display()
+    )
 }
 
 fn stop_existing_service(systemctl: &std::ffi::OsStr, existing_unit: bool) -> Result<()> {
@@ -1014,6 +1047,9 @@ fn run_guided_setup(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
         enable_autostart = outcome.enable_autostart;
         switch_account = outcome.switch_account;
 
+        if outcome.switch_account {
+            confirm_cache_cleanup(args.yes)?;
+        }
         stop_existing_service(std::ffi::OsStr::new("systemctl"), existing_unit)?;
         if outcome.switch_account {
             clear_local_cache_and_staging(args, &active_config)?;
@@ -1385,6 +1421,34 @@ mod tests {
         std::fs::remove_file(dir.join("cache.db.lock")).unwrap();
         std::fs::remove_file(alias).unwrap();
         std::fs::remove_file(db).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_cache_lock_resolves_dangling_database_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-cache-lock-dangling-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("target.db");
+        let alias = dir.join("alias.db");
+        symlink(&target, &alias).unwrap();
+
+        assert_eq!(
+            resolve_db_path_for_lock(&alias).unwrap(),
+            std::fs::canonicalize(&dir)
+                .unwrap()
+                .join(target.file_name().unwrap())
+        );
+        let active = acquire_cache_lock(&alias).unwrap();
+        let error = acquire_cache_lock(&target).unwrap_err();
+        assert!(error.to_string().contains("active gdrive-fuse-rs process"));
+        drop(active);
+        std::fs::remove_file(dir.join("target.db.lock")).unwrap();
+        std::fs::remove_file(alias).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 

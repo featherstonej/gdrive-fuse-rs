@@ -483,6 +483,24 @@ impl MetadataCache {
                 INSERT INTO directory_generations (inode, generation) VALUES (NEW.inode, 1)
                 ON CONFLICT(inode) DO UPDATE SET generation = generation + 1;
             END;
+
+            CREATE TRIGGER IF NOT EXISTS file_metadata_generation
+            AFTER UPDATE OF drive_id, name, mime_type, size, modified_time, is_dir, web_view_link, dirty ON files
+            BEGIN
+                UPDATE directory_generations
+                    SET generation = generation + 1
+                    WHERE inode IN (
+                        SELECT parent_inode FROM parent_child WHERE child_inode = NEW.inode
+                    );
+                INSERT INTO directory_generations (inode, generation)
+                    SELECT DISTINCT parent_inode, 1
+                    FROM parent_child
+                    WHERE child_inode = NEW.inode
+                      AND NOT EXISTS (
+                          SELECT 1 FROM directory_generations
+                          WHERE inode = parent_child.parent_inode
+                      );
+            END;
             ",
         )?;
 
