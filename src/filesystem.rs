@@ -483,9 +483,8 @@ pub async fn sync_changes_once(api: &DriveClient, cache: &MetadataCache) -> anyh
                 "Google Drive change page token expired ({}); clearing cache and reinitializing startPageToken",
                 err
             );
-            cache.clear_all()?;
             let fresh_token = api.get_start_page_token().await?;
-            cache.set_change_page_token(&fresh_token)?;
+            cache.recover_change_token(&fresh_token)?;
             return Ok(0);
         }
         Err(err) => return Err(err.into()),
@@ -1182,10 +1181,11 @@ impl GDriveFS {
                         );
                         cache_err.to_errno()
                     })?;
+                let cache_elapsed = sync_started.elapsed();
                 self.log_diagnostic(
                     "directory.refresh",
-                    fetch_elapsed + sync_started.elapsed(),
-                    sync_started.elapsed(),
+                    fetch_started.elapsed(),
+                    cache_elapsed,
                     fetch_elapsed,
                 );
                 if applied.is_some() {
@@ -1194,7 +1194,7 @@ impl GDriveFS {
                         dir_inode,
                         children.len(),
                         fetch_elapsed,
-                        sync_started.elapsed()
+                        cache_elapsed
                     );
                     break;
                 }
@@ -1250,10 +1250,11 @@ impl GDriveFS {
                     ) {
                         Ok(Some(_)) => {
                             if diagnostics {
+                                let cache_elapsed = cache_started.elapsed();
                                 log::info!("{}", format_diagnostic_timing(
                                     "directory.background",
-                                    fetch_elapsed + cache_started.elapsed(),
-                                    cache_started.elapsed(),
+                                    fetch_started.elapsed(),
+                                    cache_elapsed,
                                     fetch_elapsed,
                                 ));
                             }

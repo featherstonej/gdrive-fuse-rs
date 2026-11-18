@@ -199,11 +199,7 @@ impl MetadataCache {
     /// Normalizes a database path for staging namespace computation so that a relative path whose
     /// database file does not exist yet resolves to the exact same canonical path as after
     /// `MetadataCache::open` creates the database file on disk.
-    fn normalize_db_path_for_namespace(db_path: &Path) -> PathBuf {
-        if let Ok(canonical) = fs::canonicalize(db_path) {
-            return canonical;
-        }
-
+    pub(crate) fn normalize_db_path_for_namespace(db_path: &Path) -> PathBuf {
         let abs_path = if db_path.is_absolute() {
             db_path.to_path_buf()
         } else {
@@ -211,9 +207,32 @@ impl MetadataCache {
                 .map(|cwd| cwd.join(db_path))
                 .unwrap_or_else(|_| db_path.to_path_buf())
         };
+        let mut resolved_symlink = abs_path.clone();
+        for _ in 0..40 {
+            let Ok(metadata) = fs::symlink_metadata(&resolved_symlink) else {
+                break;
+            };
+            if !metadata.file_type().is_symlink() {
+                break;
+            }
+            let Ok(target) = fs::read_link(&resolved_symlink) else {
+                break;
+            };
+            resolved_symlink = if target.is_absolute() {
+                target
+            } else {
+                resolved_symlink
+                    .parent()
+                    .map(|parent| parent.join(&target))
+                    .unwrap_or(target)
+            };
+        }
+        if let Ok(canonical) = fs::canonicalize(&resolved_symlink) {
+            return canonical;
+        }
 
         let mut normalized = PathBuf::new();
-        for comp in abs_path.components() {
+        for comp in resolved_symlink.components() {
             match comp {
                 std::path::Component::CurDir => {}
                 std::path::Component::ParentDir => {
@@ -351,15 +370,34 @@ impl MetadataCache {
         }
 
         let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.query_row(
+        let has_files: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_files {
+            return Ok(false);
+        }
+        let mut columns = conn.prepare("PRAGMA table_info(files)")?;
+        let column_names = columns
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !column_names.iter().any(|name| name == "drive_id") {
+            return Err(CacheError::Sqlite(rusqlite::Error::InvalidQuery));
+        }
+        let query = if column_names.iter().any(|name| name == "dirty") {
             "SELECT EXISTS(
                 SELECT 1 FROM files
                 WHERE dirty != 0 OR drive_id LIKE 'pending:%'
-            )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(CacheError::from)
+            )"
+        } else {
+            "SELECT EXISTS(
+                SELECT 1 FROM files
+                WHERE drive_id LIKE 'pending:%'
+            )"
+        };
+        conn.query_row(query, [], |row| row.get(0))
+            .map_err(CacheError::from)
     }
 
     fn clear_staging_dir_with(
@@ -1691,6 +1729,15 @@ impl MetadataCache {
     /// "Shared with me" (`2`), open inodes, and any locally dirty/pending inodes (along with their ancestor
     /// directory chain and parent-child edges so nested dirty files remain reachable).
     pub fn clear_all(&self) -> Result<(), CacheError> {
+        self.clear_all_with_token(None)
+    }
+
+    /// Atomically clears stale cache state and installs a replacement change token.
+    pub fn recover_change_token(&self, token: &str) -> Result<(), CacheError> {
+        self.clear_all_with_token(Some(token))
+    }
+
+    fn clear_all_with_token(&self, replacement_token: Option<&str>) -> Result<(), CacheError> {
         let open_inode_counts = self
             .open_inode_counts
             .lock()
@@ -1752,6 +1799,12 @@ impl MetadataCache {
         )?;
 
         tx.execute("DELETE FROM sync_state", [])?;
+        if let Some(token) = replacement_token {
+            tx.execute(
+                "INSERT INTO sync_state (key, value) VALUES (?1, ?2)",
+                params![CHANGES_PAGE_TOKEN_KEY, token],
+            )?;
+        }
 
         let delete_files_sql = format!(
             "{} DELETE FROM files WHERE inode NOT IN (SELECT inode FROM preserved)",
@@ -1937,6 +1990,69 @@ mod tests {
         assert!(test_dir.join("target/metadata.db").exists());
         drop(cache);
         fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_pending_write_probe_supports_legacy_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-legacy-pending-probe-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let db_path = dir.join("metadata.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (
+                inode INTEGER PRIMARY KEY,
+                drive_id TEXT NOT NULL
+            );
+            INSERT INTO files (inode, drive_id) VALUES (3, 'remote-file');",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(!MetadataCache::database_has_pending_writes(&db_path).unwrap());
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO files (inode, drive_id) VALUES (4, 'pending:4')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(MetadataCache::database_has_pending_writes(&db_path).unwrap());
+
+        std::fs::remove_file(db_path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dangling_database_symlink_has_stable_staging_namespace() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "gdrive-dangling-stage-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("target.db");
+        let alias = dir.join("alias.db");
+        symlink(&target, &alias).unwrap();
+
+        assert_eq!(
+            MetadataCache::default_staging_dir_for_db(&alias),
+            MetadataCache::default_staging_dir_for_db(&target)
+        );
+        MetadataCache::open(&alias, 60).unwrap();
+        assert_eq!(
+            MetadataCache::default_staging_dir_for_db(&alias),
+            MetadataCache::default_staging_dir_for_db(&target)
+        );
+
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -2404,6 +2520,24 @@ mod tests {
         assert!(cache.list_children(ROOT_INODE).unwrap().is_empty());
         assert!(cache.get_change_page_token().unwrap().is_none());
         assert!(cache.is_dir_stale(ROOT_INODE).unwrap());
+    }
+
+    #[test]
+    fn test_recover_change_token_failure_preserves_existing_token() {
+        let cache = Cache::open_in_memory(60).expect("Failed to open cache");
+        cache.set_change_page_token("expired").unwrap();
+        cache
+            .execute_test_sql(
+                "CREATE TRIGGER reject_recovery_token BEFORE INSERT ON sync_state
+                 BEGIN SELECT RAISE(ABORT, 'token write rejected'); END;",
+            )
+            .unwrap();
+
+        assert!(cache.recover_change_token("fresh").is_err());
+        assert_eq!(
+            cache.get_change_page_token().unwrap().as_deref(),
+            Some("expired")
+        );
     }
 
     #[test]

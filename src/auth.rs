@@ -524,6 +524,11 @@ pub fn clear_keyring_tokens() -> Result<(), AuthError> {
     clear_keyring_entries(&[KEYRING_REFRESH_TOKEN_USER, KEYRING_TOKEN_SCOPE_USER])
 }
 
+/// Removes stored OAuth client credentials while preserving the signed-in account tokens.
+pub fn clear_keyring_client_credentials() -> Result<(), AuthError> {
+    clear_keyring_entries(&[KEYRING_CLIENT_CONFIG_USER])
+}
+
 /// Removes both account tokens and stored OAuth client credentials.
 pub fn clear_keyring_credentials() -> Result<(), AuthError> {
     clear_keyring_entries(&[
