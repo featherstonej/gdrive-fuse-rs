@@ -31,8 +31,8 @@ fn main() {
                         }
                     }
                 }
-                if let (Some(client_id), Some(client_secret)) = (client_id, client_secret) {
-                    if !client_id.is_empty()
+if let Some(client_id) = client_id.filter(|client_id| {
+                    !client_id.is_empty()
                         && !matches!(
                             client_id,
                             "prefilled-id.apps.googleusercontent.com"
@@ -41,9 +41,9 @@ fn main() {
                                 | "config-id-placeholder"
                                 | "cli-id-placeholder"
                         )
-                        && !client_secret.is_empty()
-                    {
-                        println!("cargo:rustc-env=GDRIVE_DEFAULT_CLIENT_ID={client_id}");
+                }) {
+                    println!("cargo:rustc-env=GDRIVE_DEFAULT_CLIENT_ID={client_id}");
+                    if let Some(client_secret) = client_secret.filter(|secret| !secret.is_empty()) {
                         println!("cargo:rustc-env=GDRIVE_BUILTIN_CLIENT_SECRET={client_secret}");
                     }
                 }
