@@ -908,9 +908,9 @@ fn launch_desktop_app(args: &CliArgs, initial_config: &AppConfig) -> Result<()> 
             .context("Failed to resolve mount point for desktop launch")?
             .join(raw_mount_point)
     };
+    cleanup_stale_fuse_mount(&mount_point);
     let proc_mounts =
         std::fs::read_to_string("/proc/mounts").context("Failed to inspect active FUSE mounts")?;
-    if is_fuse_mounted_in_proc_mounts(&proc_mounts, &mount_point) {
         log::info!(
             "Google Drive is already mounted at {}; opening it.",
             mount_point.display()
