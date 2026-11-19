@@ -4,6 +4,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GDRIVE_DEFAULT_CLIENT_ID");
     println!("cargo:rerun-if-changed=.env.build");
 
+    let builtin_client_secret_path =
+        Path::new(&std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR for build scripts"))
+            .join("builtin_client_secret");
+    std::fs::write(&builtin_client_secret_path, "")
+        .expect("failed to initialize built-in client secret");
+
     // Runtime environment variables are intentionally not embedded into release builds.
     // A matching local .env.build pair is allowed for locally distributed packages.
     let env_id_set = std::env::var("GDRIVE_DEFAULT_CLIENT_ID")
@@ -31,10 +37,10 @@ fn main() {
                         }
                     }
                 }
-if let Some(client_id) = client_id.filter(|client_id| {
+                if let Some(client_id) = client_id.filter(|client_id| {
                     !client_id.is_empty()
                         && !matches!(
-                            client_id,
+                            *client_id,
                             "prefilled-id.apps.googleusercontent.com"
                                 | "my-id.apps.googleusercontent.com"
                                 | "placeholder-id.apps.googleusercontent.com"
@@ -44,7 +50,8 @@ if let Some(client_id) = client_id.filter(|client_id| {
                 }) {
                     println!("cargo:rustc-env=GDRIVE_DEFAULT_CLIENT_ID={client_id}");
                     if let Some(client_secret) = client_secret.filter(|secret| !secret.is_empty()) {
-                        println!("cargo:rustc-env=GDRIVE_BUILTIN_CLIENT_SECRET={client_secret}");
+                        std::fs::write(&builtin_client_secret_path, client_secret)
+                            .expect("failed to write built-in client secret");
                     }
                 }
             }

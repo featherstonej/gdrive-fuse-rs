@@ -336,10 +336,13 @@ pub fn builtin_default_credentials() -> Option<ClientCredentials> {
         .map(str::trim)
         .filter(|s| !s.is_empty() && !is_test_placeholder_client_id(s))?
         .to_string();
-    let client_secret = option_env!("GDRIVE_BUILTIN_CLIENT_SECRET")
-        .map(str::trim)
-        .filter(|secret| !secret.is_empty())
-        .map(str::to_owned);
+    let client_secret = Some(include_str!(concat!(
+        env!("OUT_DIR"),
+        "/builtin_client_secret"
+    )))
+    .map(str::trim)
+    .filter(|secret| !secret.is_empty())
+    .map(str::to_owned);
     Some(ClientCredentials {
         client_id: default_id,
         client_secret,
