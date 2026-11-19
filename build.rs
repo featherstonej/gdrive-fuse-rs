@@ -44,7 +44,7 @@ fn main() {
                         && !client_secret.is_empty()
                     {
                         println!("cargo:rustc-env=GDRIVE_DEFAULT_CLIENT_ID={client_id}");
-                        println!("cargo:rustc-env=GDRIVE_DEFAULT_CLIENT_SECRET={client_secret}");
+                        println!("cargo:rustc-env=GDRIVE_BUILTIN_CLIENT_SECRET={client_secret}");
                     }
                 }
             }
