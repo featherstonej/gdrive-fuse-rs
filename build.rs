@@ -4,7 +4,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GDRIVE_DEFAULT_CLIENT_ID");
     println!("cargo:rerun-if-changed=.env.build");
 
-    // If GDRIVE_DEFAULT_CLIENT_ID is not already set in the environment, load from .env.build if present.
+    // Runtime environment variables are intentionally not embedded into release builds.
+    // A matching local .env.build pair is allowed for locally distributed packages.
     let env_id_set = std::env::var("GDRIVE_DEFAULT_CLIENT_ID")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
@@ -22,7 +23,9 @@ fn main() {
                         let key = key.trim();
                         let val = val.trim().trim_matches('"').trim_matches('\'');
                         if key == "GDRIVE_DEFAULT_CLIENT_ID" && !val.is_empty() {
-                            println!("cargo:rustc-env={}={}", key, val);
+                            println!("cargo:rustc-env={key}={val}");
+                        } else if key == "GDRIVE_DEFAULT_CLIENT_SECRET" && !val.is_empty() {
+                            println!("cargo:rustc-env={key}={val}");
                         }
                     }
                 }

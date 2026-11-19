@@ -124,6 +124,14 @@ pub struct CliArgs {
     #[arg(long = "configure", default_value_t = false)]
     pub configure: bool,
 
+    /// Open an existing configured mount, or run setup when no connected account is available.
+    #[arg(
+        long = "launch",
+        default_value_t = false,
+        conflicts_with_all = ["setup", "configure", "install_systemd", "logout", "clear_cache"]
+    )]
+    pub launch: bool,
+
     /// Open a `.gdoc`, `.gsheet`, `.gslides`, or `.gdrive` shortcut file in the default web browser.
     #[arg(long = "open-doc", value_name = "FILE")]
     pub open_doc: Option<PathBuf>,
@@ -154,7 +162,7 @@ fn main() -> Result<()> {
 
     let config = match &args.config {
         Some(path) => {
-            if !path.exists() && !args.setup && !args.configure {
+            if !path.exists() && !args.setup && !args.configure && !args.launch {
                 bail!("Configuration file does not exist: {}", path.display());
             }
             AppConfig::load_from_path(path)
@@ -217,6 +225,10 @@ fn main() -> Result<()> {
         if args.mount_point.is_none() && !args.install_systemd && !args.setup && !args.configure {
             return Ok(());
         }
+    }
+
+    if args.launch {
+        return launch_desktop_app(&args, &config);
     }
 
     if args.setup || args.configure {
@@ -880,6 +892,122 @@ fn stop_existing_service(systemctl: &std::ffi::OsStr, existing_unit: bool) -> Re
         if !status.success() {
             bail!("Failed to stop existing gdrive-fuse-rs.service");
         }
+    }
+    Ok(())
+}
+
+fn launch_desktop_app(args: &CliArgs, initial_config: &AppConfig) -> Result<()> {
+    let (raw_mount_point, _) = resolve_mount_point(
+        args.mount_point.clone(),
+        initial_config.mount_point_path.clone(),
+    );
+    let mount_point = if raw_mount_point.is_absolute() {
+        raw_mount_point
+    } else {
+        std::env::current_dir()
+            .context("Failed to resolve mount point for desktop launch")?
+            .join(raw_mount_point)
+    };
+    let proc_mounts =
+        std::fs::read_to_string("/proc/mounts").context("Failed to inspect active FUSE mounts")?;
+    if is_fuse_mounted_in_proc_mounts(&proc_mounts, &mount_point) {
+        log::info!(
+            "Google Drive is already mounted at {}; opening it.",
+            mount_point.display()
+        );
+        if !args.no_browser {
+            let _ = open::that(&mount_point);
+        }
+        return Ok(());
+    }
+
+    let config_file_path = args.config.clone().or_else(AppConfig::default_path);
+    let config_exists = config_file_path.as_ref().is_some_and(|path| path.exists());
+    let has_credentials = validate_credentials(
+        args.client_id.clone(),
+        args.client_secret.clone(),
+        initial_config,
+    )
+    .is_ok();
+    if !config_exists || !has_credentials {
+        let mut setup_args = args.clone();
+        setup_args.launch = false;
+        setup_args.setup = true;
+        return run_guided_setup(&setup_args, initial_config);
+    }
+
+    cleanup_stale_fuse_mount(&mount_point);
+    let service_output = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=LoadState",
+            "--value",
+            "gdrive-fuse-rs.service",
+        ])
+        .output()
+        .context("Failed to check gdrive-fuse-rs.service")?;
+    let load_state = std::str::from_utf8(&service_output.stdout)
+        .context("Invalid systemd service load state")?
+        .trim();
+    if load_state == "not-found" {
+        let mut setup_args = args.clone();
+        setup_args.launch = false;
+        setup_args.setup = true;
+        return run_guided_setup(&setup_args, initial_config);
+    }
+    if !service_output.status.success() || load_state.is_empty() {
+        bail!(
+            "Failed to check gdrive-fuse-rs.service: {}",
+            String::from_utf8_lossy(&service_output.stderr).trim()
+        );
+    }
+
+    let stop = std::process::Command::new("systemctl")
+        .args(["--user", "stop", "gdrive-fuse-rs.service"])
+        .status()
+        .context("Failed to stop gdrive-fuse-rs.service before authentication")?;
+    if !stop.success() {
+        bail!("Failed to stop gdrive-fuse-rs.service before authentication");
+    }
+
+    let credentials = resolve_credentials(
+        args.client_id.clone(),
+        args.client_secret.clone(),
+        initial_config,
+    )
+    .context("Failed to resolve Google OAuth2 client credentials")?;
+    let read_only = args.read_only || initial_config.read_only.unwrap_or(false);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to initialize Tokio async runtime")?;
+    log::info!("Checking the existing Google Drive sign-in...");
+    rt.block_on(AuthManager::authenticate_with_mode(
+        credentials,
+        !args.no_browser,
+        read_only,
+    ))
+    .context("Google OAuth2 authentication failed while launching Google Drive")?;
+
+    let start = std::process::Command::new("systemctl")
+        .args(["--user", "start", "gdrive-fuse-rs.service"])
+        .status()
+        .context("Failed to start gdrive-fuse-rs.service")?;
+    if !start.success() {
+        bail!(
+            "Failed to start gdrive-fuse-rs.service; run 'gdrive-fuse-rs --configure' to repair the connection"
+        );
+    }
+    if !wait_for_fuse_mount(&mount_point, Duration::from_secs(15)) {
+        bail!(
+            "Google Drive did not mount at {} in time; check the user service journal or run 'gdrive-fuse-rs --configure'",
+            mount_point.display()
+        );
+    }
+
+    if !args.no_browser {
+        let _ = open::that(&mount_point);
     }
     Ok(())
 }
@@ -1759,10 +1887,16 @@ mod tests {
             CliArgs::try_parse_from(["gdrive-fuse-rs"]).expect("Zero arguments must parse");
         assert!(zero_args.mount_point.is_none());
         assert!(!zero_args.setup);
+        assert!(!zero_args.launch);
 
         let setup_args = CliArgs::try_parse_from(["gdrive-fuse-rs", "--setup"])
             .expect("--setup flag must parse");
         assert!(setup_args.setup);
+
+        let launch_args = CliArgs::try_parse_from(["gdrive-fuse-rs", "--launch"])
+            .expect("--launch flag must parse");
+        assert!(launch_args.launch);
+        assert!(CliArgs::try_parse_from(["gdrive-fuse-rs", "--launch", "--setup"]).is_err());
 
         let configure_args = CliArgs::try_parse_from(["gdrive-fuse-rs", "--configure"])
             .expect("--configure flag must parse");
