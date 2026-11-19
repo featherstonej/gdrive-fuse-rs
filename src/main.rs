@@ -911,6 +911,7 @@ fn launch_desktop_app(args: &CliArgs, initial_config: &AppConfig) -> Result<()> 
     cleanup_stale_fuse_mount(&mount_point);
     let proc_mounts =
         std::fs::read_to_string("/proc/mounts").context("Failed to inspect active FUSE mounts")?;
+    if is_fuse_mounted_in_proc_mounts(&proc_mounts, &mount_point) {
         log::info!(
             "Google Drive is already mounted at {}; opening it.",
             mount_point.display()
@@ -989,6 +990,15 @@ fn launch_desktop_app(args: &CliArgs, initial_config: &AppConfig) -> Result<()> 
         read_only,
     ))
     .context("Google OAuth2 authentication failed while launching Google Drive")?;
+
+    install_user_systemd_unit(args, initial_config)?;
+    let reload = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()
+        .context("Failed to reload systemd user units")?;
+    if !reload.success() {
+        bail!("Failed to reload systemd user units");
+    }
 
     let start = std::process::Command::new("systemctl")
         .args(["--user", "start", "gdrive-fuse-rs.service"])
