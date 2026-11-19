@@ -336,9 +336,16 @@ pub fn builtin_default_credentials() -> Option<ClientCredentials> {
         .map(str::trim)
         .filter(|s| !s.is_empty() && !is_test_placeholder_client_id(s))?
         .to_string();
+    let client_secret = Some(include_str!(concat!(
+        env!("OUT_DIR"),
+        "/builtin_client_secret"
+    )))
+    .map(str::trim)
+    .filter(|secret| !secret.is_empty())
+    .map(str::to_owned);
     Some(ClientCredentials {
         client_id: default_id,
-        client_secret: None,
+        client_secret,
     })
 }
 
@@ -799,7 +806,12 @@ impl AuthManager {
             .exchange_refresh_token(&rt)
             .request_async(async_http_client)
             .await
-            .map_err(|e| AuthError::OAuthError(format!("Refresh token exchange failed: {}", e)))?;
+            .map_err(|error| {
+                AuthError::OAuthError(format!(
+                    "Refresh token exchange failed: {}",
+                    oauth_token_error_summary(&error)
+                ))
+            })?;
 
         let lifetime = token_res.expires_in().unwrap_or(DEFAULT_TOKEN_LIFETIME);
         let cached = CachedToken {
@@ -860,7 +872,10 @@ impl AuthManager {
             .request_async(async_http_client)
             .await
             .map_err(|e| {
-                AuthError::OAuthError(format!("Authorization code exchange failed: {}", e))
+                AuthError::OAuthError(format!(
+                    "Authorization code exchange failed: {}",
+                    oauth_token_error_summary(&e)
+                ))
             })?;
 
         let lifetime = token_res.expires_in().unwrap_or(DEFAULT_TOKEN_LIFETIME);
@@ -871,6 +886,25 @@ impl AuthManager {
         let refresh_token = token_res.refresh_token().map(|r| r.secret().clone());
 
         Ok((cached, refresh_token))
+    }
+}
+
+fn oauth_token_error_summary<RE, T>(error: &oauth2::RequestTokenError<RE, T>) -> String
+where
+    RE: std::error::Error + 'static,
+    T: oauth2::ErrorResponse + std::fmt::Display + 'static,
+{
+    match error {
+        oauth2::RequestTokenError::ServerResponse(response) => {
+            format!("server response: {response}")
+        }
+        oauth2::RequestTokenError::Request(request_error) => {
+            format!("request failed: {request_error}")
+        }
+        oauth2::RequestTokenError::Parse(parse_error, _) => {
+            format!("response could not be parsed: {parse_error}")
+        }
+        oauth2::RequestTokenError::Other(message) => message.clone(),
     }
 }
 

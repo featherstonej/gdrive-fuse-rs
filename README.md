@@ -105,9 +105,10 @@ Additionally, ensure a Secret Service provider (such as **GNOME Keyring** or **K
    ```
 
    Builds may embed a default OAuth client ID from `.env.build` or the
-   `GDRIVE_DEFAULT_CLIENT_ID` build environment. Client secrets are not embedded;
-   if your OAuth client requires a secret, supply the client ID and secret together
-   at runtime through configuration, environment, or keyring.
+   `GDRIVE_DEFAULT_CLIENT_ID` build environment. The matching client secret is
+   embedded only from a local, gitignored `.env.build` entry; environment variables
+   containing secrets are never embedded. Otherwise, supply the client ID and
+   secret together at runtime through configuration, environment, or keyring.
    Before distributing packages, inspect their contents with `dpkg-deb -c <package.deb>`
    or `rpm -qpl <package.rpm>`. Never add local credential files to package assets.
 
@@ -205,6 +206,7 @@ Options:
       --install-systemd            Install a systemd user service at ~/.config/systemd/user/gdrive-fuse-rs.service
       --setup                      Sign in with Google, enable and start the background systemd user service, and open the mount directory
       --configure                  Open the local browser configuration wizard to customize settings in ~/.config/gdrive-fuse-rs/config.toml
+      --launch                     Open an existing configured mount, or run setup when no connected account is available
       --open-doc <FILE>            Open a .gdoc/.gsheet/.gslides/.gdrive shortcut file in the default web browser and exit
       --no-browser                 Do not automatically launch the web browser during interactive OAuth2 login
       --allow-other                Allow other system users to access the FUSE mount
